@@ -2,7 +2,7 @@
 
 Extilume 是一个规划中的 macOS 菜单栏显示器工具，计划提供“外接屏设为主显示器”和“仅使用外接屏”两种模式，并在退出时撤销本应用的显示配置改动。
 
-当前仓库包含[图标资产](assets/branding/)和[分阶段 OpenSpec 提案](openspec/changes/)。应用功能尚未实现或通过实机验收。
+当前仓库包含[图标资产](assets/branding/)、[分阶段 OpenSpec 提案](openspec/changes/)和[本机显示验证入口](docs/local-display-verification.md)。验证入口默认只读，主屏路径的自动连接／唤醒生命周期尚待实机验收；日常应用与内屏停用尚未完成。开发过程日志和逐次实验记录保留在本地，不纳入 Git。
 
 ## License
 

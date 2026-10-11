@@ -1,0 +1,125 @@
+import Darwin
+import ExtilumeCore
+import Foundation
+
+private enum SnapshotWitnessError: Error {
+    case spawnFailed
+    case communicationFailed
+    case timedOut
+    case invalidSnapshot
+    case snapshotUnavailable
+    case processFailed
+    case cleanupFailed
+}
+
+func freshSnapshot() throws -> Snapshot {
+    let parentChannel: GuardChannel
+    var childChannel: GuardChannel?
+    do {
+        let pair = try GuardChannel.pair()
+        parentChannel = pair.0
+        childChannel = pair.1
+    } catch {
+        throw SnapshotWitnessError.communicationFailed
+    }
+
+    let witness: pid_t
+    do {
+        guard let childChannel else { throw SnapshotWitnessError.spawnFailed }
+        witness = try spawnProbe(["--display-snapshot"], channel: childChannel)
+    } catch {
+        childChannel = nil
+        throw SnapshotWitnessError.spawnFailed
+    }
+    childChannel = nil
+
+    var reaped = false
+    do {
+        let snapshot: Snapshot
+        do {
+            snapshot = try parentChannel.receive(Snapshot.self)
+        } catch let error as GuardChannelError where error == .timedOut {
+            throw SnapshotWitnessError.timedOut
+        } catch {
+            throw SnapshotWitnessError.communicationFailed
+        }
+
+        guard isValid(snapshot) else { throw SnapshotWitnessError.invalidSnapshot }
+        guard let status = try waitForExit(witness, polls: 100) else {
+            throw SnapshotWitnessError.timedOut
+        }
+        reaped = true
+        guard status == 0 else { // Darwin wait 状态只有正常 exit(0) 为零；Swift 不导入 wait 宏。
+            throw SnapshotWitnessError.processFailed
+        }
+        return snapshot
+    } catch {
+        if !reaped {
+            guard terminateAndReap(witness) else { throw SnapshotWitnessError.cleanupFailed }
+            reaped = true
+        }
+        throw sanitized(error)
+    }
+}
+
+func serveSnapshot(descriptor: Int32) throws {
+    let channel: GuardChannel
+    do {
+        channel = try GuardChannel(descriptor: descriptor)
+    } catch {
+        Darwin.close(descriptor)
+        throw SnapshotWitnessError.communicationFailed
+    }
+
+    let snapshot: Snapshot
+    do {
+        snapshot = try stableSnapshot()
+    } catch {
+        throw SnapshotWitnessError.snapshotUnavailable
+    }
+
+    do {
+        try channel.send(snapshot)
+    } catch {
+        throw SnapshotWitnessError.communicationFailed
+    }
+}
+
+private func isValid(_ snapshot: Snapshot) -> Bool {
+    let identifiers = snapshot.displays.map(\.id)
+    return !identifiers.isEmpty
+        && identifiers.count <= 16
+        && identifiers.allSatisfy { $0 != 0 }
+        && Set(identifiers).count == identifiers.count
+}
+
+private func waitForExit(_ process: pid_t, polls: Int) throws -> Int32? {
+    for _ in 0..<polls {
+        var status: Int32 = 0
+        let result = waitpid(process, &status, WNOHANG)
+        if result == process { return status }
+        if result == 0 {
+            Thread.sleep(forTimeInterval: 0.01)
+            continue
+        }
+        if result == -1 && errno == EINTR { continue }
+        throw SnapshotWitnessError.processFailed
+    }
+    return nil
+}
+
+private func terminateAndReap(_ process: pid_t) -> Bool {
+    do {
+        if try waitForExit(process, polls: 1) != nil { return true }
+        _ = kill(process, SIGTERM)
+        if try waitForExit(process, polls: 20) != nil { return true }
+        _ = kill(process, SIGKILL)
+        return try waitForExit(process, polls: 100) != nil
+    } catch {
+        return false
+    }
+}
+
+private func sanitized(_ error: Error) -> SnapshotWitnessError {
+    error as? SnapshotWitnessError ?? .communicationFailed
+}

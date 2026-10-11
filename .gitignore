@@ -12,6 +12,11 @@ xcuserdata/
 /DerivedData/
 /build/
 /.build/
+/.extilume-verification-state/
+
+# Local development logs and verification records
+/.local/
+*.log
 
 # Local distribution outputs (repository root)
 /dist/
