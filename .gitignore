@@ -1,0 +1,34 @@
+# macOS filesystem metadata
+.DS_Store
+._*
+.AppleDouble
+.LSOverride
+
+# Xcode: per-user settings and UI state
+xcuserdata/
+*.xcuserstate
+
+# Local build outputs (repository root)
+/DerivedData/
+/build/
+/.build/
+
+# Local distribution outputs (repository root)
+/dist/
+/*.xcarchive/
+/*.app/
+/*.dSYM/
+/*.dSYM.zip
+/*.dmg
+/*.pkg
+
+# Local environment files; keep shareable templates
+.env
+.env.*
+!.env.example
+!.env.*.example
+!.env.sample
+!.env.template
+
+# Keep project/workspace files, shared schemes, and Package.resolved.
+# Keep shared .swiftpm configuration, OpenSpec files, docs, and AGENTS.md.
