@@ -1,0 +1,261 @@
+{
+  "tool": "Apple Icon Composer ictool",
+  "version": "27.0 (129)",
+  "platform": "macOS",
+  "designGeneration": 27,
+  "scale": 1,
+  "tint": "tool default, no override",
+  "checks": [
+    {
+      "file": "previews/Default-1024.png",
+      "width": 1024,
+      "height": 1024,
+      "mode": "RGBA",
+      "cornerAlpha": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "ictoolExitCode": 0
+    },
+    {
+      "file": "previews/Default-64.png",
+      "width": 64,
+      "height": 64,
+      "mode": "RGBA",
+      "cornerAlpha": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "ictoolExitCode": 0
+    },
+    {
+      "file": "previews/Default-32.png",
+      "width": 32,
+      "height": 32,
+      "mode": "RGBA",
+      "cornerAlpha": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "ictoolExitCode": 0
+    },
+    {
+      "file": "previews/Dark-1024.png",
+      "width": 1024,
+      "height": 1024,
+      "mode": "RGBA",
+      "cornerAlpha": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "ictoolExitCode": 0
+    },
+    {
+      "file": "previews/Dark-64.png",
+      "width": 64,
+      "height": 64,
+      "mode": "RGBA",
+      "cornerAlpha": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "ictoolExitCode": 0
+    },
+    {
+      "file": "previews/Dark-32.png",
+      "width": 32,
+      "height": 32,
+      "mode": "RGBA",
+      "cornerAlpha": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "ictoolExitCode": 0
+    },
+    {
+      "file": "previews/ClearLight-1024.png",
+      "width": 1024,
+      "height": 1024,
+      "mode": "RGBA",
+      "cornerAlpha": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "ictoolExitCode": 0
+    },
+    {
+      "file": "previews/ClearLight-64.png",
+      "width": 64,
+      "height": 64,
+      "mode": "RGBA",
+      "cornerAlpha": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "ictoolExitCode": 0
+    },
+    {
+      "file": "previews/ClearLight-32.png",
+      "width": 32,
+      "height": 32,
+      "mode": "RGBA",
+      "cornerAlpha": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "ictoolExitCode": 0
+    },
+    {
+      "file": "previews/ClearDark-1024.png",
+      "width": 1024,
+      "height": 1024,
+      "mode": "RGBA",
+      "cornerAlpha": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "ictoolExitCode": 0
+    },
+    {
+      "file": "previews/ClearDark-64.png",
+      "width": 64,
+      "height": 64,
+      "mode": "RGBA",
+      "cornerAlpha": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "ictoolExitCode": 0
+    },
+    {
+      "file": "previews/ClearDark-32.png",
+      "width": 32,
+      "height": 32,
+      "mode": "RGBA",
+      "cornerAlpha": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "ictoolExitCode": 0
+    },
+    {
+      "file": "previews/TintedLight-1024.png",
+      "width": 1024,
+      "height": 1024,
+      "mode": "RGBA",
+      "cornerAlpha": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "ictoolExitCode": 0
+    },
+    {
+      "file": "previews/TintedLight-64.png",
+      "width": 64,
+      "height": 64,
+      "mode": "RGBA",
+      "cornerAlpha": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "ictoolExitCode": 0
+    },
+    {
+      "file": "previews/TintedLight-32.png",
+      "width": 32,
+      "height": 32,
+      "mode": "RGBA",
+      "cornerAlpha": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "ictoolExitCode": 0
+    },
+    {
+      "file": "previews/TintedDark-1024.png",
+      "width": 1024,
+      "height": 1024,
+      "mode": "RGBA",
+      "cornerAlpha": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "ictoolExitCode": 0
+    },
+    {
+      "file": "previews/TintedDark-64.png",
+      "width": 64,
+      "height": 64,
+      "mode": "RGBA",
+      "cornerAlpha": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "ictoolExitCode": 0
+    },
+    {
+      "file": "previews/TintedDark-32.png",
+      "width": 32,
+      "height": 32,
+      "mode": "RGBA",
+      "cornerAlpha": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "ictoolExitCode": 0
+    }
+  ],
+  "compilation": {
+    "tool": "Apple Xcode actool",
+    "xcodeVersion": "27.0 (27A266a)",
+    "platform": "macosx",
+    "minimumDeploymentTarget": "27.0",
+    "exitCode": 0,
+    "outputs": [
+      "Assets.car",
+      "Extilume.icns",
+      "icon-info.plist"
+    ],
+    "savedExport": "Extilume.icns",
+    "savedExportBytes": 47146,
+    "icnsContainerValidated": true,
+    "bundleIconFile": "Extilume",
+    "bundleIconName": "Extilume"
+  }
+}

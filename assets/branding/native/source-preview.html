@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Extilume 原生源层预览</title>
+<style>
+  body { margin: 32px; color: #dee8fa; background: #121c2d; font: 16px system-ui; }
+  h1 { font-size: 22px; }
+  p { max-width: 650px; line-height: 1.6; }
+  .mark { position: relative; width: min(512px, 100%); aspect-ratio: 1; }
+  .mark img { position: absolute; inset: 0; width: 100%; height: 100%; }
+  .sizes { display: flex; align-items: center; gap: 32px; }
+  .s64 { width: 64px; }
+  .s32 { width: 32px; }
+</style>
+<h1>Extilume · 原生源层预览</h1>
+<p>只预览三个 SVG 的几何叠放。页面背景不属于图标，不代表 Icon Composer 的材质、系统蒙版或六种最终外观。</p>
+<div class="mark" role="img" aria-label="单一外接显示器，屏内光形向下收束">
+  <img src="layers/screen.svg" alt="">
+  <img src="layers/focus-light.svg" alt="">
+  <img src="layers/monitor-body.svg" alt="">
+</div>
+<div class="sizes">
+  <div><p>64 px 源层</p><div class="mark s64" aria-hidden="true">
+    <img src="layers/screen.svg" alt=""><img src="layers/focus-light.svg" alt=""><img src="layers/monitor-body.svg" alt="">
+  </div></div>
+  <div><p>32 px 源层</p><div class="mark s32" aria-hidden="true">
+    <img src="layers/screen.svg" alt=""><img src="layers/focus-light.svg" alt=""><img src="layers/monitor-body.svg" alt="">
+  </div></div>
+</div>
+</html>
