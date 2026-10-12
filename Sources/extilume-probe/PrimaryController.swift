@@ -105,7 +105,7 @@ final class PrimaryController: @unchecked Sendable {
 
     func finalizeOnly() throws {
         try queue.sync {
-            guard let restored = try store.load(), restored.canClear,
+            guard let restored = try store.load(), restored.canClear, restored.internalDisplay == nil,
                   try freshSnapshot().layout() == restored.baseline else { throw RecoveryError.unfinishedTransaction }
             try store.clear()
             print("独立进程已读回恢复基准；本次责任记录已清除。")
@@ -191,8 +191,6 @@ final class PrimaryController: @unchecked Sendable {
         if source == .confirmedUser {
             guard record.phase == .owned, layout != record.applied else { throw RecoveryError.unresolvedSource }
         }
-        // 缺失拓扑只用于适用部分恢复，不能改写完整基准。
-        if Set(layout.origins.keys) != Set(record.baseline.origins.keys) { return }
         do { try record.observe(layout, source: source) }
         catch { self.record = record; try store.save(record); throw error }
         self.record = record

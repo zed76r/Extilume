@@ -14,10 +14,20 @@ def require(condition, message):
         raise RuntimeError(message)
 
 
-def ready_line(process):
-    require(select.select([process.stdout], [], [], 5)[0], "等待演练就绪超时")
-    line = process.stdout.readline()
-    require("保护演练已就绪" in line, "演练未就绪；保留状态目录")
+def ready_line(process, timeout=5):
+    deadline = time.monotonic() + timeout
+    fd = process.stdout.fileno()
+    line = bytearray()
+    while True:
+        remaining = deadline - time.monotonic()
+        require(remaining > 0 and select.select([fd], [], [], remaining)[0], "等待演练就绪超时")
+        byte = os.read(fd, 1)
+        require(byte, "演练输出在就绪行前结束；保留状态目录")
+        if byte == b"\n":
+            require("保护演练已就绪" in line.decode("utf-8", errors="replace"), "演练未就绪；保留状态目录")
+            return
+        require(len(line) < 4096, "演练就绪行超过4096字节；保留状态目录")
+        line.extend(byte)
 
 
 def processes():

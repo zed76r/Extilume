@@ -71,6 +71,71 @@ final class RecoveryRecordTests: XCTestCase {
         XCTAssertTrue(record.layoutPending)
     }
 
+    func testReconnectedBRearmsRecoveryOfLatestCWithoutAnotherApplication() throws {
+        let b = try layout(mainExternal: true)
+        let c = try layout(distance: -1920)
+        var record = try ownedRecord()
+        try record.observe(c, source: .confirmedUser)
+        XCTAssertFalse(record.layoutPending)
+
+        try record.observe(b, source: .reconnect)
+        XCTAssertEqual(record.baseline, c)
+        XCTAssertEqual(record.generation, 1)
+        XCTAssertTrue(record.layoutPending)
+        let plan = try record.layoutRestorePlan(connected: [
+            ConnectedDisplay(identity: internalID, numericID: 80),
+            ConnectedDisplay(identity: externalID, numericID: 40)
+        ], current: b)
+        XCTAssertEqual(plan.origins[80], c.origins[internalID])
+        XCTAssertEqual(plan.origins[40], c.origins[externalID])
+        record.beginRestoration()
+        try record.confirmRestored(actual: c)
+        XCTAssertTrue(record.canClear)
+    }
+
+    func testKnownBReturningAfterUnresolvedDDoesNotEraseSourceUncertainty() throws {
+        let b = try layout(mainExternal: true)
+        let c = try layout(distance: -1920)
+        var record = try ownedRecord()
+        try record.observe(c, source: .confirmedUser)
+        XCTAssertThrowsError(try record.observe(layout(distance: 2000), source: .unknown))
+
+        try record.observe(b, source: .reconnect)
+        XCTAssertEqual(record.baseline, c)
+        XCTAssertTrue(record.layoutPending)
+        XCTAssertTrue(record.sourceUnresolved)
+        XCTAssertThrowsError(try record.prepareReapplication(current: b, target: b))
+        XCTAssertThrowsError(try record.layoutRestorePlan(connected: [], current: b))
+    }
+
+    func testReconnectedDisabledBitRearmsRecoveryOfUserEnabledC() throws {
+        var record = try ownedRecord(internalDisplay: InternalDisplayResponsibility(
+            identity: internalID, baseline: true, applied: false
+        ))
+        try record.observeInternalEnabled(true, source: .confirmedUser)
+        XCTAssertFalse(record.internalDisplay?.pending == true)
+
+        try record.observeInternalEnabled(false, source: .reconnect)
+        XCTAssertTrue(record.internalDisplay?.pending == true)
+        let plan = try record.internalRestorePlan(connected: [
+            ConnectedDisplay(identity: internalID, numericID: 80)
+        ])
+        XCTAssertEqual(plan?.id, 80)
+        XCTAssertEqual(plan?.enabled, true)
+    }
+
+    func testUncoveredInternalCStillRequiresActualEnabledReadback() throws {
+        var record = try ownedRecord(internalDisplay: InternalDisplayResponsibility(
+            identity: internalID, baseline: true, applied: false
+        ))
+        try record.observeInternalEnabled(true, source: .confirmedUser)
+        record.beginRestoration()
+        XCTAssertThrowsError(try record.confirmRestored(actual: layout(), internalEnabled: false))
+        XCTAssertFalse(record.canClear)
+        try record.confirmRestored(actual: layout(), internalEnabled: true)
+        XCTAssertTrue(record.canClear)
+    }
+
     func testUnconfirmedConfigurationStopsNewControl() throws {
         var record = try ownedRecord()
         let c = try layout(distance: -1920)
@@ -80,6 +145,42 @@ final class RecoveryRecordTests: XCTestCase {
         XCTAssertThrowsError(try record.prepareReapplication(current: c, target: layout(mainExternal: true)))
         XCTAssertThrowsError(try record.layoutRestorePlan(connected: [], current: c))
         XCTAssertFalse(record.canClear)
+    }
+
+    func testMissingDisplayObservationKeepsFullConfirmedC() throws {
+        let c = try layout(distance: -1920)
+        var record = try ownedRecord()
+        try record.observe(c, source: .confirmedUser)
+        let partial = try DisplayLayout(main: internalID, origins: [internalID: DisplayOrigin(x: 0, y: 0)])
+
+        XCTAssertNoThrow(try record.observe(partial, source: .reconnect))
+        XCTAssertEqual(record.baseline, c)
+        XCTAssertFalse(record.sourceUnresolved)
+        XCTAssertFalse(record.layoutPending)
+        XCTAssertFalse(record.canClear)
+    }
+
+    func testPartialTopologyCannotBeConfirmedAsFullUserC() throws {
+        let c = try layout(distance: -1920)
+        var record = try ownedRecord()
+        try record.observe(c, source: .confirmedUser)
+        let partial = try DisplayLayout(main: internalID, origins: [internalID: DisplayOrigin(x: 0, y: 0)])
+
+        XCTAssertThrowsError(try record.observe(partial, source: .confirmedUser))
+        XCTAssertEqual(record.baseline, c)
+        XCTAssertTrue(record.sourceUnresolved)
+        XCTAssertFalse(record.canClear)
+    }
+
+    func testForeignDisplayTopologyDoesNotMasqueradeAsMissingTarget() throws {
+        var record = try ownedRecord()
+        let foreign = try DisplayLayout(main: internalID, origins: [
+            internalID: DisplayOrigin(x: 0, y: 0), otherID: DisplayOrigin(x: 1728, y: 0)
+        ])
+        XCTAssertThrowsError(try record.observe(foreign, source: .reconnect))
+        XCTAssertEqual(record.baseline, try layout())
+        XCTAssertTrue(record.sourceUnresolved)
+        XCTAssertThrowsError(try record.prepareReapplication(current: record.applied, target: record.applied))
     }
 
     func testInFlightCallbackCannotBecomeUserBaseline() throws {

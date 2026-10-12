@@ -51,6 +51,8 @@ public struct ProtectionAuthorization {
     public init() {}
 
     public mutating func acknowledge(receipt: ProtectionHandshake, expected: ProtectionHandshake) throws {
+        ready = false
+        acknowledgedHandshake = nil
         guard !lost else { throw RecoveryError.unfinishedTransaction }
         try receipt.validate()
         try expected.validate()

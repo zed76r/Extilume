@@ -58,7 +58,7 @@ final class GuardDrill: @unchecked Sendable {
     func start() throws {
         try queue.sync {
             guard try store.load() == nil else { throw RecoveryError.unfinishedTransaction }
-            let baseline = try stableSnapshot().layout()
+            let baseline = try freshSnapshot().layout()
             let prepared = try RecoveryRecord(baseline: baseline, target: baseline)
             do {
                 record = try store.apply(prepared) {
@@ -91,7 +91,7 @@ final class GuardDrill: @unchecked Sendable {
                         throw GuardError.protectionLost
                     }
                     try authorization.authorize(record: durable)
-                    return (try stableSnapshot().layout(), nil)
+                    return (try freshSnapshot().layout(), nil)
                 }
             } catch {
                 record = try store.load()
@@ -136,7 +136,7 @@ final class GuardDrill: @unchecked Sendable {
             }
             latest.beginRestoration()
             try store.save(latest)
-            try latest.confirmRestored(actual: stableSnapshot().layout())
+            try latest.confirmRestored(actual: freshSnapshot().layout())
             try store.save(latest)
             if authorization.ready {
                 do { try channel?.send(GuardCommand.quiesce) }
@@ -218,7 +218,7 @@ final class DisplayGuard: @unchecked Sendable {
                   record.baseline == record.applied, record.internalDisplay == nil else {
                 throw GuardError.missingRecord
             }
-            let actual = try stableSnapshot().layout()
+            let actual = try freshSnapshot().layout()
             guard actual == record.baseline else { throw RecoveryError.unfinishedTransaction }
             if !record.canClear {
                 record.beginRestoration()

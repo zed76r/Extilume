@@ -1,3 +1,4 @@
+import AppKit
 import CoreGraphics
 import CoreFoundation
 import Darwin
@@ -137,6 +138,7 @@ private enum ProbeError: Error, CustomStringConvertible {
     case noDisplays(String)
     case displayModeReadFailed
     case noHDMIService
+    case eventLoopUnavailable
 
     var description: String {
         switch self {
@@ -144,6 +146,7 @@ private enum ProbeError: Error, CustomStringConvertible {
         case .noDisplays(let list): "CoreGraphics 返回的\(list)显示列表为空"
         case .displayModeReadFailed: "CoreGraphics 无法读取当前显示模式"
         case .noHDMIService: "没有唯一匹配的物理 HDMI 设备"
+        case .eventLoopUnavailable: "无法启动后台显示事件循环"
         }
     }
 }
@@ -292,6 +295,15 @@ private func architectureName() -> String {
     #endif
 }
 
+@MainActor
+private func displayEventApplication() throws -> NSApplication {
+    let application = NSApplication.shared
+    guard application.activationPolicy() == .prohibited || application.setActivationPolicy(.prohibited) else {
+        throw ProbeError.eventLoopUnavailable
+    }
+    return application
+}
+
 if CommandLine.arguments.dropFirst().contains(where: { $0 == "--help" || $0 == "-h" }) {
     print("""
     只读：extilume-probe
@@ -306,6 +318,7 @@ if CommandLine.arguments.dropFirst().contains(where: { $0 == "--help" || $0 == "
     """)
 } else if CommandLine.arguments.count == 2, CommandLine.arguments[1] == "--watch-connection" {
     do {
+        let application = try displayEventApplication()
         let observer = try ConnectionObserver(service: matchedHDMIService())
         try observer.start()
         print("只读 HDMI 事件观察已启动；mark 仅人工标记，stop 结束。不修改显示设置。")
@@ -313,7 +326,7 @@ if CommandLine.arguments.dropFirst().contains(where: { $0 == "--help" || $0 == "
             while let command = readLine() { observer.command(command) }
             observer.command("stop")
         }
-        withExtendedLifetime(observer) { CFRunLoopRun() }
+        withExtendedLifetime(observer) { application.run() }
     } catch {
         fputs("HDMI 物理事件观察未就绪；未执行配置写入。\n", stderr)
         exit(EXIT_FAILURE)
@@ -355,8 +368,9 @@ if CommandLine.arguments.dropFirst().contains(where: { $0 == "--help" || $0 == "
         } else if CommandLine.arguments[1] == "--recover-primary" {
             try controller.recoverOnly()
         } else {
+            let application = try displayEventApplication()
             try controller.start()
-            withExtendedLifetime(controller) { CFRunLoopRun() }
+            withExtendedLifetime(controller) { application.run() }
         }
     } catch {
         fputs("主屏验证未完成；保留已有责任记录。未执行内屏停用。\n", stderr)

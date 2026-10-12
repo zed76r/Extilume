@@ -58,6 +58,28 @@ final class ProtectionHandshakeTests: XCTestCase {
         XCTAssertNoThrow(try authorization.authorize(record: prepared))
     }
 
+    func testFailedNewGenerationAcknowledgementRevokesPreviousReadiness() throws {
+        let contract1 = try handshake(generation: 1)
+        let contract2 = try handshake(generation: 2)
+        var authorization = ProtectionAuthorization()
+        try authorization.acknowledge(receipt: contract1, expected: contract1)
+
+        var record2 = try makeRecord()
+        try record2.markApplying()
+        try record2.confirmApplied(record2.applied)
+        let current = record2.applied
+        try record2.prepareReapplication(current: current, target: current)
+        XCTAssertEqual(record2.generation, 2)
+
+        XCTAssertThrowsError(try authorization.acknowledge(receipt: contract1, expected: contract2))
+        XCTAssertFalse(authorization.ready)
+        XCTAssertThrowsError(try authorization.authorize(record: record2))
+
+        try authorization.acknowledge(receipt: contract2, expected: contract2)
+        XCTAssertTrue(authorization.ready)
+        XCTAssertNoThrow(try authorization.authorize(record: record2))
+    }
+
     func testRejectsNonControlPhaseAndUnresolvedSource() throws {
         let contract = try handshake()
         var authorization = ProtectionAuthorization()

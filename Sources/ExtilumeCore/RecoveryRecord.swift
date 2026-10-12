@@ -137,7 +137,20 @@ public struct RecoveryRecord: Codable, Equatable {
             if actual != applied && actual != baseline { sourceUnresolved = true }
             return
         }
-        if actual == applied || (!layoutPending && actual == baseline) { return }
+        let present = Set(actual.origins.keys)
+        let recorded = Set(baseline.origins.keys)
+        if present != recorded {
+            guard source != .confirmedUser, present.isSubset(of: recorded) else {
+                sourceUnresolved = true
+                throw RecoveryError.unresolvedSource
+            }
+            return
+        }
+        if actual == applied {
+            layoutPending = baseline != applied
+            return
+        }
+        if !layoutPending && actual == baseline { return }
         if actual == baseline, source == .reconnect, !sourceUnresolved {
             // 重连读回旧基准只解除已验证的布局责任，不生成新的基准。
             layoutPending = false
@@ -155,7 +168,14 @@ public struct RecoveryRecord: Codable, Equatable {
 
     public mutating func observeInternalEnabled(_ actual: Bool, source: ConfigurationSource) throws {
         guard var responsibility = internalDisplay else { return }
-        if actual == responsibility.applied || (!responsibility.pending && actual == responsibility.baseline) { return }
+        if actual == responsibility.applied {
+            if phase == .owned {
+                responsibility.pending = responsibility.baseline != responsibility.applied
+                internalDisplay = responsibility
+            }
+            return
+        }
+        if !responsibility.pending && actual == responsibility.baseline { return }
         guard phase == .owned, source == .confirmedUser else {
             sourceUnresolved = true
             throw RecoveryError.unresolvedSource
@@ -238,7 +258,7 @@ public struct RecoveryRecord: Codable, Equatable {
         if layoutPending {
             layoutPending = false
         }
-        if var responsibility = internalDisplay, responsibility.pending {
+        if var responsibility = internalDisplay {
             guard internalEnabled == responsibility.baseline else { throw RecoveryError.unfinishedTransaction }
             responsibility.pending = false
             internalDisplay = responsibility
