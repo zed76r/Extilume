@@ -214,7 +214,13 @@ final class DisplayGuard: @unchecked Sendable {
     private func attemptRecovery() {
         do {
             try store.acquireExclusiveOwnership()
-            guard var record = try store.load(), contract.accepts(record: record),
+            guard var record = try store.load() else { throw GuardError.missingRecord }
+            // 不同会话不属于旧握手；保留新责任并释放锁，而非替它恢复。
+            guard record.session == contract.session else {
+                print("责任记录属于其他会话；旧辅助进程未执行恢复，保留记录并退出。")
+                exit(EXIT_SUCCESS)
+            }
+            guard contract.accepts(record: record),
                   record.baseline == record.applied, record.internalDisplay == nil else {
                 throw GuardError.missingRecord
             }

@@ -6,6 +6,7 @@ import math
 import os
 from pathlib import Path
 import select
+import signal
 import socket
 import stat
 import struct
@@ -30,6 +31,8 @@ CASES = (
     "pre-ready-helper-terminated",
     "older-generation-rejected",
     "newer-generation-readback",
+    "replaced-session-preserved",
+    "same-session-rollback-preserved",
 )
 RECORD_NAME = "recovery-record.json"
 MAX_MESSAGE = 4096
@@ -238,9 +241,10 @@ def parent_mode(case, binary, directory):
     fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     layout = current_layout(binary)
     session = uuid.uuid4()
-    record = make_record(layout, session)
+    initial_generation = 2 if case == "same-session-rollback-preserved" else 1
+    record = make_record(layout, session, generation=initial_generation)
     write_record(directory, record)
-    check_record(directory, "applying", 1)
+    check_record(directory, "applying", initial_generation)
 
     parent, child = socket.socketpair()
     helper = subprocess.Popen(
@@ -261,7 +265,7 @@ def parent_mode(case, binary, directory):
             check_record(directory, "applying", 1)
             return
 
-        contract_generation = 2 if case == "older-generation-rejected" else 1
+        contract_generation = 2 if case in {"older-generation-rejected", "same-session-rollback-preserved"} else 1
         contract = {
             "version": 1,
             "session": str(session),
@@ -285,6 +289,12 @@ def parent_mode(case, binary, directory):
         elif case == "newer-generation-readback":
             write_record(directory, make_record(layout, session, generation=2), replace=True)
             check_record(directory, "applying", 2)
+        elif case == "replaced-session-preserved":
+            write_record(directory, make_record(layout, uuid.uuid4()), replace=True)
+            require(read_record(directory)["session"] != str(session), "新会话未替换旧记录")
+        elif case == "same-session-rollback-preserved":
+            write_record(directory, make_record(layout, session), replace=True)
+            check_record(directory, "applying", 1)
         else:
             require(False, "未知交错场景")
 
@@ -332,10 +342,19 @@ def wait_restored(directory, generation, timeout=8):
         select.select([], [], [], min(0.05, remaining))
 
 
+def helper_pids(directory):
+    result = []
+    for row in DRILL.processes():
+        arguments = row[4].split()
+        if row[2] == str(os.getuid()) and not row[3].startswith("Z") and len(arguments) == 4 \
+                and arguments[1:3] == ["--display-guard", str(directory)]:
+            result.append(int(row[0]))
+    return result
+
+
 def wait_helpers_exited(directory):
     deadline = time.monotonic() + 5
-    while any("--display-guard" in row[4].split() and str(directory) in row[4].split()
-              and not row[3].startswith("Z") for row in DRILL.processes()):
+    while helper_pids(directory):
         require(time.monotonic() < deadline, "本轮辅助进程尚未退出；责任目录保留")
         time.sleep(0.05)
 
@@ -376,6 +395,26 @@ def main(arguments):
             if case in {"pre-ready-helper-terminated", "older-generation-rejected"}:
                 check_record(active_directory, "applying", generation)
                 require(run_primary(binary, "--recover-primary", active_directory) == 0, "补偿恢复失败")
+                check_record(active_directory, "restored", generation)
+            elif case == "replaced-session-preserved":
+                check_record(active_directory, "applying", generation)
+                preserved = record_path(active_directory).read_bytes()
+                wait_helpers_exited(active_directory)
+                require(record_path(active_directory).read_bytes() == preserved, "旧辅助进程修改新会话责任")
+                require(run_primary(binary, "--recover-primary", active_directory) == 0, "新会话不能取得恢复归属")
+                check_record(active_directory, "restored", generation)
+            elif case == "same-session-rollback-preserved":
+                check_record(active_directory, "applying", generation)
+                preserved = record_path(active_directory).read_bytes()
+                select.select([], [], [], 0.3)
+                helpers = helper_pids(active_directory)
+                require(len(helpers) == 1, "同会话回退时辅助进程未保留")
+                require(run_primary(binary, "--recover-primary", active_directory) != 0, "回退记录意外转移恢复归属")
+                require(record_path(active_directory).read_bytes() == preserved, "回退责任被修改")
+                # 此故障 fixture 无显示改动，结束自己的辅助进程后单独核验收束。
+                os.kill(helpers[0], signal.SIGTERM)
+                wait_helpers_exited(active_directory)
+                require(run_primary(binary, "--recover-primary", active_directory) == 0, "回退 fixture 收束失败")
                 check_record(active_directory, "restored", generation)
             else:
                 wait_restored(active_directory, generation)
