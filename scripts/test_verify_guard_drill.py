@@ -1,8 +1,16 @@
+import contextlib
 import importlib.util
+import io
 from pathlib import Path
+import socket
+import struct
 import subprocess
 import sys
+import tempfile
+import threading
+import time
 import unittest
+from unittest.mock import patch
 
 
 sys.dont_write_bytecode = True
@@ -10,6 +18,11 @@ SCRIPT = Path(__file__).with_name("verify-guard-drill.py")
 SPEC = importlib.util.spec_from_file_location("verify_guard_drill", SCRIPT)
 VERIFY_GUARD_DRILL = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(VERIFY_GUARD_DRILL)
+INTERLEAVINGS_SPEC = importlib.util.spec_from_file_location(
+    "verify_guard_interleavings", Path(__file__).with_name("verify-guard-interleavings.py")
+)
+INTERLEAVINGS = importlib.util.module_from_spec(INTERLEAVINGS_SPEC)
+INTERLEAVINGS_SPEC.loader.exec_module(INTERLEAVINGS)
 
 
 def start_child(source):
@@ -69,6 +82,50 @@ class ReadyLineTests(unittest.TestCase):
                         VERIFY_GUARD_DRILL.ready_line(process, timeout=2)
                 finally:
                     kill_and_reap(process)
+
+
+class FailureCleanupTests(unittest.TestCase):
+    def test_failed_startup_reaps_parent_and_preserves_responsibility(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / "state"
+            state.mkdir(mode=0o700)
+            marker = state / "keep"
+            marker.write_text("pending")
+            child = start_child(
+                "import os, time; os.write(1, b'not-ready\\n'); time.sleep(30)"
+            )
+            try:
+                with patch.object(VERIFY_GUARD_DRILL.tempfile, "mkdtemp", return_value=str(state)), \
+                     patch.object(VERIFY_GUARD_DRILL.subprocess, "Popen", return_value=child), \
+                     contextlib.redirect_stderr(io.StringIO()):
+                    with self.assertRaisesRegex(RuntimeError, "演练未就绪"):
+                        VERIFY_GUARD_DRILL.run_case(Path(sys.executable), "stop")
+                self.assertIsNotNone(child.returncode)
+                self.assertEqual(marker.read_text(), "pending")
+            finally:
+                kill_and_reap(child)
+
+
+class FrameDeadlineTests(unittest.TestCase):
+    def test_header_and_payload_share_one_deadline(self):
+        receiver, sender = socket.socketpair()
+
+        def delayed_frame():
+            time.sleep(0.1)
+            sender.sendall(struct.pack(">I", 2))
+            time.sleep(0.1)
+            sender.sendall(b"{}")
+
+        writer = threading.Thread(target=delayed_frame)
+        writer.start()
+        try:
+            with self.assertRaises((socket.timeout, RuntimeError)):
+                INTERLEAVINGS.receive_frame(receiver, timeout=0.15)
+        finally:
+            writer.join(timeout=1)
+            receiver.close()
+            sender.close()
+        self.assertFalse(writer.is_alive())
 
 
 if __name__ == "__main__":

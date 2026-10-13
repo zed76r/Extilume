@@ -78,6 +78,7 @@ def run_case(binary, command):
         if process.poll() is None:
             process.kill()
         print("演练未完成；状态保留于 " + str(directory), file=sys.stderr)
+        process.wait(timeout=5)
         raise
 
 

@@ -10,6 +10,7 @@ final class RecoveryStoreTests: XCTestCase {
     func testStaleGenerationCannotReplaceNewerResponsibility() throws {
         try withTemporaryDirectory { directory in
             let store = try RecoveryStore(directory: directory)
+            try store.acquireExclusiveOwnership()
             var newer = try makeRecord(pendingLayout: true)
             let old = newer
             try newer.confirmApplied(newer.applied)
@@ -25,6 +26,7 @@ final class RecoveryStoreTests: XCTestCase {
     func testSaveAndLoadUseRestrictedFileAndPreserveRecord() throws {
         try withTemporaryDirectory { directory in
             let store = try RecoveryStore(directory: directory)
+            try store.acquireExclusiveOwnership()
             let record = try makeRecord(pendingLayout: true)
 
             try store.save(record)
@@ -60,6 +62,7 @@ final class RecoveryStoreTests: XCTestCase {
     func testRejectsSymlinkRecordWithoutFollowingOrReplacingIt() throws {
         try withTemporaryDirectory { directory in
             let store = try RecoveryStore(directory: directory)
+            try store.acquireExclusiveOwnership()
             let target = directory.appendingPathComponent("fixture.json")
             XCTAssertTrue(FileManager.default.createFile(atPath: target.path, contents: Data("fixture".utf8)))
             XCTAssertEqual(chmod(target.path, mode_t(0o600)), 0)
@@ -81,6 +84,7 @@ final class RecoveryStoreTests: XCTestCase {
     func testRejectsMalformedPayloadAndDoesNotOverwriteIt() throws {
         try withTemporaryDirectory { directory in
             let store = try RecoveryStore(directory: directory)
+            try store.acquireExclusiveOwnership()
             let url = recordURL(in: directory)
             let malformed = Data("not-json".utf8)
             try malformed.write(to: url)
@@ -116,6 +120,7 @@ final class RecoveryStoreTests: XCTestCase {
     func testRejectsRelaxedRecordPermissionsWithoutOverwriting() throws {
         try withTemporaryDirectory { directory in
             let store = try RecoveryStore(directory: directory)
+            try store.acquireExclusiveOwnership()
             let existing = try makeRecord(pendingLayout: true)
             try store.save(existing)
             let url = recordURL(in: directory)
@@ -135,6 +140,7 @@ final class RecoveryStoreTests: XCTestCase {
     func testRejectsNonRegularRecordWithoutReplacingIt() throws {
         try withTemporaryDirectory { directory in
             let store = try RecoveryStore(directory: directory)
+            try store.acquireExclusiveOwnership()
             let url = recordURL(in: directory)
             try FileManager.default.createDirectory(at: url, withIntermediateDirectories: false)
 
@@ -161,6 +167,7 @@ final class RecoveryStoreTests: XCTestCase {
         for record in [prepared, applying, restoring, pendingLayout, pendingInternal] {
             try withTemporaryDirectory { directory in
                 let store = try RecoveryStore(directory: directory)
+                try store.acquireExclusiveOwnership()
                 try store.save(record)
                 XCTAssertFalse(record.canClear)
                 XCTAssertThrowsError(try store.clear()) { error in
@@ -174,6 +181,7 @@ final class RecoveryStoreTests: XCTestCase {
     func testDifferentSessionCannotReplacePendingResponsibility() throws {
         try withTemporaryDirectory { directory in
             let store = try RecoveryStore(directory: directory)
+            try store.acquireExclusiveOwnership()
             let existing = try makeRecord(
                 pendingLayout: true,
                 session: UUID(uuidString: "00000000-0000-4000-8000-000000000001")!
@@ -194,6 +202,7 @@ final class RecoveryStoreTests: XCTestCase {
     func testConfirmedRecoveryCanBeClearedAndMissingRecordIsNoOp() throws {
         try withTemporaryDirectory { directory in
             let store = try RecoveryStore(directory: directory)
+            try store.acquireExclusiveOwnership()
             XCTAssertNoThrow(try store.clear())
 
             var record = try makeRecord(pendingLayout: false)
@@ -210,6 +219,7 @@ final class RecoveryStoreTests: XCTestCase {
     func testApplicationCannotRunBeforeResponsibilityIsPersisted() throws {
         try withTemporaryDirectory { directory in
             let store = try RecoveryStore(directory: directory)
+            try store.acquireExclusiveOwnership()
             let prepared = try makeRecord(pendingLayout: true)
             let owned = try store.apply(prepared) {
                 let saved = try XCTUnwrap(store.load())
@@ -236,6 +246,7 @@ final class RecoveryStoreTests: XCTestCase {
     func testFailedApplicationKeepsResponsibilityAndRejectsRetry() throws {
         try withTemporaryDirectory { directory in
             let store = try RecoveryStore(directory: directory)
+            try store.acquireExclusiveOwnership()
             let prepared = try makeRecord(pendingLayout: true)
             XCTAssertThrowsError(try store.apply(prepared) {
                 throw RecoveryStoreError.ioFailure
@@ -248,6 +259,81 @@ final class RecoveryStoreTests: XCTestCase {
                 return (prepared.applied, nil)
             })
             XCTAssertFalse(invoked)
+        }
+    }
+
+    func testUnownedStoreCannotSaveClearOrApply() throws {
+        try withTemporaryDirectory { directory in
+            let store = try RecoveryStore(directory: directory)
+            let record = try makeRecord(pendingLayout: true)
+
+            XCTAssertThrowsError(try store.save(record)) { error in
+                XCTAssertEqual(error as? RecoveryStoreError, .ownershipUnavailable)
+            }
+            XCTAssertNil(try store.load())
+        }
+
+        try withTemporaryDirectory { directory in
+            let store = try RecoveryStore(directory: directory)
+
+            XCTAssertThrowsError(try store.clear()) { error in
+                XCTAssertEqual(error as? RecoveryStoreError, .ownershipUnavailable)
+            }
+            XCTAssertNil(try store.load())
+        }
+
+        try withTemporaryDirectory { directory in
+            let store = try RecoveryStore(directory: directory)
+            let prepared = try makeRecord(pendingLayout: true)
+            var operationInvoked = false
+
+            XCTAssertThrowsError(try store.apply(prepared) {
+                operationInvoked = true
+                return (prepared.applied, nil)
+            }) { error in
+                XCTAssertEqual(error as? RecoveryStoreError, .ownershipUnavailable)
+            }
+            XCTAssertFalse(operationInvoked)
+            XCTAssertNil(try store.load())
+        }
+    }
+
+    func testUnownedStoreCannotOverwriteOrClearOwnersRestoredRecord() throws {
+        try withTemporaryDirectory { directory in
+            let owner = try RecoveryStore(directory: directory)
+            try owner.acquireExclusiveOwnership()
+
+            var restored = try makeRecord(pendingLayout: false)
+            restored.beginRestoration()
+            try restored.confirmRestored(actual: restored.baseline)
+            XCTAssertTrue(restored.canClear)
+            try owner.save(restored)
+
+            let originalBytes = try Data(contentsOf: recordURL(in: directory))
+            let unowned = try RecoveryStore(directory: directory)
+            XCTAssertThrowsError(try unowned.acquireExclusiveOwnership())
+            XCTAssertEqual(try unowned.load(), restored)
+
+            var newer = try makeRecord(pendingLayout: true, session: restored.session)
+            try newer.confirmApplied(newer.applied)
+            try newer.prepareReapplication(current: newer.applied, target: newer.applied)
+            XCTAssertGreaterThan(newer.generation, restored.generation)
+
+            XCTAssertThrowsError(try unowned.save(newer)) { error in
+                XCTAssertEqual(error as? RecoveryStoreError, .ownershipUnavailable)
+            }
+            XCTAssertEqual(try Data(contentsOf: recordURL(in: directory)), originalBytes)
+            XCTAssertEqual(try unowned.load(), restored)
+
+            XCTAssertThrowsError(try unowned.clear()) { error in
+                XCTAssertEqual(error as? RecoveryStoreError, .ownershipUnavailable)
+            }
+            XCTAssertEqual(try Data(contentsOf: recordURL(in: directory)), originalBytes)
+            XCTAssertEqual(try unowned.load(), restored)
+
+            try owner.clear()
+            XCTAssertNil(try owner.load())
+            XCTAssertNil(try unowned.load())
         }
     }
 

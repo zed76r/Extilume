@@ -14,12 +14,12 @@ public enum RecoveryStoreError: Error, Equatable {
     case ownershipUnavailable
 }
 
-// shortcut: 写入调用方须先取得独占锁，辅助进程接入前补齐会话与代次的恢复归属协议。
 public final class RecoveryStore {
     private static let recordName = "recovery-record.json"
     private static let maximumRecordSize = 1_048_576
 
     private let directoryDescriptor: Int32
+    private var ownsExclusiveLock = false
 
     public init(directory: URL) throws {
         guard directory.isFileURL, !directory.path.isEmpty else {
@@ -50,12 +50,14 @@ public final class RecoveryStore {
         guard flock(directoryDescriptor, LOCK_EX | LOCK_NB) == 0 else {
             throw RecoveryStoreError.ownershipUnavailable
         }
+        ownsExclusiveLock = true
     }
 
     public func apply(
         _ prepared: RecoveryRecord,
         operation: () throws -> (layout: DisplayLayout, internalEnabled: Bool?)
     ) throws -> RecoveryRecord {
+        guard ownsExclusiveLock else { throw RecoveryStoreError.ownershipUnavailable }
         guard prepared.phase == .prepared, !prepared.sourceUnresolved else {
             throw RecoveryError.unfinishedTransaction
         }
@@ -77,6 +79,7 @@ public final class RecoveryStore {
     }
 
     public func save(_ record: RecoveryRecord) throws {
+        guard ownsExclusiveLock else { throw RecoveryStoreError.ownershipUnavailable }
         do {
             try record.validate()
         } catch {
@@ -217,6 +220,7 @@ public final class RecoveryStore {
     }
 
     public func clear() throws {
+        guard ownsExclusiveLock else { throw RecoveryStoreError.ownershipUnavailable }
         guard let record = try load() else { return }
         guard record.canClear else { throw RecoveryStoreError.unresolvedResponsibility }
 
