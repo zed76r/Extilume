@@ -1,7 +1,9 @@
 import contextlib
 import importlib.util
 import io
+import os
 from pathlib import Path
+import signal
 import socket
 import struct
 import subprocess
@@ -97,13 +99,94 @@ class FailureCleanupTests(unittest.TestCase):
             try:
                 with patch.object(VERIFY_GUARD_DRILL.tempfile, "mkdtemp", return_value=str(state)), \
                      patch.object(VERIFY_GUARD_DRILL.subprocess, "Popen", return_value=child), \
+                     patch.object(child, "wait", wraps=child.wait) as wait, \
                      contextlib.redirect_stderr(io.StringIO()):
                     with self.assertRaisesRegex(RuntimeError, "演练未就绪"):
                         VERIFY_GUARD_DRILL.run_case(Path(sys.executable), "stop")
+                wait.assert_called_once_with(timeout=5)
                 self.assertIsNotNone(child.returncode)
                 self.assertEqual(marker.read_text(), "pending")
             finally:
                 kill_and_reap(child)
+
+
+class KillDrillTests(unittest.TestCase):
+    def test_kill_targets_own_popen_and_measures_through_helper_exit_and_finalize(self):
+        events = []
+
+        class FakePopen:
+            pid = 123
+            returncode = None
+
+            def poll(self):
+                return self.returncode
+
+            def send_signal(self, sent_signal):
+                events.append(("signal", sent_signal))
+                self.returncode = -sent_signal
+                record_path.write_text('{"phase":"restored"}')
+
+            def wait(self, timeout=None):
+                self.wait_timeout = timeout
+                return self.returncode
+
+            def communicate(self, input=None, timeout=None):
+                return "主进程退出后独立读取并核验完成\n", None
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            state = Path(temporary_directory) / "state"
+            state.mkdir(mode=0o700)
+            record_path = state / "recovery-record.json"
+            record_path.write_text('{"phase":"owned","baseline":{},"applied":{}}')
+            record_path.chmod(0o600)
+            child = FakePopen()
+            clock_values = iter((100, 125, 200, 240))
+            finalize_count = 0
+
+            def clock():
+                value = next(clock_values)
+                events.append(("clock", value))
+                if value == 240:
+                    events.append(("state-exists-at-final-clock", state.exists()))
+                return value
+
+            def run(command, **_kwargs):
+                nonlocal finalize_count
+                if command[1] == "--guard-drill":
+                    return subprocess.CompletedProcess(command, 1)
+                if command[1] == "--finalize-primary":
+                    finalize_count += 1
+                    if finalize_count == 2:
+                        events.append("finalize-success")
+                        record_path.unlink()
+                        return subprocess.CompletedProcess(command, 0)
+                    return subprocess.CompletedProcess(command, 1)
+                self.fail("unexpected subprocess command")
+
+            def process_rows():
+                if child.returncode is not None:
+                    events.append("helper-absent")
+                    return []
+                return [["321", str(child.pid), str(os.getuid()), "S", "probe --display-guard"]]
+
+            with patch.object(VERIFY_GUARD_DRILL.tempfile, "mkdtemp", return_value=str(state)), \
+                 patch.object(VERIFY_GUARD_DRILL.subprocess, "Popen", return_value=child), \
+                 patch.object(VERIFY_GUARD_DRILL.subprocess, "run", side_effect=run), \
+                 patch.object(VERIFY_GUARD_DRILL, "ready_line"), \
+                 patch.object(VERIFY_GUARD_DRILL, "processes", side_effect=process_rows), \
+                 patch.object(VERIFY_GUARD_DRILL, "continuous_nanoseconds", side_effect=clock), \
+                 patch.object(VERIFY_GUARD_DRILL.time, "sleep"), \
+                 contextlib.redirect_stdout(io.StringIO()) as output:
+                VERIFY_GUARD_DRILL.run_case(Path("probe"), "kill")
+
+            self.assertEqual(child.returncode, -signal.SIGKILL)
+            self.assertEqual(child.wait_timeout, 8)
+            self.assertLess(events.index(("clock", 100)), events.index(("signal", signal.SIGKILL)))
+            self.assertLess(events.index("helper-absent"), events.index(("clock", 200)))
+            self.assertLess(events.index("finalize-success"), events.index(("clock", 240)))
+            self.assertIn(("state-exists-at-final-clock", False), events)
+            self.assertIn("耗时上界=140 ns", output.getvalue())
+            self.assertIn("非真实内屏恢复、物理拔线 10 s 或任务 4.4 完成", output.getvalue())
 
 
 class FrameDeadlineTests(unittest.TestCase):
