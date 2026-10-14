@@ -232,6 +232,245 @@ final class RecoveryStoreTests: XCTestCase {
         }
     }
 
+    func testPrewriteCancellationWithoutPreviousOwnershipRestoresBaselineAndCanRetry() throws {
+        try withTemporaryDirectory { directory in
+            let store = try RecoveryStore(directory: directory)
+            try store.acquireExclusiveOwnership()
+            let prepared = try makeRecord(pendingLayout: true)
+            var configurationWriterInvoked = false
+
+            XCTAssertThrowsError(try store.apply(prepared, beforeOperation: {
+                throw CancellationError()
+            }) {
+                configurationWriterInvoked = true
+                return (prepared.applied, nil)
+            }) { error in
+                XCTAssertTrue(error is CancellationError)
+            }
+
+            XCTAssertFalse(configurationWriterInvoked)
+            let rolledBack = try XCTUnwrap(store.load())
+            XCTAssertEqual(rolledBack.phase, .owned)
+            XCTAssertEqual(rolledBack.session, prepared.session)
+            XCTAssertEqual(rolledBack.generation, prepared.generation)
+            XCTAssertEqual(rolledBack.baseline, prepared.baseline)
+            XCTAssertEqual(rolledBack.applied, prepared.baseline)
+            XCTAssertFalse(rolledBack.layoutPending)
+            XCTAssertNil(rolledBack.internalDisplay)
+            XCTAssertFalse(rolledBack.canClear)
+            XCTAssertThrowsError(try store.clear()) { error in
+                XCTAssertEqual(error as? RecoveryStoreError, .unresolvedResponsibility)
+            }
+
+            var retry = rolledBack
+            try retry.prepareReapplication(current: rolledBack.baseline, target: prepared.applied)
+            let reapplied = try store.apply(retry) { (retry.applied, nil) }
+            XCTAssertEqual(reapplied.phase, .owned)
+            XCTAssertGreaterThan(reapplied.generation, rolledBack.generation)
+            XCTAssertEqual(try store.load(), reapplied)
+        }
+    }
+
+    func testConnectionInvalidationDuringPrewriteReadbackKeepsApplicationRetryable() throws {
+        try withTemporaryDirectory { directory in
+            let queue = DispatchQueue(label: "RecoveryStoreTests.prewrite-readback")
+            let scheduler = PrimaryReapplicationScheduler(ownerQueue: queue)
+            let readbackEntered = DispatchSemaphore(value: 0)
+            let resumeReadback = DispatchSemaphore(value: 0)
+            let completed = DispatchSemaphore(value: 0)
+            let writer = DispatchSemaphore(value: 0)
+            let main = mainIdentity
+            let outer = outerIdentity
+            queue.sync {
+                scheduler.schedule { isCurrent in
+                    defer { completed.signal() }
+                    do {
+                        let store = try RecoveryStore(directory: directory)
+                        try store.acquireExclusiveOwnership()
+                        let baseline = try DisplayLayout(main: main, origins: [
+                            main: DisplayOrigin(x: 0, y: 0), outer: DisplayOrigin(x: 100, y: 0)
+                        ])
+                        let target = try DisplayLayout(main: outer, origins: [
+                            main: DisplayOrigin(x: -100, y: 0), outer: DisplayOrigin(x: 0, y: 0)
+                        ])
+                        let prepared = try RecoveryRecord(baseline: baseline, target: target)
+                        XCTAssertThrowsError(try store.apply(prepared, beforeOperation: {
+                            XCTAssertEqual(try store.load()?.phase, .applying)
+                            readbackEntered.signal()
+                            guard resumeReadback.wait(timeout: .now() + 2) == .success,
+                                  isCurrent() else { throw CancellationError() }
+                        }) {
+                            writer.signal()
+                            return (target, nil)
+                        }) { XCTAssertTrue($0 is CancellationError) }
+                        XCTAssertEqual(writer.wait(timeout: .now()), .timedOut)
+                        var retry = try XCTUnwrap(store.load())
+                        XCTAssertEqual(retry.phase, .owned)
+                        try retry.prepareReapplication(current: baseline, target: target)
+                        let applied = try store.apply(retry) {
+                            writer.signal()
+                            return (target, nil)
+                        }
+                        XCTAssertEqual(applied.phase, .owned)
+                        XCTAssertEqual(applied.baseline, baseline)
+                    } catch { XCTFail("受控写前取消交错失败：\(error)") }
+                }
+            }
+            XCTAssertEqual(readbackEntered.wait(timeout: .now() + 1.5), .success)
+            scheduler.invalidate()
+            resumeReadback.signal()
+            XCTAssertEqual(completed.wait(timeout: .now() + 1.5), .success)
+            XCTAssertEqual(writer.wait(timeout: .now()), .success)
+            XCTAssertEqual(writer.wait(timeout: .now()), .timedOut)
+        }
+    }
+
+    func testPrewriteCancellationPreservesExistingPendingLayoutAndInternalResponsibility() throws {
+        try withTemporaryDirectory { directory in
+            let store = try RecoveryStore(directory: directory)
+            try store.acquireExclusiveOwnership()
+            let initial = try makeRecord(pendingLayout: true, pendingInternal: true)
+            let originalOwned = try store.apply(initial) { (initial.applied, true) }
+            XCTAssertTrue(originalOwned.layoutPending)
+            XCTAssertEqual(originalOwned.internalDisplay?.pending, true)
+
+            var prepared = originalOwned
+            let nextTarget = try layout(otherX: -250)
+            try prepared.prepareReapplication(current: originalOwned.applied, target: nextTarget)
+            var operationInvoked = false
+
+            XCTAssertThrowsError(try store.apply(prepared, beforeOperation: {
+                throw CancellationError()
+            }) {
+                operationInvoked = true
+                return (prepared.applied, true)
+            }) { error in
+                XCTAssertTrue(error is CancellationError)
+            }
+
+            XCTAssertFalse(operationInvoked)
+            let restored = try XCTUnwrap(store.load())
+            XCTAssertEqual(restored.phase, .owned)
+            XCTAssertEqual(restored.version, originalOwned.version)
+            XCTAssertEqual(restored.session, originalOwned.session)
+            XCTAssertEqual(restored.generation, prepared.generation)
+            XCTAssertEqual(restored.baseline, originalOwned.baseline)
+            XCTAssertEqual(restored.applied, originalOwned.applied)
+            XCTAssertEqual(restored.layoutPending, originalOwned.layoutPending)
+            XCTAssertEqual(restored.internalDisplay, originalOwned.internalDisplay)
+            XCTAssertEqual(restored.sourceUnresolved, originalOwned.sourceUnresolved)
+
+            var retry = restored
+            try retry.prepareReapplication(current: restored.applied, target: nextTarget)
+            XCTAssertGreaterThan(retry.generation, restored.generation)
+            let reapplied = try store.apply(retry) { (retry.applied, true) }
+            XCTAssertEqual(reapplied.phase, .owned)
+            XCTAssertEqual(try store.load(), reapplied)
+        }
+    }
+
+    func testPrewriteCancellationPreservesUserConfirmedBaselineWithNoPendingLayout() throws {
+        try withTemporaryDirectory { directory in
+            let store = try RecoveryStore(directory: directory)
+            try store.acquireExclusiveOwnership()
+            let initial = try makeRecord(pendingLayout: true)
+            var owned = try store.apply(initial) { (initial.applied, nil) }
+            let confirmedC = try layout(otherX: 350)
+            try owned.observe(confirmedC, source: .confirmedUser)
+            XCTAssertFalse(owned.layoutPending)
+            XCTAssertNotEqual(owned.applied, owned.baseline)
+            try store.save(owned)
+            let originalOwned = owned
+
+            let nextTarget = try layout(otherX: -250)
+            try owned.prepareReapplication(current: confirmedC, target: nextTarget)
+            var operationInvoked = false
+
+            XCTAssertThrowsError(try store.apply(owned, beforeOperation: {
+                throw CancellationError()
+            }) {
+                operationInvoked = true
+                return (owned.applied, nil)
+            }) { error in
+                XCTAssertTrue(error is CancellationError)
+            }
+
+            XCTAssertFalse(operationInvoked)
+            let restored = try XCTUnwrap(store.load())
+            XCTAssertEqual(restored.phase, .owned)
+            XCTAssertEqual(restored.generation, owned.generation)
+            XCTAssertEqual(restored.baseline, confirmedC)
+            XCTAssertEqual(restored.applied, originalOwned.applied)
+            XCTAssertNotEqual(restored.applied, restored.baseline)
+            XCTAssertFalse(restored.layoutPending)
+            XCTAssertEqual(restored.internalDisplay, originalOwned.internalDisplay)
+
+            var retry = restored
+            try retry.prepareReapplication(current: confirmedC, target: nextTarget)
+            let reapplied = try store.apply(retry) { (retry.applied, nil) }
+            XCTAssertEqual(reapplied.phase, .owned)
+            XCTAssertEqual(try store.load(), reapplied)
+        }
+    }
+
+    func testOperationCancellationLeavesApplyingAndRejectsRetry() throws {
+        try withTemporaryDirectory { directory in
+            let store = try RecoveryStore(directory: directory)
+            try store.acquireExclusiveOwnership()
+            let prepared = try makeRecord(pendingLayout: true)
+            var operationInvoked = false
+
+            XCTAssertThrowsError(try store.apply(prepared, beforeOperation: {}) {
+                operationInvoked = true
+                throw CancellationError()
+            }) { error in
+                XCTAssertTrue(error is CancellationError)
+            }
+
+            XCTAssertTrue(operationInvoked)
+            let applying = try XCTUnwrap(store.load())
+            XCTAssertEqual(applying.phase, .applying)
+            var retry = applying
+            XCTAssertThrowsError(try retry.prepareReapplication(current: applying.applied, target: prepared.applied))
+            var retryOperationInvoked = false
+            XCTAssertThrowsError(try store.apply(prepared, beforeOperation: {}) {
+                retryOperationInvoked = true
+                return (prepared.applied, nil)
+            })
+            XCTAssertFalse(retryOperationInvoked)
+        }
+    }
+
+    func testPrewriteCancellationRollbackSaveFailureDoesNotPersistOwnedRecord() throws {
+        try withTemporaryDirectory { directory in
+            let store = try RecoveryStore(directory: directory)
+            try store.acquireExclusiveOwnership()
+            let prepared = try makeRecord(pendingLayout: true)
+            let url = recordURL(in: directory)
+            defer { _ = chmod(url.path, mode_t(0o600)) }
+            var applyingSnapshot: RecoveryRecord?
+            var operationInvoked = false
+
+            XCTAssertThrowsError(try store.apply(prepared, beforeOperation: {
+                applyingSnapshot = try XCTUnwrap(store.load())
+                XCTAssertEqual(applyingSnapshot?.phase, .applying)
+                XCTAssertEqual(chmod(url.path, mode_t(0o400)), 0)
+                throw CancellationError()
+            }) {
+                operationInvoked = true
+                return (prepared.applied, nil)
+            }) { error in
+                XCTAssertEqual(error as? RecoveryStoreError, .unsafeRecordFile)
+            }
+
+            XCTAssertFalse(operationInvoked)
+            XCTAssertEqual(chmod(url.path, mode_t(0o600)), 0)
+            let persisted = try XCTUnwrap(store.load())
+            XCTAssertEqual(persisted, applyingSnapshot)
+            XCTAssertEqual(persisted.phase, .applying)
+        }
+    }
+
     func testExclusiveOwnershipRejectsSecondControllerAndReleasesOnExit() throws {
         try withTemporaryDirectory { directory in
             var owner: RecoveryStore? = try RecoveryStore(directory: directory)

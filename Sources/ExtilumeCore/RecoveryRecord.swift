@@ -121,6 +121,30 @@ public struct RecoveryRecord: Codable, Equatable {
         phase = .applying
     }
 
+    // 仅用于尚未调用操作的预检失败；旧 applied 即使无 pending 也关系到退出补偿。
+    mutating func cancelBeforeApplication(previous: RecoveryRecord?) throws {
+        guard phase == .applying, !sourceUnresolved else { throw RecoveryError.invalidTransition }
+        if let previous, previous.phase == .owned {
+            guard previous.session == session, previous.baseline == baseline,
+                  previous.generation < generation else { throw RecoveryError.invalidTransition }
+            let cancelledGeneration = generation
+            self = previous
+            generation = cancelledGeneration
+        } else {
+            guard previous == nil || previous?.canClear == true else { throw RecoveryError.invalidTransition }
+            applied = baseline
+            layoutPending = false
+            if let responsibility = internalDisplay {
+                internalDisplay = InternalDisplayResponsibility(
+                    identity: responsibility.identity, baseline: responsibility.baseline,
+                    applied: responsibility.baseline
+                )
+            }
+        }
+        phase = .owned
+        try validate()
+    }
+
     public mutating func confirmApplied(_ actual: DisplayLayout, internalEnabled: Bool? = nil) throws {
         guard phase == .applying || phase == .prepared else { throw RecoveryError.invalidTransition }
         guard actual == applied,

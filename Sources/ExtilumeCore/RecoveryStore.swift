@@ -55,13 +55,15 @@ public final class RecoveryStore {
 
     public func apply(
         _ prepared: RecoveryRecord,
+        beforeOperation: () throws -> Void = {},
         operation: () throws -> (layout: DisplayLayout, internalEnabled: Bool?)
     ) throws -> RecoveryRecord {
         guard ownsExclusiveLock else { throw RecoveryStoreError.ownershipUnavailable }
         guard prepared.phase == .prepared, !prepared.sourceUnresolved else {
             throw RecoveryError.unfinishedTransaction
         }
-        if let existing = try load(), !existing.canClear {
+        let previous = try load()
+        if let existing = previous, !existing.canClear {
             guard existing.phase == .owned,
                   existing.session == prepared.session,
                   prepared.generation > existing.generation,
@@ -71,6 +73,13 @@ public final class RecoveryStore {
         try save(record)
         try record.markApplying()
         try save(record)
+        // 预检须无显示副作用；操作尚未调用时才可恢复到可重试的 owned。
+        do { try beforeOperation() }
+        catch {
+            try record.cancelBeforeApplication(previous: previous)
+            try save(record)
+            throw error
+        }
         // 控制回调只能在责任记录已原子落盘后运行；失败保留 applying 责任。
         let actual = try operation()
         try record.confirmApplied(actual.layout, internalEnabled: actual.internalEnabled)

@@ -265,11 +265,12 @@ final class PrimaryController: @unchecked Sendable {
         for display in mapping { origins[display.numericID] = target.origins[display.identity] }
         var stage = "责任记录落盘"
         do {
-            record = try store.apply(prepared) {
+            record = try store.apply(prepared, beforeOperation: {
                 stage = "写入前独立读回"
                 let immediatelyBefore = try freshSnapshot()
                 guard isCurrent() else { throw PrimaryError.superseded }
                 guard immediatelyBefore == snapshot else { throw PrimaryError.unstable }
+            }) {
                 stage = "公开坐标写入"
                 try configureOrigins(origins, option: .forAppOnly)
                 stage = "写入后目标读回"
