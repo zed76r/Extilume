@@ -287,6 +287,29 @@ final class RecoveryRecordTests: XCTestCase {
         XCTAssertFalse(record.canClear)
     }
 
+    func testUncertainApplyingRecordRequiresFullBaselineForConfirmation() throws {
+        var record = try ownedRecord()
+        try record.prepareReapplication(current: record.applied, target: record.applied)
+        try record.markApplying()
+        try record.observe(layout(distance: 2000), source: .unknown)
+        XCTAssertTrue(record.sourceUnresolved)
+        let session = record.session
+        let generation = record.generation
+        XCTAssertEqual(generation, 2)
+        record.beginRestoration()
+        let partial = try DisplayLayout(main: internalID, origins: [internalID: DisplayOrigin(x: 0, y: 0)])
+        XCTAssertThrowsError(try record.confirmRestored(actual: partial))
+        XCTAssertThrowsError(try record.confirmRestored(actual: layout(distance: 2000)))
+        XCTAssertThrowsError(try record.confirmRestored(actual: layout(mainExternal: true)))
+        XCTAssertTrue(record.sourceUnresolved)
+        XCTAssertTrue(record.layoutPending)
+        try record.confirmRestored(actual: layout())
+        XCTAssertTrue(record.canClear)
+        XCTAssertEqual(record.session, session)
+        XCTAssertEqual(record.generation, generation)
+        XCTAssertEqual(record.baseline, try layout())
+    }
+
     func testUnobservedDDoesNotMasqueradeAsDirectCExit() throws {
         var record = try ownedRecord()
         try record.observe(layout(distance: -1920), source: .confirmedUser)

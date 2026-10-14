@@ -163,6 +163,7 @@ final class DisplayGuard: @unchecked Sendable {
     private var inputSource: DispatchSourceRead?
     private var parentExited = false
     private var attemptCount = 0
+    private var lastFailureStage: String?
     private var notificationAt: UInt64?
 
     init(directory: URL, descriptor: Int32) throws {
@@ -212,9 +213,12 @@ final class DisplayGuard: @unchecked Sendable {
     }
 
     private func attemptRecovery() {
+        var stage = "取得独占锁"
         do {
             try store.acquireExclusiveOwnership()
+            stage = "读取责任记录"
             guard var record = try store.load() else { throw GuardError.missingRecord }
+            stage = "检查归属与责任范围"
             // 不同会话不属于旧握手；保留新责任并释放锁，而非替它恢复。
             guard record.session == contract.session else {
                 print("责任记录属于其他会话；旧辅助进程未执行恢复，保留记录并退出。")
@@ -224,20 +228,28 @@ final class DisplayGuard: @unchecked Sendable {
                   record.baseline == record.applied, record.internalDisplay == nil else {
                 throw GuardError.missingRecord
             }
+            stage = "独立基准读回"
             let actual = try freshSnapshot().layout()
             guard actual == record.baseline else { throw RecoveryError.unfinishedTransaction }
             if !record.canClear {
                 record.beginRestoration()
+                stage = "保存恢复阶段"
                 try store.save(record)
+                stage = "确认恢复结果"
                 try record.confirmRestored(actual: actual)
+                stage = "保存已恢复记录"
                 try store.save(record)
             }
+            stage = "读取完成计时"
             let elapsed = try ContinuousClock.nanoseconds() - (notificationAt ?? 0)
             print("辅助进程在主进程退出后独立读取并核验完成；通知至核验=\(elapsed / 1_000_000) ms。该值不代表实际故障至恢复时限。")
             exit(EXIT_SUCCESS)
         } catch {
             attemptCount += 1
-            if attemptCount == 1 { print("辅助进程尚未核验恢复；保留责任，不提前退出。") }
+            if lastFailureStage != stage {
+                print("辅助进程尚未核验恢复；失败阶段=\(stage)，保留责任，不提前退出。")
+                lastFailureStage = stage
+            }
             // shortcut: 尚未接入物理事件；仅未决演练按退避重试，真实停用前改为设备事件与有界恢复重试。
             let delay = min(30.0, 0.1 * pow(2.0, Double(min(attemptCount, 9))))
             queue.asyncAfter(deadline: .now() + delay) { [weak self] in self?.attemptRecovery() }

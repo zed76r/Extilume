@@ -5,7 +5,7 @@ import ExtilumeCore
 import Foundation
 
 private enum PrimaryError: Error {
-    case unsupported, unstable, transactionFailed, readbackMismatch
+    case unsupported, unstable, transactionFailed, readbackMismatch, superseded
 }
 
 extension Snapshot {
@@ -73,8 +73,10 @@ final class PrimaryController: @unchecked Sendable {
     private var registered = false
     private var stopping = false
     private var transactions = 0
+    private let reapplication: PrimaryReapplicationScheduler
 
     init(directory: URL) throws {
+        reapplication = PrimaryReapplicationScheduler(ownerQueue: queue)
         store = try RecoveryStore(directory: directory)
         try store.acquireExclusiveOwnership()
     }
@@ -83,6 +85,21 @@ final class PrimaryController: @unchecked Sendable {
         try queue.sync {
             record = try store.load()
             guard record?.phase != .restored else { throw RecoveryError.unfinishedTransaction }
+            if var pending = record, pending.sourceUnresolved {
+                // 原进程已退出；完整基准的独立读回只解除责任，不生成补偿写入。
+                guard pending.internalDisplay == nil,
+                      try freshSnapshot().layout() == pending.baseline,
+                      try freshSnapshot().layout() == pending.baseline else {
+                    throw RecoveryError.unresolvedSource
+                }
+                pending.beginRestoration()
+                try store.save(pending)
+                try pending.confirmRestored(actual: pending.baseline)
+                try store.save(pending)
+                record = pending
+                print("两个独立读回均为完整恢复基准；未写显示配置，记录保留待终验。")
+                return
+            }
             try restore()
         }
     }
@@ -144,13 +161,23 @@ final class PrimaryController: @unchecked Sendable {
     }
 
     func displayChanged(_ flags: CGDisplayChangeSummaryFlags) {
-        if flags.contains(.beginConfigurationFlag) { return }
-        let connection = !flags.intersection([.addFlag, .removeFlag, .enabledFlag, .disabledFlag]).isEmpty
+        let disconnected = !flags.intersection([.removeFlag, .disabledFlag]).isEmpty
+        let connected = !flags.intersection([.addFlag, .enabledFlag]).isEmpty
+        if flags != .desktopShapeChangedFlag { reapplication.invalidate() }
         queue.async { [weak self] in
             guard let self, !self.stopping else { return }
+            if flags.contains(.beginConfigurationFlag) {
+                self.reapplication.cancel()
+                return
+            }
+            if !disconnected && (connected || (flags == .desktopShapeChangedFlag && self.reapplication.hasPending)) {
+                self.scheduleReapplication()
+                return
+            }
+            // 用户设置或断开事件不能留下稍后覆盖 C 的旧接管意图。
+            self.reapplication.cancel()
             do {
-                try self.observe(source: connection ? .reconnect : .unknown)
-                if connection { try self.apply() }
+                try self.observe(source: disconnected ? .reconnect : .unknown)
             } catch {
                 print("显示事件来源或拓扑未确认；保留责任，停止本次接管。")
             }
@@ -158,14 +185,27 @@ final class PrimaryController: @unchecked Sendable {
     }
 
     private func wake() {
+        reapplication.invalidate()
         queue.async { [weak self] in
             guard let self, !self.stopping else { return }
-            do { try self.observe(source: .reconnect); try self.apply() }
-            catch { print("唤醒后未满足接管条件；保留责任。") }
+            self.scheduleReapplication()
+        }
+    }
+
+    private func scheduleReapplication() {
+        reapplication.schedule { [weak self] isCurrent in
+            guard let self, !self.stopping, isCurrent() else { return }
+            do {
+                try self.observe(source: .reconnect)
+                guard isCurrent() else { return }
+                try self.apply(isCurrent: isCurrent)
+            }
+            catch { print("连接或唤醒后未满足接管条件；保留责任，停止本次接管。") }
         }
     }
 
     private func command(_ command: String) {
+        if ["confirm-user", "reapply", "stop"].contains(command) { reapplication.invalidate() }
         queue.async { [weak self] in
             guard let self, !self.stopping else { return }
             do {
@@ -174,9 +214,10 @@ final class PrimaryController: @unchecked Sendable {
                     let snapshot = try freshSnapshot()
                     print("活动屏=\(snapshot.displays.filter(\.isActive).count)；HDMI 主屏=\(snapshot.displays.contains { $0.identity == .physical && $0.isMain })；事务数=\(self.transactions)；未决来源=\(self.record?.sourceUnresolved ?? false)。")
                 case "confirm-user":
+                    self.reapplication.cancel()
                     try self.observe(source: .confirmedUser)
                     print("已按操作人员的明确用户修改证据记录 C；尚未重新接管。")
-                case "reapply": try self.apply()
+                case "reapply": self.reapplication.cancel(); try self.apply()
                 case "stop": self.stop()
                 default: print("有效命令：status / confirm-user / reapply / stop。")
                 }
@@ -197,8 +238,9 @@ final class PrimaryController: @unchecked Sendable {
         try store.save(record)
     }
 
-    private func apply() throws {
+    private func apply(isCurrent: @Sendable () -> Bool = { true }) throws {
         let snapshot = try freshSnapshot()
+        guard isCurrent() else { throw PrimaryError.superseded }
         guard clamshellState() == "开盖", snapshot.assessment.isSupported,
               snapshot.displays.filter({ $0.identity == .builtIn && $0.isActive }).count == 1,
               snapshot.displays.filter(\.isActive).count == 2,
@@ -221,18 +263,28 @@ final class PrimaryController: @unchecked Sendable {
         let mapping = try snapshot.connected()
         var origins: [UInt32: DisplayOrigin] = [:]
         for display in mapping { origins[display.numericID] = target.origins[display.identity] }
+        var stage = "责任记录落盘"
         do {
             record = try store.apply(prepared) {
+                stage = "写入前独立读回"
                 let immediatelyBefore = try freshSnapshot()
+                guard isCurrent() else { throw PrimaryError.superseded }
                 guard immediatelyBefore == snapshot else { throw PrimaryError.unstable }
+                stage = "公开坐标写入"
                 try configureOrigins(origins, option: .forAppOnly)
+                stage = "写入后目标读回"
                 let after = try freshSnapshot().layout()
                 guard after == target else { throw PrimaryError.readbackMismatch }
+                stage = "应用确认与记录落盘"
                 return (after, nil)
             }
             transactions += 1
             print("公开坐标事务已读回；事务数=\(transactions)。内屏仍须现场确认扩展桌面。")
-        } catch { record = try store.load(); throw error }
+        } catch {
+            print("主屏事务未完成；失败阶段=\(stage)，责任记录保留。")
+            record = try store.load()
+            throw error
+        }
     }
 
     private func restore() throws {
@@ -264,6 +316,7 @@ final class PrimaryController: @unchecked Sendable {
 
     private func stop() {
         stopping = true
+        reapplication.cancel()
         var success = true
         do { try restore() } catch { success = false; print("恢复未完成；保留未决责任。") }
         if registered { CGDisplayRemoveReconfigurationCallback(primaryDisplayCallback, Unmanaged.passUnretained(self).toOpaque()) }
