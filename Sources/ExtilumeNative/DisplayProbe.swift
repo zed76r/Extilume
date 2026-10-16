@@ -324,6 +324,7 @@ public func runDisplayProbe() {
             let observer = try ConnectionObserver(service: matchedHDMIService())
             try observer.start()
             print("只读 HDMI 事件观察已启动；mark 仅人工标记，stop 结束。不修改显示设置。")
+            print("External 候选事件仅标记安全条件失效；不确认目标身份、拔线或可用桌面，不授权内屏停用。")
             DispatchQueue.global().async {
                 while let command = readLine() { observer.command(command) }
                 observer.command("stop")

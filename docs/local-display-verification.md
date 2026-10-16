@@ -208,7 +208,11 @@ python3 scripts/verify-guard-interleavings.py "$extilume_bin_dir/extilume-probe"
 "$extilume_bin_dir/extilume-probe" --watch-connection
 ```
 
-观察入口精确匹配当前 HDMI 的 IOKit service，仅输出目标服务的 interest、property-change、匹配／终止事件及 CG 回调的相对单调毫秒，不输出设备路径或身份。输入 `mark` 是人工准备标记，不是实际拔线时刻；`stop` 释放监听并退出。CG 回调附带的进程内活动数只用于查找陈旧读回，不证明物理外屏可用。
+观察入口先精确匹配当前 HDMI 的 IOKit service，再同时监听目标 shim 和 `Location=External` 的 `DCPAVDeviceProxy`、`DCPAVServiceProxy`、`DCPAVVideoInterfaceProxy` 候选。输出目标服务的 interest、property-change、匹配／终止事件，以及候选类别、数值消息类型和 CG 回调；不输出设备路径或身份。初始排空标为 `initial-not-physical`，不算实际连接事件。
+
+候选的 interest 或终止仅将本次观察的 `invalidated` 单向置为 true，表示安全条件不能继续确认，不能解释成目标 HDMI 已拔出；之后的 matched 和 CG 在线／活动列表不能清除该标记。候选可能由无关服务重建触发，不能提供目标身份、可用桌面或重新停用许可。此观察尚未接入控制／恢复路径；将来恢复请求仍须核对现有责任、身份、适用拓扑和用户配置来源，不直接回写旧基准。
+
+事件记录包含相对单调毫秒及 `mach_continuous_time` 换算的 `continuousNs`；CG 时间戳在回调入队前取得，附带的活动数则在队列处理中读取，可能来自陈旧缓存，只用于排查，不证明物理外屏可用。时间戳表示用户态观察到通知的时刻，不是硬件断开时刻。输入 `mark` 是人工准备标记；`stop` 或输入 EOF 释放所有监听并退出。
 
 IOKit 通用 SDK 声明不保证这条 HDMI 链路在拔线时产生 property-change 或 service termination，必须与实际拔线及新进程读回对应。没有目标设备事件或无法约束通知延迟时不能据此授权停用；人工标记至事件的间隔也不能冒充实际断开检测延迟。此入口不执行任何配置写入、不创建恢复记录。
 
