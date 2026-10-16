@@ -21,14 +21,14 @@
 ```sh
 CLANG_MODULE_CACHE_PATH=/private/tmp/extilume-clang-cache swift test --disable-sandbox --cache-path /private/tmp/extilume-swift-cache
 PYTHONPYCACHEPREFIX=/private/tmp/extilume-python-cache python3 -m unittest discover -s scripts -p 'test_verify_*.py'
-openspec validate add-menu-bar-primary-display-mode --strict
+openspec validate --specs --strict
 ```
 
 测试定位：[原生控制器](../Tests/ExtilumeNativeTests/PrimaryApplicationTests.swift)、[菜单集成](../Tests/ExtilumeNativeTests/MenuBarApplicationTests.swift)、[启动恢复](../Tests/ExtilumeNativeTests/PrimaryStartupTests.swift)、[核心恢复记录](../Tests/ExtilumeCoreTests/RecoveryRecordTests.swift)、[状态模型](../Tests/ExtilumeCoreTests/PrimarySessionStatusTests.swift)。下表的测试名可在这些文件中直接查找。
 
 ## 全部规格场景
 
-场景名称与 [primary-display-session](../openspec/changes/add-menu-bar-primary-display-mode/specs/primary-display-session/spec.md) 对应。行为和呈现分别记录，单项实机通过不扩大为整个场景的桌面验收通过。
+场景名称与 [primary-display-session](../openspec/specs/primary-display-session/spec.md) 对应。行为和呈现分别记录，单项实机通过不扩大为整个场景的桌面验收通过。
 
 | 规格场景 | 自动回归定位 | 实机行为与验证边界 |
 | --- | --- | --- |

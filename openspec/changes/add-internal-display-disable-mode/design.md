@@ -2,7 +2,7 @@
 
 ## Context
 
-动机见 [proposal.md](proposal.md)，新增契约见 [spec.md](specs/internal-display-session/spec.md)。本阶段同时依赖阶段零内屏路径的本机通过及阶段一完整应用的运行验收；沿用 [主屏会话设计](../add-menu-bar-primary-display-mode/design.md) 的菜单入口、自动应用和最新 C 恢复规则。
+动机见 [proposal.md](proposal.md)，新增契约见 [spec.md](specs/internal-display-session/spec.md)。本阶段同时依赖阶段零内屏路径的本机通过及阶段一完整应用的运行验收；沿用 [主屏会话设计](../archive/2026-10-16-add-menu-bar-primary-display-mode/design.md) 的菜单入口、自动应用和最新 C 恢复规则。
 
 真正停用依赖私有 `CGSConfigureDisplayEnabled`，不是公开 API 保证。已有项目报告私有启用位在强退后可能不随 `.forAppOnly` 回退，拔线也可能出现陈旧显示列表或无法启用内屏的状态，来源及边界见 [阶段零设计](../validate-local-display-control/design.md)。这些案例决定需要独立保护，但不能证明 macOS 27.0.1 已满足 10 秒恢复。
 
