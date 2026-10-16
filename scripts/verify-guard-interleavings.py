@@ -36,6 +36,7 @@ CASES = (
     "restoring-record-parent-alive",
     "restored-record-parent-alive",
     "delayed-lock-release",
+    "native-restart-handoff",
 )
 RECORD_NAME = "recovery-record.json"
 MAX_MESSAGE = 4096
@@ -282,8 +283,8 @@ def parent_mode(case, binary, directory):
     helper_log_path = None
     helper_log_fd = None
     helper_log_identity = None
-    if case == "delayed-lock-release":
-        helper_log_path = Path("/private/tmp") / f"{Path(directory).name}.delayed-lock-release.log"
+    if case in {"delayed-lock-release", "native-restart-handoff"}:
+        helper_log_path = Path("/private/tmp") / f"{Path(directory).name}.{case}.log"
         helper_log_fd = os.open(
             helper_log_path,
             os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
@@ -364,6 +365,11 @@ def parent_mode(case, binary, directory):
             record_snapshot = record_path(directory).read_bytes()
         elif case == "delayed-lock-release":
             record_snapshot = record_path(directory).read_bytes()
+        elif case == "native-restart-handoff":
+            # 仅暂停本 fixture 的辅助进程，模拟父退出后旧保护尚未获得调度。
+            helper.send_signal(signal.SIGSTOP)
+            stopped_pid, stopped_status = os.waitpid(helper.pid, os.WUNTRACED)
+            require(stopped_pid == helper.pid and os.WIFSTOPPED(stopped_status), "旧辅助进程未暂停")
         else:
             require(False, "未知交错场景")
 
@@ -393,6 +399,8 @@ def parent_mode(case, binary, directory):
             )
             lock_holder_pid = holder.pid
     finally:
+        if case == "native-restart-handoff" and sys.exc_info()[0] is not None and helper.poll() is None:
+            helper.send_signal(signal.SIGCONT)
         parent.close()
         os.close(lock_fd)
 
@@ -402,6 +410,8 @@ def parent_mode(case, binary, directory):
         require(record_snapshot is not None and lock_holder_pid is not None and helper_log_identity is not None,
                 "受控锁延期释放 fixture 信息不完整")
         return {"record": record_snapshot.hex(), "lockHolderPID": lock_holder_pid, **helper_log_identity}
+    if case == "native-restart-handoff":
+        return {"helperPID": helper.pid, **helper_log_identity}
     return None
 
 
@@ -451,6 +461,14 @@ def helper_pids(directory):
     return result
 
 
+def resume_fixture_helpers(directory):
+    for pid in helper_pids(directory):
+        try:
+            os.kill(pid, signal.SIGCONT)
+        except ProcessLookupError:
+            pass
+
+
 def process_running(pid):
     return any(row[0] == str(pid) and not row[3].startswith("Z") for row in DRILL.processes())
 
@@ -462,7 +480,7 @@ def wait_process_exited(pid, timeout=5):
         time.sleep(0.05)
 
 
-def verify_delayed_lock_log(details, expected_path):
+def read_owned_helper_log(details, expected_path):
     require(details.get("helperLogPath") == str(expected_path), "helper 日志路径不符")
     info = os.lstat(expected_path)
     require(stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid(), "helper 日志文件不安全")
@@ -470,8 +488,13 @@ def verify_delayed_lock_log(details, expected_path):
     require(info.st_dev == details.get("helperLogDevice") and info.st_ino == details.get("helperLogInode"),
             "helper 日志不是本 fixture 创建的文件")
     output = expected_path.read_text(encoding="utf-8")
+    return output, (info.st_dev, info.st_ino)
+
+
+def verify_delayed_lock_log(details, expected_path):
+    output, identity = read_owned_helper_log(details, expected_path)
     require(output.count("失败阶段=取得独占锁") == 1, "独占锁失败阶段日志未恰好出现一次")
-    return info.st_dev, info.st_ino
+    return identity
 
 
 def remove_owned_helper_log(path, device, inode):
@@ -502,6 +525,62 @@ def finalize(binary, directory):
         select.select([], [], [], min(0.05, remaining))
     require(not list(Path(directory).iterdir()), "终验后状态目录非空")
     Path(directory).rmdir()
+
+
+def verify_native_restart(binary, directory, details):
+    require(isinstance(details, dict), "父进程未返回旧保护信息")
+    old_helper = details.get("helperPID")
+    require(isinstance(old_helper, int) and not isinstance(old_helper, bool) and old_helper > 1,
+            "旧辅助进程 PID 无效")
+    require(helper_pids(directory) == [old_helper], "旧辅助进程归属不符")
+    try:
+        stopped = next(row for row in DRILL.processes() if row[0] == str(old_helper))
+        require("T" in stopped[3], "旧辅助进程未保持暂停")
+        # 父已退出且旧 helper 尚未取锁，排除把锁冲突误算成旧责任拒绝。
+        descriptor = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        finally:
+            os.close(descriptor)
+        original = check_record(directory, "applying", 1)
+        preserved = record_path(directory).read_bytes()
+        require(run_primary(binary, "--guard-drill", directory) != 0, "新演练覆盖了未决旧责任")
+        require(record_path(directory).read_bytes() == preserved, "拒绝启动时旧责任被修改")
+        require(run_primary(binary, "--recover-primary", directory) == 0, "接任进程恢复失败")
+        restored = check_record(directory, "restored", 1)
+        require(uuid.UUID(restored["session"]) == uuid.UUID(original["session"]), "接任恢复改变旧会话")
+        require(layout_key(restored["baseline"]) == layout_key(original["baseline"]), "接任恢复改变基准")
+        preserved = record_path(directory).read_bytes()
+    finally:
+        resume_fixture_helpers(directory)
+    wait_helpers_exited(directory)
+    require(record_path(directory).read_bytes() == preserved, "旧辅助进程重复改写接任恢复结果")
+    log_path = Path("/private/tmp") / f"{Path(directory).name}.native-restart-handoff.log"
+    output, identity = read_owned_helper_log(details, log_path)
+    require("主进程退出后独立读取并核验完成" in output, "旧辅助进程未成功独立核验接任结果")
+    require(run_primary(binary, "--finalize-primary", directory) == 0, "旧责任独立终验失败")
+    require(not list(Path(directory).iterdir()), "旧责任未结清")
+
+    replacement = subprocess.Popen(
+        [str(binary), "--guard-drill", str(directory)],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, bufsize=1,
+    )
+    try:
+        DRILL.ready_line(replacement)
+        current = check_record(directory, "owned", 1)
+        require(uuid.UUID(current["session"]) != uuid.UUID(original["session"]), "原生重启沿用了旧会话")
+        require(layout_key(current["baseline"]) == layout_key(original["baseline"]), "重启基准改变")
+        output, _ = replacement.communicate("stop\n", timeout=8)
+        require(replacement.returncode == 0 and "主进程退出后独立读取并核验完成" in output,
+                "新原生演练未完成退出后独立核验")
+        final = check_record(directory, "restored", 1)
+        require(uuid.UUID(final["session"]) == uuid.UUID(current["session"]), "新演练恢复结果归属不符")
+    finally:
+        if replacement.poll() is None:
+            replacement.kill()
+            replacement.wait(timeout=5)
+    return log_path, identity
 
 
 def main(arguments):
@@ -580,17 +659,25 @@ def main(arguments):
                 wait_restored(active_directory, generation)
                 wait_helpers_exited(active_directory)
                 delayed_log_identity = verify_delayed_lock_log(parent_result, delayed_log_path)
+            elif case == "native-restart-handoff":
+                handoff_log_path, delayed_log_identity = verify_native_restart(binary, active_directory, parent_result)
             else:
                 wait_restored(active_directory, generation)
             finalize(binary, active_directory)
             if delayed_log_identity is not None:
-                remove_owned_helper_log(delayed_log_path, *delayed_log_identity)
+                owned_log_path = handoff_log_path if case == "native-restart-handoff" else delayed_log_path
+                remove_owned_helper_log(owned_log_path, *delayed_log_identity)
         except Exception as error:
-            log_note = f"；helper 日志（若已创建）保留于 {delayed_log_path}" if case == "delayed-lock-release" else ""
+            log_note = (f"；helper 日志（若已创建）保留于 /private/tmp/{active_directory.name}.{case}.log"
+                        if case in {"delayed-lock-release", "native-restart-handoff"} else "")
             raise RuntimeError(f"{case} 失败；责任目录保留于 {active_directory}{log_note}") from error
+        finally:
+            if case == "native-restart-handoff":
+                # 父进程被强制结束时，其 finally 无法恢复暂停的保护进程。
+                resume_fixture_helpers(active_directory)
         print(f"{case}: passed", flush=True)
         active_directory = None
-    print("范围：仅验证无显示写入的保护进程协议；延迟锁场景是受控锁延期释放，不代表独立第三方锁交接；不证明实际内屏恢复、10秒恢复标准或 task 4.2 完成。")
+    print("范围：仅验证无显示写入的保护进程协议和原生重启交接；需结合 guard-drill 的辅助进程死亡演练验收协议职责。延迟锁场景仍是受控锁延期释放；不证明真实内屏保护、恢复或10秒恢复标准。")
     return 0
 
 
