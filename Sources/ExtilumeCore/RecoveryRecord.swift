@@ -174,7 +174,7 @@ public struct RecoveryRecord: Codable, Equatable {
             layoutPending = baseline != applied
             return
         }
-        if !layoutPending && actual == baseline { return }
+        if !layoutPending && actual == baseline && source != .confirmedUser { return }
         if actual == baseline, source == .reconnect, !sourceUnresolved {
             // 重连读回旧基准只解除已验证的布局责任，不生成新的基准。
             layoutPending = false

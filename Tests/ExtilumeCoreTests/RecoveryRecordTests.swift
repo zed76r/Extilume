@@ -52,6 +52,18 @@ final class RecoveryRecordTests: XCTestCase {
         XCTAssertEqual(record.baseline, c)
     }
 
+    func testExplicitReconfirmationOfBaselineClearsUnknownSource() throws {
+        let c = try layout(distance: -1920)
+        var record = try ownedRecord()
+        try record.observe(c, source: .confirmedUser)
+        XCTAssertThrowsError(try record.observe(layout(distance: 2400), source: .unknown))
+        XCTAssertTrue(record.sourceUnresolved)
+        try record.observe(c, source: .confirmedUser)
+        XCTAssertEqual(record.baseline, c)
+        XCTAssertFalse(record.sourceUnresolved)
+        XCTAssertFalse(record.layoutPending)
+    }
+
     func testDirectExitCannotConfirmAnUnobservedLayoutAsRestored() throws {
         var record = try ownedRecord()
         try record.observe(layout(distance: -1920), source: .confirmedUser)

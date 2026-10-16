@@ -113,7 +113,7 @@ def layout_key(layout):
     return main, origins
 
 
-def current_layout(binary):
+def current_snapshot(binary):
     parent, child = socket.socketpair()
     process = subprocess.Popen(
         [str(binary), "--display-snapshot", str(child.fileno())],
@@ -139,6 +139,11 @@ def current_layout(binary):
         parent.close()
 
     require(isinstance(snapshot, dict) and isinstance(snapshot.get("displays"), list), "快照结构无效")
+    return snapshot
+
+
+def current_layout(binary):
+    snapshot = current_snapshot(binary)
     active = [display for display in snapshot["displays"] if display.get("isActive") is True]
     require(active, "没有活动显示器")
     mains = [display for display in active if display.get("isMain") is True]
