@@ -340,7 +340,7 @@ final class DisplayEnableTransactionTests: XCTestCase {
             checkProtection: { try protection.authorize(record: $0) }
         ))
 
-        XCTAssertEqual(internalReads, 2)
+        XCTAssertEqual(internalReads, 3)
         XCTAssertEqual(fake.events, ["begin", "configure:80:false", "cancel"])
     }
 
@@ -368,6 +368,38 @@ final class DisplayEnableTransactionTests: XCTestCase {
                 ? []
                 : ["begin", "configure:80:false", "cancel"]
             XCTAssertEqual(fake.events, expectedEvents)
+        }
+    }
+
+    func testDisableAfterRestorationAcceptsChangedRuntimeUUIDOnlyWithSameHardwareProof() throws {
+        let record = try makeRecord()
+        let protection = try readyProtection(for: record)
+        let runtimeID = UUID(uuidString: "00000000-0000-4000-8000-000000000099")!
+        var displays = makeSnapshot(try layout(mainExternal: true)).displays
+        displays[0].identityUUID = runtimeID
+        let snapshot = Snapshot(displays: displays)
+
+        for reportedID in [runtimeID, internalID] {
+            let fake = FakeCalls()
+            let apply = {
+                try self.runDisable(
+                    fake.transaction(), record: record, storedRecord: { record }, snapshotReader: { snapshot },
+                    internalReader: { _ in
+                        InternalDisplayState(
+                            id: 80, identityUUID: self.internalID, isBuiltIn: true, isOnline: true, isActive: true,
+                            hardwareIdentity: self.internalHardwareIdentity, reportedIdentityUUID: reportedID
+                        )
+                    },
+                    checkProtection: { try protection.authorize(record: $0) }
+                )
+            }
+            if reportedID == runtimeID {
+                XCTAssertNoThrow(try apply())
+                XCTAssertEqual(fake.events, ["begin", "configure:80:false", "complete:\(CGConfigureOption.forAppOnly.rawValue)"])
+            } else {
+                XCTAssertThrowsError(try apply())
+                XCTAssertTrue(fake.events.isEmpty)
+            }
         }
     }
 

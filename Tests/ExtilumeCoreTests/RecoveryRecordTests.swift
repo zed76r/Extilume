@@ -5,6 +5,9 @@ final class RecoveryRecordTests: XCTestCase {
     private let internalID = UUID(uuidString: "00000000-0000-4000-8000-000000000001")!
     private let externalID = UUID(uuidString: "00000000-0000-4000-8000-000000000002")!
     private let otherID = UUID(uuidString: "00000000-0000-4000-8000-000000000003")!
+    private let internalHardwareIdentity = InternalDisplayHardwareIdentity(
+        bootSession: UUID(uuidString: "00000000-0000-4000-8000-000000000004")!, registryEntryID: 77
+    )
 
     private func layout(mainExternal: Bool = false, distance: Int32 = 1728) throws -> DisplayLayout {
         try DisplayLayout(main: mainExternal ? externalID : internalID, origins: [
@@ -29,6 +32,14 @@ final class RecoveryRecordTests: XCTestCase {
             : try layout(mainExternal: true)
         try record.confirmApplied(actual, internalEnabled: internalDisplay?.applied)
         return record
+    }
+
+    private func assertResumeRejected(
+        _ record: RecoveryRecord, current: DisplayLayout, internalEnabled: Bool
+    ) throws {
+        var rejected = record
+        XCTAssertThrowsError(try rejected.resumeInternalObservation(current: current, internalEnabled: internalEnabled))
+        XCTAssertEqual(rejected, record)
     }
 
     func testDisabledLayoutUsesV2SubsetAndRestoresLatestCWithOrWithoutExternalDisplay() throws {
@@ -259,6 +270,98 @@ final class RecoveryRecordTests: XCTestCase {
         record.beginRestoration()
         try record.confirmRestored(actual: c)
         XCTAssertTrue(record.canClear)
+    }
+
+    func testRestoredDisabledInternalDisplayCanResumeObservationAndReapply() throws {
+        let initial = try layout()
+        let c = try layout(distance: -1920)
+        let b = try layout(mainExternal: true)
+        let subset = try externalOnlyLayout()
+        let responsibility = InternalDisplayResponsibility(
+            identity: internalID, baseline: true, applied: false, hardwareIdentity: internalHardwareIdentity
+        )
+        var record = try RecoveryRecord(baseline: initial, target: b, internalDisplay: responsibility)
+        try record.markApplying()
+        try record.confirmApplied(subset, internalEnabled: false)
+        record.beginRestoration()
+        try record.confirmRestored(actual: initial, internalEnabled: true)
+        XCTAssertTrue(record.canClear)
+
+        let priorSession = record.session
+        let priorGeneration = record.generation
+        let priorApplied = record.applied
+        let priorPreDisableLayout = record.preDisableLayout
+        let priorResponsibility = record.internalDisplay
+        let handshake = try ProtectionHandshake(
+            session: priorSession, generation: priorGeneration, parentPID: 2,
+            internalDisplayIdentity: internalID, internalDisplayHardwareIdentity: internalHardwareIdentity
+        )
+        try record.resumeInternalObservation(current: initial, internalEnabled: true)
+        XCTAssertEqual(record.phase, .owned)
+        XCTAssertEqual(record.session, priorSession)
+        XCTAssertEqual(record.generation, priorGeneration)
+        XCTAssertEqual(record.baseline, initial)
+        XCTAssertEqual(record.applied, priorApplied)
+        XCTAssertEqual(record.preDisableLayout, priorPreDisableLayout)
+        XCTAssertEqual(record.internalDisplay, priorResponsibility)
+        XCTAssertFalse(record.layoutPending)
+        XCTAssertFalse(record.sourceUnresolved)
+
+        try record.observe(c, source: .confirmedUser)
+        try record.prepareReapplication(current: c, target: b)
+        XCTAssertEqual(record.generation, priorGeneration + 1)
+        XCTAssertTrue(handshake.accepts(record: record))
+        try record.markApplying()
+        try record.confirmApplied(subset, internalEnabled: false)
+        record.beginRestoration()
+        XCTAssertEqual(try record.internalRestorePlan(connected: [
+            ConnectedDisplay(identity: internalID, numericID: 90)
+        ])?.enabled, true)
+        let restorePlan = try record.layoutRestorePlan(connected: [
+            ConnectedDisplay(identity: internalID, numericID: 90),
+            ConnectedDisplay(identity: externalID, numericID: 40)
+        ], current: b)
+        XCTAssertEqual(restorePlan.origins[90], c.origins[internalID])
+        XCTAssertEqual(restorePlan.origins[40], c.origins[externalID])
+        try record.confirmRestored(actual: c, internalEnabled: true)
+        XCTAssertTrue(record.canClear)
+    }
+
+    func testResumeInternalObservationRejectsIneligibleRecordsWithoutMutation() throws {
+        let c = try layout()
+        let b = try layout(mainExternal: true)
+        let responsibility = InternalDisplayResponsibility(
+            identity: internalID, baseline: true, applied: false, hardwareIdentity: internalHardwareIdentity
+        )
+        let prepared = try RecoveryRecord(baseline: c, target: b, internalDisplay: responsibility)
+        var applying = prepared
+        try applying.markApplying()
+        let owned = try ownedRecord(internalDisplay: responsibility)
+        var restoring = owned
+        restoring.beginRestoration()
+
+        for record in [prepared, applying, owned, restoring] {
+            try assertResumeRejected(record, current: c, internalEnabled: true)
+        }
+
+        let restored = try ownedRecord(internalDisplay: responsibility)
+        var mismatchedLayout = restored
+        mismatchedLayout.beginRestoration()
+        try mismatchedLayout.confirmRestored(actual: c, internalEnabled: true)
+        try assertResumeRejected(mismatchedLayout, current: b, internalEnabled: true)
+        try assertResumeRejected(mismatchedLayout, current: c, internalEnabled: false)
+
+        var missingResponsibility = try ownedRecord()
+        missingResponsibility.beginRestoration()
+        try missingResponsibility.confirmRestored(actual: missingResponsibility.baseline)
+        try assertResumeRejected(missingResponsibility, current: c, internalEnabled: true)
+
+        var missingProof = try ownedRecord(internalDisplay: InternalDisplayResponsibility(
+            identity: internalID, baseline: true, applied: false
+        ))
+        missingProof.beginRestoration()
+        try missingProof.confirmRestored(actual: c, internalEnabled: true)
+        try assertResumeRejected(missingProof, current: c, internalEnabled: true)
     }
 
     func testKnownBReturningAfterUnresolvedDDoesNotEraseSourceUncertainty() throws {

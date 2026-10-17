@@ -92,6 +92,10 @@ final class ConnectionObserver: @unchecked Sendable {
     }
 
     deinit {
+        stopObserving()
+    }
+
+    func stopObserving() {
         if DispatchQueue.getSpecific(key: queueKey) == true {
             releaseResourcesOnQueue()
         } else {

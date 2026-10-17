@@ -6,7 +6,7 @@ import Foundation
 
 private struct GuardReply: Codable { let ready: ProtectionHandshake }
 private enum GuardCommand: String, Codable { case quiesce }
-private enum GuardError: Error { case spawn, identity, missingRecord, protectionLost }
+private enum GuardError: Error, Equatable { case spawn, identity, missingRecord, protectionLost, suspended, unstable }
 
 func spawnProbe(_ arguments: [String], channel: GuardChannel) throws -> pid_t {
     let inheritedDescriptor: Int32 = 198
@@ -52,6 +52,7 @@ final class GuardSession: @unchecked Sendable {
     private let operation: GuardSessionOperation
     private let enableTransaction: DisplayEnableTransaction?
     private let queue = DispatchQueue(label: "Extilume.guard-drill")
+    private let queueKey = DispatchSpecificKey<Bool>()
     private var record: RecoveryRecord?
     private var channel: GuardChannel?
     private var child: pid_t = 0
@@ -60,20 +61,35 @@ final class GuardSession: @unchecked Sendable {
     private var signals: [DispatchSourceSignal] = []
     private let authorizationLock = NSLock()
     private var authorization = ProtectionAuthorization()
+    private var lifecycle = InternalSessionLifecycle()
     private var connectionObserver: ConnectionObserver?
+    private var connectionObserverEpoch: UUID?
+    private let reapplication: PrimaryReapplicationScheduler
+    private var applicationIsCurrent: (@Sendable () -> Bool)?
     private var stopping = false
     private var internalDisplayIDHint: UInt32?
     private var sleepObserver: NSObjectProtocol?
+    private var wakeObserver: NSObjectProtocol?
     private var recoveryFailed = false
     private var recoveryStartedAt: UInt64?
     private var recoveryRetryScheduled = false
+    private var recoveryEpoch = UUID()
 
     init(directory: URL, operation: GuardSessionOperation) throws {
         self.directory = directory
         self.operation = operation
         enableTransaction = operation == .disableInternal ? try DisplayEnableTransaction() : nil
         store = try RecoveryStore(directory: directory)
+        reapplication = PrimaryReapplicationScheduler(ownerQueue: queue)
         try store.acquireExclusiveOwnership()
+        queue.setSpecific(key: queueKey, value: true)
+    }
+
+    deinit {
+        for observer in [sleepObserver, wakeObserver].compactMap({ $0 }) {
+            NSWorkspace.shared.notificationCenter.removeObserver(observer)
+        }
+        connectionObserver?.stopObserving()
     }
 
     func start() throws {
@@ -101,126 +117,18 @@ final class GuardSession: @unchecked Sendable {
                 internalResponsibility = nil
             }
             if snapshot.assessment.isSupported {
-                let observer = try ConnectionObserver(
-                    service: matchedHDMIService(), reportsEvents: false,
-                    expectedDisabledInternal: operation == .disableInternal ? internalDisplayIDHint : nil,
-                    expectedInternalRegistryID: operation == .disableInternal ? internalResponsibility?.hardwareIdentity?.registryEntryID : nil,
-                    onReconfiguration: { [weak self] in
-                        self?.queue.async { [weak self] in
-                            guard let self, self.recoveryFailed else { return }
-                            self.scheduleRecoveryRetry(after: 0)
-                        }
-                    }
-                ) { [weak self] reason in
-                    self?.connectionInvalidated(message: "连接安全条件失效 [\(reason)]；禁止新控制，主进程负责核验恢复。")
-                }
-                connectionObserver = observer
-                try observer.start()
+                try startConnectionObserver(responsibility: internalResponsibility)
             }
             if operation == .disableInternal {
                 sleepObserver = NSWorkspace.shared.notificationCenter.addObserver(
                     forName: NSWorkspace.willSleepNotification, object: nil, queue: nil
-                ) { [weak self] _ in self?.connectionInvalidated() }
+                ) { [weak self] _ in self?.willSleep() }
+                wakeObserver = NSWorkspace.shared.notificationCenter.addObserver(
+                    forName: NSWorkspace.didWakeNotification, object: nil, queue: nil
+                ) { [weak self] _ in self?.didWake() }
             }
             let prepared = try RecoveryRecord(baseline: baseline, target: baseline, internalDisplay: internalResponsibility)
-            do {
-                let apply: (RecoveryRecord) throws -> (layout: DisplayLayout, internalEnabled: Bool?) = { [self] durable in
-                    let contract = try ProtectionHandshake(
-                        session: durable.session, generation: durable.generation, parentPID: getpid(),
-                        internalDisplayIdentity: durable.internalDisplay?.identity,
-                        internalDisplayHardwareIdentity: durable.internalDisplay?.hardwareIdentity
-                    )
-                    let parentChannel: GuardChannel = try {
-                        let pair = try GuardChannel.pair()
-                        child = try spawnProbe(["--display-guard", directory.path], channel: pair.1)
-                        return pair.0
-                    }()
-                    channel = parentChannel
-                    let source = DispatchSource.makeProcessSource(identifier: child, eventMask: .exit, queue: .global())
-                    source.setEventHandler { [weak self] in
-                        guard let self else { return }
-                        self.authorizationLock.withLock { self.authorization.markLost() }
-                        self.queue.async {
-                            var status: Int32 = 0
-                            _ = waitpid(self.child, &status, WNOHANG)
-                            if !self.stopping {
-                                self.stop()
-                            }
-                        }
-                        print("辅助进程失效；禁止新控制，主进程负责核验恢复。")
-                    }
-                    deathSource = source
-                    source.resume()
-                    try parentChannel.send(contract)
-                    let reply = try parentChannel.receive(GuardReply.self)
-                    try authorizationLock.withLock { try authorization.acknowledge(receipt: reply.ready, expected: contract) }
-                    let input = DispatchSource.makeReadSource(fileDescriptor: parentChannel.descriptor, queue: .global())
-                    input.setEventHandler { [weak self] in
-                        self?.protectionInputSource?.cancel()
-                        self?.connectionInvalidated(message: "保护通信失效；禁止新控制，主进程负责核验恢复。")
-                    }
-                    protectionInputSource = input
-                    input.resume()
-                    guard try !parentChannel.peerClosed(), kill(child, 0) == 0 else {
-                        authorizationLock.withLock { authorization.markLost() }
-                        throw GuardError.protectionLost
-                    }
-                    try checkProtection(durable)
-                    if let enableTransaction {
-                        return try performProtectedInternalDisable(
-                            record: durable, loadRecord: { try self.store.load() },
-                            disable: { pending in
-                                try enableTransaction.disableInternal(
-                                    record: pending, loadRecord: { try self.store.load() },
-                                    snapshotReader: { try freshSnapshot() }, lidIsOpen: { clamshellState() == "开盖" },
-                                    checkProtection: { try self.checkProtection($0) },
-                                    internalReader: { identity in
-                                        guard let id = self.internalDisplayIDHint else { throw GuardError.identity }
-                                        return try freshInternalDisplay(identity: identity, numericIDHint: id,
-                                                                        hardwareIdentity: pending.internalDisplay?.hardwareIdentity)
-                                    }
-                                )
-                            },
-                            activeSnapshotReader: { try freshActiveSnapshot() },
-                            internalReader: { identity in
-                                guard let internalDisplayIDHint else { throw GuardError.identity }
-                                return try freshInternalDisplay(identity: identity, numericIDHint: internalDisplayIDHint,
-                                                                hardwareIdentity: durable.internalDisplay?.hardwareIdentity)
-                            },
-                            checkProtection: { try self.checkProtection($0) }
-                        )
-                    }
-                    let actual = try freshSnapshot()
-                    try checkProtection(durable)
-                    let enabled = try durable.internalDisplay.map {
-                        guard let internalDisplayIDHint else { throw GuardError.identity }
-                        return try freshInternalDisplay(identity: $0.identity, numericIDHint: internalDisplayIDHint,
-                                                        hardwareIdentity: $0.hardwareIdentity).isEnabled
-                    }
-                    try checkProtection(durable)
-                    return (try actual.layout(), enabled)
-                }
-                if operation == .disableInternal {
-                    if let applied = try applyProtectedInternalRecord(
-                        store: store, prepared: prepared, operation: apply,
-                        recoverOnFailure: { [self] durable in
-                            record = durable
-                            authorizationLock.withLock { authorization.markLost() }
-                            print("停用事务未完成；主进程接管恢复，不依赖辅助进程仍存活。")
-                            stop()
-                        }
-                    ) { record = applied }
-                } else {
-                    record = try store.apply(prepared) {
-                        guard let durable = try store.load() else { throw GuardError.missingRecord }
-                        return try apply(durable)
-                    }
-                }
-            } catch {
-                record = try store.load()
-                // 子进程已启动时须随主进程退出继续核验，不能杀掉保护来掩盖握手失败。
-                throw error
-            }
+            try applyPrepared(prepared)
             for number in [SIGINT, SIGTERM] {
                 signal(number, SIG_IGN)
                 let source = DispatchSource.makeSignalSource(signal: number, queue: queue)
@@ -234,7 +142,11 @@ final class GuardSession: @unchecked Sendable {
             }
             if !recoveryFailed {
                 if operation == .disableInternal {
-                    print("受保护停用已读回；尚需现场确认桌面、键盘及触控板。输入 status / stop 恢复退出。")
+                    if authorizationLock.withLock({ lifecycle.paused }) {
+                        print("会话已恢复并暂停；输入 confirm-user / reapply / stop。")
+                    } else {
+                        print("受保护停用已读回；尚需现场确认桌面、键盘及触控板。输入 status / restore / confirm-user / reapply / stop 恢复退出。")
+                    }
                 } else {
                     print("不改显示设置的保护演练已就绪；连接观察=\(connectionObserver != nil)；输入 status / stop / crash / lose-guard / invalidate-connection。")
                 }
@@ -248,7 +160,129 @@ final class GuardSession: @unchecked Sendable {
         }
     }
 
+    private func applyPrepared(_ prepared: RecoveryRecord) throws {
+        do {
+            if operation == .disableInternal {
+                if let applied = try applyProtectedInternalRecord(
+                    store: store, prepared: prepared, operation: { try self.applyDurable($0) },
+                    recoverOnFailure: { [self] durable, error in
+                        record = durable
+                        if authorizationLock.withLock({ lifecycle.pauseAfterFailure(error, protectionReady: authorization.ready) }) {
+                            pauseForConfiguration(forSleep: true)
+                        } else {
+                            loseProtection()
+                            print("停用事务未完成；主进程接管恢复，不依赖辅助进程仍存活。")
+                            stop()
+                        }
+                    }
+                ) { record = applied }
+            } else {
+                record = try store.apply(prepared) {
+                    guard let durable = try self.store.load() else { throw GuardError.missingRecord }
+                    return try self.applyDurable(durable)
+                }
+            }
+        } catch {
+            record = try store.load()
+            // 已启动的辅助进程须随主进程退出继续核验。
+            throw error
+        }
+    }
+
+    private func applyDurable(_ durable: RecoveryRecord) throws -> (layout: DisplayLayout, internalEnabled: Bool?) {
+        if child == 0 {
+            let contract = try ProtectionHandshake(
+                session: durable.session, generation: durable.generation, parentPID: getpid(),
+                internalDisplayIdentity: durable.internalDisplay?.identity,
+                internalDisplayHardwareIdentity: durable.internalDisplay?.hardwareIdentity
+            )
+            let parentChannel: GuardChannel = try {
+                let pair = try GuardChannel.pair()
+                child = try spawnProbe(["--display-guard", directory.path], channel: pair.1)
+                return pair.0
+            }()
+            channel = parentChannel
+            let source = DispatchSource.makeProcessSource(identifier: child, eventMask: .exit, queue: .global())
+            source.setEventHandler { [weak self] in
+                guard let self else { return }
+                self.loseProtection()
+                self.queue.async {
+                    var status: Int32 = 0
+                    _ = waitpid(self.child, &status, WNOHANG)
+                    if !self.stopping {
+                        self.stop()
+                    }
+                }
+                print("辅助进程失效；禁止新控制，主进程负责核验恢复。")
+            }
+            deathSource = source
+            source.resume()
+            try parentChannel.send(contract)
+            let reply = try parentChannel.receive(GuardReply.self)
+            try authorizationLock.withLock { try authorization.acknowledge(receipt: reply.ready, expected: contract) }
+            let input = DispatchSource.makeReadSource(fileDescriptor: parentChannel.descriptor, queue: .global())
+            input.setEventHandler { [weak self] in
+                self?.protectionInputSource?.cancel()
+                self?.connectionInvalidated(message: "保护通信失效；禁止新控制，主进程负责核验恢复。")
+            }
+            protectionInputSource = input
+            input.resume()
+        }
+        guard let channel, try !channel.peerClosed(), kill(child, 0) == 0 else {
+            loseProtection()
+            throw GuardError.protectionLost
+        }
+        try checkProtection(durable)
+        if let enableTransaction {
+            try translateProtectedInternalLayout(
+                record: durable, loadRecord: { try self.store.load() },
+                snapshotReader: { try self.readGuardSnapshot(durable) },
+                originWriter: { origins, validate in
+                    try configureOrigins(origins, option: .forAppOnly, validateBeforeCommit: validate)
+                },
+                checkProtection: { try self.checkProtection($0) }
+            )
+            return try performProtectedInternalDisable(
+                record: durable, loadRecord: { try self.store.load() },
+                disable: { pending in
+                    try enableTransaction.disableInternal(
+                        record: pending, loadRecord: { try self.store.load() },
+                        snapshotReader: { try freshSnapshot() }, lidIsOpen: { clamshellState() == "开盖" },
+                        checkProtection: { try self.checkProtection($0) },
+                        internalReader: { identity in
+                            guard let id = self.internalDisplayIDHint else { throw GuardError.identity }
+                            return try freshInternalDisplay(identity: identity, numericIDHint: id,
+                                                            hardwareIdentity: pending.internalDisplay?.hardwareIdentity)
+                        }
+                    )
+                },
+                activeSnapshotReader: { try freshActiveSnapshot() },
+                internalReader: { identity in
+                    guard let internalDisplayIDHint else { throw GuardError.identity }
+                    return try freshInternalDisplay(identity: identity, numericIDHint: internalDisplayIDHint,
+                                                    hardwareIdentity: durable.internalDisplay?.hardwareIdentity)
+                },
+                checkProtection: { try self.checkProtection($0) }
+            )
+        }
+        let actual = try freshSnapshot()
+        try checkProtection(durable)
+        let enabled = try durable.internalDisplay.map {
+            guard let internalDisplayIDHint else { throw GuardError.identity }
+            return try freshInternalDisplay(identity: $0.identity, numericIDHint: internalDisplayIDHint,
+                                            hardwareIdentity: $0.hardwareIdentity).isEnabled
+        }
+        try checkProtection(durable)
+        return (try actual.layout(), enabled)
+    }
+
     private func command(_ command: String) {
+        if ["restore", "stop"].contains(command) {
+            reapplication.invalidate()
+        }
+        if command == "restore", operation == .disableInternal {
+            authorizationLock.withLock { lifecycle.requestPause() }
+        }
         if command == "invalidate-connection" {
             print("模拟连接安全条件失效；不代表实际拔线。")
             connectionInvalidated()
@@ -258,27 +292,65 @@ final class GuardSession: @unchecked Sendable {
             guard let self, !self.stopping || self.recoveryFailed else { return }
             switch command {
             case "status":
-                let ready = self.authorizationLock.withLock { self.authorization.ready }
-                print("主进程仍在运行；保护就绪=\(ready)；连接观察=\(self.connectionObserver != nil)；责任尚未独立清除。")
+                let state = self.authorizationLock.withLock { (self.authorization.ready, self.lifecycle.paused, self.lifecycle.sleeping) }
+                print("主进程仍在运行；保护就绪=\(state.0)；已暂停=\(state.1)；睡眠中=\(state.2)；连接观察=\(self.connectionObserver != nil)；责任尚未独立清除。")
             case "stop": self.stop()
+            case "restore" where self.operation == .disableInternal:
+                self.pauseForConfiguration(forSleep: false)
+            case "confirm-user" where self.operation == .disableInternal:
+                self.reapplication.cancel()
+                do { try self.confirmUserConfiguration() }
+                catch { print("用户配置未获确认；原基准及恢复责任保留。") }
+            case "reapply" where self.operation == .disableInternal:
+                self.reapplication.cancel()
+                do { try self.reapply() }
+                catch { print("重新应用未完成；保留当前基准及恢复责任。") }
             case "crash": _exit(99)
             case "lose-guard": _ = kill(self.child, SIGKILL)
-            default: print("有效命令：status / stop / crash / lose-guard / invalidate-connection。")
+            default: print("有效命令：status / restore / confirm-user / reapply / stop / crash / lose-guard / invalidate-connection；前三项配置命令仅用于受保护停用验证。")
             }
         }
     }
 
     private func checkProtection(_ record: RecoveryRecord) throws {
-        guard let channel, try !channel.peerClosed(), kill(child, 0) == 0 else {
-            authorizationLock.withLock { authorization.markLost() }
-            throw GuardError.protectionLost
+        try checkProtectedPeer()
+        try authorizationLock.withLock {
+            guard authorization.ready && !lifecycle.faulted else { throw GuardError.protectionLost }
+            guard !lifecycle.pauseRequested else { throw InternalControlCancellation.pauseRequested }
+            guard lifecycle.permitsControls else { throw GuardError.suspended }
+            try authorization.authorize(record: record)
         }
-        try authorizationLock.withLock { try authorization.authorize(record: record) }
+        guard applicationIsCurrent?() != false else { throw GuardError.suspended }
     }
 
-    private func connectionInvalidated(message: String = "连接安全条件失效；禁止新控制，主进程负责核验恢复。") {
+    private func checkProtectedPeer() throws {
+        guard let channel, try !channel.peerClosed(), kill(child, 0) == 0 else {
+            loseProtection()
+            throw GuardError.protectionLost
+        }
+        guard authorizationLock.withLock({ authorization.ready && !lifecycle.faulted }) else {
+            throw GuardError.protectionLost
+        }
+    }
+
+    private func loseProtection() {
+        reapplication.invalidate()
+        authorizationLock.withLock {
+            authorization.markLost()
+            lifecycle.fail()
+        }
+    }
+
+    private func connectionInvalidated(message: String = "连接安全条件失效；禁止新控制，主进程负责核验恢复。", observerEpoch: UUID? = nil) {
         // 危险事件立即撤权，不等待控制队列上的快照或握手。
-        authorizationLock.withLock { authorization.markLost() }
+        let invalidated = authorizationLock.withLock {
+            if let observerEpoch, connectionObserverEpoch != observerEpoch { return false }
+            authorization.markLost()
+            lifecycle.fail()
+            return true
+        }
+        guard invalidated else { return }
+        reapplication.invalidate()
         queue.async { [weak self] in
             guard let self, !self.stopping else { return }
             self.stop()
@@ -286,45 +358,226 @@ final class GuardSession: @unchecked Sendable {
         print(message)
     }
 
+    private func startConnectionObserver(responsibility: InternalDisplayResponsibility?) throws {
+        guard connectionObserver == nil else { throw GuardError.protectionLost }
+        let epoch = UUID()
+        authorizationLock.withLock { connectionObserverEpoch = epoch }
+        let observer = try ConnectionObserver(
+            service: matchedHDMIService(), reportsEvents: false,
+            expectedDisabledInternal: operation == .disableInternal ? internalDisplayIDHint : nil,
+            expectedInternalRegistryID: operation == .disableInternal ? responsibility?.hardwareIdentity?.registryEntryID : nil,
+            onReconfiguration: { [weak self] in
+                self?.queue.async { [weak self] in
+                    guard let self, self.recoveryFailed,
+                          self.authorizationLock.withLock({ self.connectionObserverEpoch == epoch }) else { return }
+                    self.scheduleRecoveryRetry(after: 0)
+                }
+            }
+        ) { [weak self] reason in
+            self?.connectionInvalidated(
+                message: "连接安全条件失效 [\(reason)]；禁止新控制，主进程负责核验恢复。", observerEpoch: epoch
+            )
+        }
+        connectionObserver = observer
+        try observer.start()
+    }
+
+    private func stopConnectionObserver() {
+        // 先排空旧观察器；已收到的负面事件仍会锁存到当前会话。
+        connectionObserver?.stopObserving()
+        connectionObserver = nil
+        authorizationLock.withLock { connectionObserverEpoch = nil }
+    }
+
+    private func readGuardSnapshot(_ record: RecoveryRecord) throws -> Snapshot {
+        try freshGuardSnapshot(responsibility: record.internalDisplay, numericIDHint: internalDisplayIDHint)
+    }
+
+    private func pausedSnapshot(_ record: RecoveryRecord) throws -> Snapshot {
+        try checkProtectedPeer()
+        let before = try readGuardSnapshot(record)
+        let after = try readGuardSnapshot(record)
+        guard clamshellState() == "开盖",
+              after.assessment.issues.allSatisfy({ [.noExternalDisplay, .externalNotOnline, .externalNotActive].contains($0) }),
+              try store.load() == record else { throw GuardError.suspended }
+        guard before == after, after.assessment.isSupported,
+              after.displays.count == 2,
+              after.displays.allSatisfy({ $0.isActive && $0.isOnline && !$0.isMirrored }) else { throw GuardError.unstable }
+        try checkProtectedPeer()
+        return after
+    }
+
+    @discardableResult
+    private func pauseForConfiguration(forSleep: Bool) -> Bool {
+        guard operation == .disableInternal, !stopping else { return false }
+        reapplication.cancel()
+        if !forSleep { authorizationLock.withLock { lifecycle.requestPause() } }
+        do {
+            var restored = try restoreRecord()
+            record = restored
+            stopConnectionObserver()
+            let snapshot = try pausedSnapshot(restored)
+            guard let responsibility = restored.internalDisplay else { throw GuardError.identity }
+            try restored.resumeInternalObservation(
+                current: snapshot.layout(),
+                internalEnabled: snapshot.builtInDisplay(identity: responsibility.identity).isActive
+            )
+            guard try store.load() == record else { throw RecoveryError.unfinishedTransaction }
+            try store.save(restored)
+            record = restored
+            authorizationLock.withLock { lifecycle.didRestore() }
+            resetRecoveryCycle()
+            print("已恢复并暂停；可手动设置 C 后输入 confirm-user，再输入 reapply；输入 stop 恢复退出。保护进程继续等待真实退出。")
+            scheduleWakeReapplication()
+            return true
+        } catch {
+            loseProtection()
+            print("暂停前恢复未能核验；保留责任，转入恢复退出。")
+            stop()
+            return false
+        }
+    }
+
+    private func confirmUserConfiguration() throws {
+        guard operation == .disableInternal, !stopping,
+              authorizationLock.withLock({ lifecycle.permitsControls }),
+              let current = try store.load(), current == record else { throw GuardError.suspended }
+        let snapshot = try pausedSnapshot(current)
+        let observed = try confirmProtectedInternalConfiguration(record: current, snapshot: snapshot)
+        guard authorizationLock.withLock({ lifecycle.permitsControls }) else { throw GuardError.suspended }
+        try store.save(observed)
+        record = observed
+        stopConnectionObserver()
+        authorizationLock.withLock { lifecycle.didConfirmUserConfiguration() }
+        print("已确认用户 C；不修改显示设置，后续恢复以 C 为准。")
+    }
+
+    private func reapply(stillCurrent: @escaping @Sendable () -> Bool = { true }) throws {
+        guard operation == .disableInternal, !stopping, stillCurrent(),
+              authorizationLock.withLock({ lifecycle.paused && lifecycle.permitsControls }),
+              let current = try store.load(), current == record else { throw GuardError.suspended }
+        let snapshot = try pausedSnapshot(current)
+        let prepared = try prepareProtectedInternalReapplication(record: current, snapshot: snapshot)
+        guard stillCurrent(), let responsibility = current.internalDisplay else { throw GuardError.suspended }
+        internalDisplayIDHint = try snapshot.builtInDisplay(identity: responsibility.identity).id
+        do {
+            try startConnectionObserver(responsibility: responsibility)
+            try checkProtectedPeer()
+            guard stillCurrent() else { throw GuardError.suspended }
+            try authorizationLock.withLock { try lifecycle.beginReapplication() }
+            resetRecoveryCycle()
+            applicationIsCurrent = stillCurrent
+            defer { applicationIsCurrent = nil }
+            try applyPrepared(prepared)
+            if !stopping && !authorizationLock.withLock({ lifecycle.paused }) {
+                print("重新应用已独立读回；沿用同一保护进程及最新用户 C，输入 restore 或 stop 恢复。")
+            }
+        } catch {
+            loseProtection()
+            stop()
+            throw error
+        }
+    }
+
+    private func willSleep() {
+        let deadline = DispatchTime.now() + .seconds(10)
+        reapplication.invalidate()
+        authorizationLock.withLock { lifecycle.willSleep() }
+        let restored = InternalSleepPreparation.wait(
+            on: queue, alreadyOnQueue: DispatchQueue.getSpecific(key: queueKey) != nil,
+            deadline: deadline
+        ) { [weak self] in self?.pauseForConfiguration(forSleep: true) ?? false }
+        authorizationLock.withLock { lifecycle.finishSleepPreparation(restored: restored) }
+        if !restored {
+            loseProtection()
+            print("睡前恢复未能在同步等待期限内核验；禁止新停用，保留恢复责任。")
+        }
+        queue.async { [weak self] in
+            guard let self else { return }
+            if restored { self.scheduleWakeReapplication() }
+            else { self.stop() }
+        }
+    }
+
+    private func didWake() {
+        authorizationLock.withLock { lifecycle.didWake() }
+        queue.async { [weak self] in
+            guard let self else { return }
+            if self.recoveryFailed { self.scheduleRecoveryRetry(after: 0) }
+            else { self.scheduleWakeReapplication() }
+        }
+    }
+
+    private func scheduleWakeReapplication(attempt: Int = 0) {
+        guard !stopping, authorizationLock.withLock({ lifecycle.shouldResumeAfterWake && authorization.ready }) else { return }
+        reapplication.schedule { [weak self] isCurrent in
+            guard let self, isCurrent(),
+                  self.authorizationLock.withLock({ self.lifecycle.shouldResumeAfterWake && self.authorization.ready }) else { return }
+            withoutActuallyEscaping(isCurrent) { isCurrent in
+                do { try self.reapply(stillCurrent: isCurrent) }
+                catch {
+                    if error as? GuardError == .unstable, attempt < 2 {
+                        self.scheduleWakeReapplication(attempt: attempt + 1)
+                    } else {
+                        print("醒后重新应用未完成；保持恢复责任，不自动采纳新的用户配置。")
+                    }
+                }
+            }
+        }
+    }
+
+    private func resetRecoveryCycle() {
+        recoveryEpoch = UUID()
+        recoveryRetryScheduled = false
+        recoveryStartedAt = nil
+        recoveryFailed = false
+    }
+
+    private func restoreRecord() throws -> RecoveryRecord {
+        guard let record else { throw GuardError.missingRecord }
+        let contract = try ProtectionHandshake(
+            session: record.session, generation: record.generation, parentPID: getpid(),
+            internalDisplayIdentity: record.internalDisplay?.identity,
+            internalDisplayHardwareIdentity: record.internalDisplay?.hardwareIdentity
+        )
+        return try recoverGuardRecord(
+            store: store, contract: contract,
+            snapshotReader: { try freshGuardSnapshot(responsibility: record.internalDisplay, numericIDHint: self.internalDisplayIDHint) },
+            internalReader: { identity in
+                guard let id = self.internalDisplayIDHint else { throw GuardError.identity }
+                return try freshInternalDisplay(identity: identity, numericIDHint: id,
+                                                hardwareIdentity: record.internalDisplay?.hardwareIdentity)
+            },
+            enableInternal: { restoring in
+                guard let enableTransaction = self.enableTransaction else { throw GuardError.protectionLost }
+                try enableTransaction.enableInternalForRecovery(
+                    record: restoring, loadRecord: { try self.store.load() },
+                    internalReader: { identity in
+                        guard let id = self.internalDisplayIDHint else { throw GuardError.identity }
+                        return try freshInternalDisplay(identity: identity, numericIDHint: id,
+                                                        hardwareIdentity: restoring.internalDisplay?.hardwareIdentity)
+                    }
+                )
+            },
+            originWriter: { origins in
+                guard self.operation == .disableInternal else { throw GuardError.protectionLost }
+                try configureOrigins(origins, option: .forSession)
+            }
+        )
+    }
+
     private func stop() {
+        reapplication.cancel()
+        authorizationLock.withLock { lifecycle.requestPause() }
         stopping = true
         recoveryFailed = false
         if recoveryStartedAt == nil { recoveryStartedAt = try? ContinuousClock.nanoseconds() }
         do {
-            guard let record else { throw GuardError.missingRecord }
-            let contract = try ProtectionHandshake(
-                session: record.session, generation: record.generation, parentPID: getpid(),
-                internalDisplayIdentity: record.internalDisplay?.identity,
-                internalDisplayHardwareIdentity: record.internalDisplay?.hardwareIdentity
-            )
-            _ = try recoverGuardRecord(
-                store: store, contract: contract,
-                snapshotReader: { try freshGuardSnapshot(responsibility: record.internalDisplay, numericIDHint: self.internalDisplayIDHint) },
-                internalReader: { identity in
-                    guard let id = self.internalDisplayIDHint else { throw GuardError.identity }
-                    return try freshInternalDisplay(identity: identity, numericIDHint: id,
-                                                    hardwareIdentity: record.internalDisplay?.hardwareIdentity)
-                },
-                enableInternal: { restoring in
-                    guard let enableTransaction = self.enableTransaction else { throw GuardError.protectionLost }
-                    try enableTransaction.enableInternalForRecovery(
-                        record: restoring, loadRecord: { try self.store.load() },
-                        internalReader: { identity in
-                            guard let id = self.internalDisplayIDHint else { throw GuardError.identity }
-                            return try freshInternalDisplay(identity: identity, numericIDHint: id,
-                                                            hardwareIdentity: restoring.internalDisplay?.hardwareIdentity)
-                        }
-                    )
-                },
-                originWriter: { origins in
-                    guard self.operation == .disableInternal else { throw GuardError.protectionLost }
-                    try configureOrigins(origins, option: .forSession)
-                }
-            )
+            record = try restoreRecord()
             if authorizationLock.withLock({ authorization.ready }) {
                 do { try channel?.send(GuardCommand.quiesce) }
                 catch {
-                    authorizationLock.withLock { authorization.markLost() }
+                    loseProtection()
                     print("辅助进程失效；禁止新控制，已核验的恢复结果仍保留。")
                 }
             } else {
@@ -334,7 +587,7 @@ final class GuardSession: @unchecked Sendable {
             exit(EXIT_SUCCESS)
         } catch {
             if operation == .disableInternal {
-                authorizationLock.withLock { authorization.markLost() }
+                loseProtection()
                 recoveryFailed = true
                 print("恢复未完成；禁止新停用，主进程保留责任。可输入 stop 重试。")
                 let elapsed = (try? ContinuousClock.nanoseconds()).flatMap { now in
@@ -354,8 +607,9 @@ final class GuardSession: @unchecked Sendable {
     private func scheduleRecoveryRetry(after delay: Double) {
         guard !recoveryRetryScheduled else { return }
         recoveryRetryScheduled = true
+        let epoch = recoveryEpoch
         queue.asyncAfter(deadline: .now() + delay) { [weak self] in
-            guard let self else { return }
+            guard let self, self.recoveryEpoch == epoch else { return }
             self.recoveryRetryScheduled = false
             guard self.recoveryFailed else { return }
             self.stop()

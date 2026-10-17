@@ -43,8 +43,10 @@ func stableSnapshot(activeOnly: Bool = false) throws -> Snapshot {
     throw PrimaryError.unstable
 }
 
-func configureOrigins(_ origins: [UInt32: DisplayOrigin], option: CGConfigureOption) throws {
+func configureOrigins(_ origins: [UInt32: DisplayOrigin], option: CGConfigureOption,
+                      validateBeforeCommit: () throws -> Void = {}) throws {
     guard !origins.isEmpty else { return }
+    try validateBeforeCommit()
     var configuration: CGDisplayConfigRef?
     guard CGBeginDisplayConfiguration(&configuration) == .success, let configuration else {
         throw PrimaryError.transactionFailed
@@ -56,6 +58,7 @@ func configureOrigins(_ origins: [UInt32: DisplayOrigin], option: CGConfigureOpt
             throw PrimaryError.transactionFailed
         }
     }
+    try validateBeforeCommit()
     let completion = CGCompleteDisplayConfiguration(configuration, option)
     completed = true // SDK 规定 Complete 返回后句柄无效，包括失败返回。
     guard completion == .success else {

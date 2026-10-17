@@ -68,10 +68,19 @@ final class DisplayEnableTransaction {
         guard record.phase == .applying, !record.sourceUnresolved,
               let responsibility = record.internalDisplay,
               responsibility.baseline, !responsibility.applied, responsibility.pending,
-              responsibility.hardwareIdentity != nil else {
+              let hardwareIdentity = responsibility.hardwareIdentity else {
             throw RecoveryError.invalidRecord
         }
-        let initial = try snapshotReader()
+        func observe() throws -> (Snapshot, InternalDisplayState) {
+            let raw = try snapshotReader()
+            let state = try internalReader(responsibility.identity)
+            guard state.isEnabled else { throw RecoveryError.identityConflict }
+            let snapshot = try raw.canonicalizingInternalDisplay(
+                identity: responsibility.identity, hardwareIdentity: hardwareIdentity, state: state
+            )
+            return (snapshot, state)
+        }
+        let (initial, _) = try observe()
         guard initial.assessment.isSupported, try initial.layout() == record.applied else {
             throw DisplayEnableTransactionError.unsafeTopology
         }
@@ -80,7 +89,7 @@ final class DisplayEnableTransaction {
         try setEnabled(display: display, enabled: false) {
             try checkProtection(record)
             guard try loadRecord() == record else { throw RecoveryError.unfinishedTransaction }
-            let snapshot = try snapshotReader()
+            let (snapshot, state) = try observe()
             guard snapshot.assessment.isSupported, lidIsOpen(),
                   snapshot.displays.filter({ $0.identity == .builtIn }).count == 1,
                   try snapshot.builtInDisplay(identity: responsibility.identity).id == display,
@@ -90,10 +99,8 @@ final class DisplayEnableTransaction {
                 throw DisplayEnableTransactionError.unsafeTopology
             }
             guard try loadRecord() == record else { throw RecoveryError.unfinishedTransaction }
-            let state = try internalReader(responsibility.identity)
             guard state.matches(identity: responsibility.identity, hardwareIdentity: responsibility.hardwareIdentity),
-                  state.id == display, state.isEnabled,
-                  state.reportedIdentityUUID == snapshot.displays.first(where: { $0.id == display })?.identityUUID else {
+                  state.id == display, state.isEnabled else {
                 throw RecoveryError.identityConflict
             }
             try checkProtection(record)

@@ -391,4 +391,18 @@ public struct RecoveryRecord: Codable, Equatable {
         phase = .restored
         sourceUnresolved = false
     }
+
+    public mutating func resumeInternalObservation(current: DisplayLayout, internalEnabled: Bool) throws {
+        try validate()
+        guard canClear,
+              let responsibility = internalDisplay,
+              responsibility.baseline, !responsibility.applied,
+              responsibility.hardwareIdentity != nil else { throw RecoveryError.invalidTransition }
+        guard current == baseline, internalEnabled else { throw RecoveryError.unresolvedSource }
+
+        var resumed = self
+        resumed.phase = .owned
+        try resumed.validate()
+        self = resumed
+    }
 }
