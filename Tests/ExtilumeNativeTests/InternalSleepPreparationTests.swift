@@ -1,13 +1,191 @@
 import XCTest
+import ExtilumeCore
 @testable import ExtilumeNative
 
 private final class SleepPreparationState: @unchecked Sendable {
     let lock = NSLock()
     var lifecycle = InternalSessionLifecycle()
     var events: [String] = []
+    var clockValues: [UInt64] = []
 }
 
 final class InternalSleepPreparationTests: XCTestCase {
+    func testRestoreRetiresObserverBeforeExpectedNegativeAndAllowsVerifiedWake() throws {
+        let identity = UUID()
+        let layout = try DisplayLayout(main: identity, origins: [identity: DisplayOrigin(x: 0, y: 0)])
+        let record = try RecoveryRecord(baseline: layout, target: layout)
+        var lifecycle = InternalSessionLifecycle()
+        lifecycle.didConfirmUserConfiguration()
+        try lifecycle.beginReapplication()
+        lifecycle.willSleep()
+        XCTAssertFalse(lifecycle.permitsControls)
+        var candidates = ConnectionCandidateState()
+        XCTAssertTrue(candidates.matched(entryID: 42, service: .videoInterface, location: "External"))
+        var observing = true
+        var emittedNegative = false
+
+        let restored = InternalSleepPreparation.restore(stopObserving: { observing = false }) {
+            emittedNegative = true
+            if observing {
+                _ = candidates.invalidate(entryID: 0, terminated: false)
+                lifecycle.fail()
+            }
+            lifecycle.didRestore()
+            return record
+        }
+
+        XCTAssertEqual(restored, record)
+        XCTAssertTrue(emittedNegative)
+        XCTAssertFalse(observing)
+        XCTAssertTrue(candidates.hasCandidates)
+        XCTAssertFalse(candidates.invalidated)
+        lifecycle.finishSleepPreparation(restored: true)
+        lifecycle.didWake()
+        XCTAssertTrue(lifecycle.shouldResumeAfterWake)
+    }
+
+    func testNegativeLatchedBeforeObserverRetirementCannotBeClearedByRestore() throws {
+        let identity = UUID()
+        let layout = try DisplayLayout(main: identity, origins: [identity: DisplayOrigin(x: 0, y: 0)])
+        let record = try RecoveryRecord(baseline: layout, target: layout)
+        var lifecycle = InternalSessionLifecycle()
+        lifecycle.didConfirmUserConfiguration()
+        try lifecycle.beginReapplication()
+        lifecycle.willSleep()
+        var candidates = ConnectionCandidateState()
+        XCTAssertTrue(candidates.matched(entryID: 42, service: .videoInterface, location: "External"))
+        var observing = true
+        if observing {
+            _ = candidates.invalidate(entryID: 0, terminated: false)
+            lifecycle.fail()
+        }
+
+        let restored = InternalSleepPreparation.restore(stopObserving: { observing = false }) {
+            if observing {
+                _ = candidates.invalidate(entryID: 0, terminated: false)
+                lifecycle.fail()
+            }
+            lifecycle.didRestore()
+            return record
+        }
+
+        XCTAssertEqual(restored, record)
+        XCTAssertTrue(candidates.invalidated)
+        XCTAssertFalse(observing)
+        lifecycle.finishSleepPreparation(restored: true)
+        lifecycle.didWake()
+        XCTAssertTrue(lifecycle.faulted)
+        XCTAssertFalse(lifecycle.shouldResumeAfterWake)
+    }
+
+    func testRestoreRetiresObserverAndRethrowsForCallerRecovery() throws {
+        enum RestoreFailure: Error, Equatable { case injected }
+        var lifecycle = InternalSessionLifecycle()
+        lifecycle.didConfirmUserConfiguration()
+        try lifecycle.beginReapplication()
+        lifecycle.willSleep()
+        var observing = true
+        var callerEnteredRecovery = false
+
+        XCTAssertThrowsError(try InternalSleepPreparation.restore(stopObserving: { observing = false }) {
+            throw RestoreFailure.injected
+        }) { error in
+            XCTAssertEqual(error as? RestoreFailure, .injected)
+            XCTAssertFalse(observing)
+            callerEnteredRecovery = true
+            lifecycle.finishSleepPreparation(restored: false)
+        }
+
+        XCTAssertTrue(callerEnteredRecovery)
+        lifecycle.didWake()
+        XCTAssertTrue(lifecycle.faulted)
+        XCTAssertFalse(lifecycle.shouldResumeAfterWake)
+    }
+
+    func testStartupPersistenceFailureDrainsAcceptedSleepOutsideControlQueueBeforeExit() throws {
+        let control = DispatchQueue(label: "sleep-test.startup-control")
+        let notifications = DispatchQueue(label: "sleep-test.startup-power")
+        let accepted = DispatchSemaphore(value: 0)
+        let state = SleepPreparationState()
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false,
+                                                attributes: [.posixPermissions: 0o700])
+        defer {
+            try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
+            try? FileManager.default.removeItem(at: directory)
+        }
+        let store = try RecoveryStore(directory: directory)
+        try store.acquireExclusiveOwnership()
+        let identity = UUID()
+        let layout = try DisplayLayout(main: identity, origins: [identity: DisplayOrigin(x: 0, y: 0)])
+        let record = try RecoveryRecord(baseline: layout, target: layout)
+        XCTAssertThrowsError(try InternalSleepPreparation.startSession(on: control, cleanupPower: {
+            notifications.sync { state.lock.withLock { state.events.append("power-drained") } }
+        }) {
+            notifications.async {
+                state.lock.withLock { state.lifecycle.willSleep() }
+                accepted.signal()
+                let restored = InternalSleepPreparation.wait(on: control, alreadyOnQueue: false, deadline: .now() + 2) {
+                    state.lock.withLock { state.events.append("queued-recovery") }
+                    return false
+                }
+                state.lock.withLock {
+                    state.events.append("ack")
+                    state.lifecycle.finishSleepPreparation(restored: restored)
+                }
+            }
+            XCTAssertEqual(accepted.wait(timeout: .now() + 1), .success)
+            try FileManager.default.setAttributes([.posixPermissions: 0o500], ofItemAtPath: directory.path)
+            _ = try store.apply(record) { XCTFail("failed persistence must precede native writes"); return (layout, nil) }
+        })
+        state.lock.withLock {
+            state.events.append("caller-exit")
+            XCTAssertEqual(state.events, ["queued-recovery", "ack", "power-drained", "caller-exit"])
+            XCTAssertFalse(state.lifecycle.preparingForSleep)
+            XCTAssertTrue(state.lifecycle.beginExitAfterRecovery())
+        }
+    }
+
+    func testAcknowledgementResumesDeferredStopInsteadOfDroppingQuitIntent() {
+        var state = InternalSessionLifecycle()
+        state.willSleep()
+        state.didRestore()
+        state.requestPause()
+        XCTAssertFalse(state.beginExitAfterRecovery())
+        var events = ["restored", "stop-deferred"]
+        events.append("ack")
+        state.finishSleepPreparation(restored: true)
+        InternalSleepPreparation.complete(restored: true, acknowledged: true, stopping: true,
+            stop: { XCTAssertTrue(state.beginExitAfterRecovery()); events.append("exit") },
+            resume: { XCTFail("quit intent must not become wake reapplication") })
+        XCTAssertEqual(events, ["restored", "stop-deferred", "ack", "exit"])
+    }
+
+    func testContinuousElapsedTimeCannotBeHiddenByPausedUptimeOrClockRegression() {
+        let samples: [[UInt64]] = [[0, 11_000_000_000], [1, 0]]
+        for values in samples {
+            let queue = DispatchQueue(label: "sleep-test.continuous-budget")
+            let state = SleepPreparationState()
+            state.clockValues = values
+            XCTAssertFalse(InternalSleepPreparation.wait(
+                on: queue, alreadyOnQueue: false, deadline: .now() + 1,
+                continuousNow: { state.lock.withLock { state.clockValues.removeFirst() } }
+            ) { true })
+            queue.sync {}
+        }
+    }
+
+    func testUnavailableClockKeepsRecoveryQueuedButCannotAuthorizeWake() {
+        enum ClockFailure: Error { case injected }
+        let queue = DispatchQueue(label: "sleep-test.unavailable-clock")
+        let recovered = DispatchSemaphore(value: 0)
+        XCTAssertFalse(InternalSleepPreparation.wait(
+            on: queue, alreadyOnQueue: false, deadline: .now() + 1,
+            continuousNow: { throw ClockFailure.injected }
+        ) { recovered.signal(); return true })
+        XCTAssertEqual(recovered.wait(timeout: .now() + 1), .success)
+    }
+
     func testNotificationReturnWaitsForQueuedApplicationAndVerifiedRestoration() {
         let queue = DispatchQueue(label: "sleep-test.serial")
         let state = SleepPreparationState()

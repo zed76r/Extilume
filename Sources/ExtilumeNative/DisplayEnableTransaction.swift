@@ -14,6 +14,7 @@ enum DisplayEnableTransactionError: Error, Equatable {
 
 // 私有 ABI 参考 displayplacer/src/Header.h；符号存在不表示本机启停已经验收。
 final class DisplayEnableTransaction {
+    typealias Trace = (InternalLifecycleStage, CGError?) -> Void
     typealias Begin = (UnsafeMutablePointer<CGDisplayConfigRef?>) -> CGError
     typealias Configure = (CGDisplayConfigRef, CGDirectDisplayID, Bool) -> CGError
     typealias Complete = (CGDisplayConfigRef, CGConfigureOption) -> CGError
@@ -111,17 +112,24 @@ final class DisplayEnableTransaction {
     func enableInternalForRecovery(
         record: RecoveryRecord,
         loadRecord: () throws -> RecoveryRecord?,
+        trace: Trace = { _, _ in },
         internalReader: (UUID) throws -> InternalDisplayState
     ) throws {
         try record.validate()
         guard record.phase == .restoring, let responsibility = record.internalDisplay,
               responsibility.baseline, responsibility.pending else { throw RecoveryError.invalidRecord }
-        let initial = try internalReader(responsibility.identity)
+        func readInternal() throws -> InternalDisplayState {
+            trace(.enableIdentityReadStarted, nil)
+            let state = try internalReader(responsibility.identity)
+            trace(.enableIdentityReadFinished, nil)
+            return state
+        }
+        let initial = try readInternal()
         guard initial.matches(identity: responsibility.identity, hardwareIdentity: responsibility.hardwareIdentity) else { throw RecoveryError.identityConflict }
         let display = initial.id
-        try setEnabled(display: display, enabled: true) {
+        try setEnabled(display: display, enabled: true, trace: trace) {
             guard try loadRecord() == record else { throw RecoveryError.unfinishedTransaction }
-            let actual = try internalReader(responsibility.identity)
+            let actual = try readInternal()
             guard actual.matches(identity: responsibility.identity, hardwareIdentity: responsibility.hardwareIdentity),
                   actual.id == display, actual.reportedIdentityUUID == initial.reportedIdentityUUID else {
                 throw RecoveryError.identityConflict
@@ -131,22 +139,43 @@ final class DisplayEnableTransaction {
     }
 
     // 仅由持锁控制／恢复入口调用；调用方须校验落盘责任、身份和适用保护。
-    func setEnabled(display: CGDirectDisplayID, enabled: Bool, validate: () throws -> Void) throws {
+    func setEnabled(
+        display: CGDirectDisplayID, enabled: Bool,
+        trace: Trace = { _, _ in }, validate: () throws -> Void
+    ) throws {
         guard display != kCGNullDirectDisplay else { throw DisplayEnableTransactionError.invalidDisplay }
         guard let configure else { throw DisplayEnableTransactionError.symbolUnavailable }
+        trace(.enablePreValidationStarted, nil)
         try validate()
+        trace(.enablePreValidationFinished, nil)
         var configuration: CGDisplayConfigRef?
-        guard begin(&configuration) == .success, let configuration else {
+        trace(.enableBeginStarted, nil)
+        let beginResult = begin(&configuration)
+        trace(.enableBeginFinished, beginResult)
+        guard beginResult == .success, let configuration else {
             throw DisplayEnableTransactionError.beginFailed
         }
         var consumed = false
-        defer { if !consumed { _ = cancel(configuration) } }
-        guard configure(configuration, display, enabled) == .success else {
+        defer {
+            if !consumed {
+                trace(.enableCancelStarted, nil)
+                let cancelResult = cancel(configuration)
+                trace(.enableCancelFinished, cancelResult)
+            }
+        }
+        trace(.enableConfigureStarted, nil)
+        let configureResult = configure(configuration, display, enabled)
+        trace(.enableConfigureFinished, configureResult)
+        guard configureResult == .success else {
             throw DisplayEnableTransactionError.configurationFailed
         }
+        trace(.enablePostValidationStarted, nil)
         try validate()
+        trace(.enablePostValidationFinished, nil)
+        trace(.enableCompleteStarted, nil)
         let result = complete(configuration, enabled ? .forSession : .forAppOnly)
         consumed = true // Complete 返回后句柄已失效，包括失败返回。
+        trace(.enableCompleteFinished, result)
         guard result == .success else { throw DisplayEnableTransactionError.commitFailed }
     }
 }

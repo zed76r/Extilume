@@ -9,26 +9,38 @@ struct InternalSessionLifecycle {
     private(set) var pauseRequested = false
     private(set) var resumeAfterWake = false
     private(set) var faulted = false
+    private(set) var exiting = false
     private var pendingSleepPreparations = 0
 
     var preparingForSleep: Bool { pendingSleepPreparations != 0 }
 
-    var permitsControls: Bool { !sleeping && !pauseRequested && !faulted && !preparingForSleep }
+    var permitsControls: Bool { !sleeping && !pauseRequested && !faulted && !preparingForSleep && !exiting }
     var shouldResumeAfterWake: Bool { paused && permitsControls && resumeAfterWake }
 
-    mutating func willSleep() {
+    @discardableResult
+    mutating func willSleep() -> Bool {
+        guard !exiting else { return false }
         resumeAfterWake = resumeAfterWake || !paused
         sleeping = true
         pauseRequested = true
         pendingSleepPreparations += 1
+        return true
     }
 
     mutating func didWake() { sleeping = false }
 
+    // 只能在对应电源通知已确认后结算，防止恢复线程提前退出。
     mutating func finishSleepPreparation(restored: Bool) {
         if !restored || !paused { fail() }
         guard pendingSleepPreparations > 0 else { fail(); return }
         pendingSleepPreparations -= 1
+    }
+
+    mutating func beginExitAfterRecovery() -> Bool {
+        guard !preparingForSleep else { return false }
+        exiting = true
+        resumeAfterWake = false
+        return true
     }
 
     mutating func requestPause() {

@@ -1,4 +1,3 @@
-import AppKit
 import CoreGraphics
 import Darwin
 import ExtilumeCore
@@ -68,8 +67,9 @@ final class GuardSession: @unchecked Sendable {
     private var applicationIsCurrent: (@Sendable () -> Bool)?
     private var stopping = false
     private var internalDisplayIDHint: UInt32?
-    private var sleepObserver: NSObjectProtocol?
-    private var wakeObserver: NSObjectProtocol?
+    private var powerObserver: InternalSystemPowerObserver?
+    private var recoveryDisplayCallbackRegistered = false
+    private var reportedConnectionInvalidation = false
     private var recoveryFailed = false
     private var recoveryStartedAt: UInt64?
     private var recoveryRetryScheduled = false
@@ -86,14 +86,19 @@ final class GuardSession: @unchecked Sendable {
     }
 
     deinit {
-        for observer in [sleepObserver, wakeObserver].compactMap({ $0 }) {
-            NSWorkspace.shared.notificationCenter.removeObserver(observer)
-        }
+        powerObserver?.stop()
         connectionObserver?.stopObserving()
+        if recoveryDisplayCallbackRegistered {
+            CGDisplayRemoveReconfigurationCallback(guardSessionDisplayCallback, Unmanaged.passUnretained(self).toOpaque())
+        }
     }
 
     func start() throws {
-        try queue.sync {
+        try InternalSleepPreparation.startSession(on: queue, cleanupPower: { [self] in
+            reapplication.invalidate()
+            loseProtection()
+            powerObserver?.stop()
+        }) {
             guard try store.load() == nil else { throw RecoveryError.unfinishedTransaction }
             let snapshot = try freshSnapshot()
             let baseline = try snapshot.layout()
@@ -120,12 +125,22 @@ final class GuardSession: @unchecked Sendable {
                 try startConnectionObserver(responsibility: internalResponsibility)
             }
             if operation == .disableInternal {
-                sleepObserver = NSWorkspace.shared.notificationCenter.addObserver(
-                    forName: NSWorkspace.willSleepNotification, object: nil, queue: nil
-                ) { [weak self] _ in self?.willSleep() }
-                wakeObserver = NSWorkspace.shared.notificationCenter.addObserver(
-                    forName: NSWorkspace.didWakeNotification, object: nil, queue: nil
-                ) { [weak self] _ in self?.didWake() }
+                guard CGDisplayRegisterReconfigurationCallback(
+                    guardSessionDisplayCallback, Unmanaged.passUnretained(self).toOpaque()
+                ) == .success else { throw GuardError.protectionLost }
+                recoveryDisplayCallbackRegistered = true
+                let observer = InternalSystemPowerObserver(
+                    prepareForSleep: { [weak self] in self?.prepareForSleep() ?? false },
+                    didPrepareForSleep: { [weak self] restored, acknowledged in
+                        self?.didPrepareForSleep(restored: restored, acknowledged: acknowledged)
+                    },
+                    didWake: { [weak self] in self?.didWake() },
+                    onFailure: { [weak self] in
+                        self?.connectionInvalidated(message: "电源通知确认失败；禁止新停用，保留恢复责任。")
+                    }
+                )
+                try observer.start()
+                powerObserver = observer
             }
             let prepared = try RecoveryRecord(baseline: baseline, target: baseline, internalDisplay: internalResponsibility)
             try applyPrepared(prepared)
@@ -341,19 +356,24 @@ final class GuardSession: @unchecked Sendable {
         }
     }
 
-    private func connectionInvalidated(message: String = "连接安全条件失效；禁止新控制，主进程负责核验恢复。", observerEpoch: UUID? = nil) {
+    private func connectionInvalidated(message: String = "连接安全条件失效；禁止新控制，主进程负责核验恢复。") {
         // 危险事件立即撤权，不等待控制队列上的快照或握手。
-        let invalidated = authorizationLock.withLock {
-            if let observerEpoch, connectionObserverEpoch != observerEpoch { return false }
+        let observedAt = try? ContinuousClock.nanoseconds()
+        let first = authorizationLock.withLock {
+            let first = !reportedConnectionInvalidation
+            reportedConnectionInvalidation = true
             authorization.markLost()
             lifecycle.fail()
-            return true
+            return first
         }
-        guard invalidated else { return }
         reapplication.invalidate()
         queue.async { [weak self] in
             guard let self, !self.stopping else { return }
             self.stop()
+        }
+        if first {
+            if let observedAt { traceInternalLifecycle(.firstConnectionInvalidation, observedAt: observedAt) }
+            else { print("首个连接失效计时不可用；不能据此判定恢复时限通过。") }
         }
         print(message)
     }
@@ -375,7 +395,7 @@ final class GuardSession: @unchecked Sendable {
             }
         ) { [weak self] reason in
             self?.connectionInvalidated(
-                message: "连接安全条件失效 [\(reason)]；禁止新控制，主进程负责核验恢复。", observerEpoch: epoch
+                message: "连接安全条件失效 [\(reason)]；禁止新控制，主进程负责核验恢复。"
             )
         }
         connectionObserver = observer
@@ -387,6 +407,14 @@ final class GuardSession: @unchecked Sendable {
         connectionObserver?.stopObserving()
         connectionObserver = nil
         authorizationLock.withLock { connectionObserverEpoch = nil }
+    }
+
+    fileprivate func displayChangedForRecovery() {
+        // 接管观察退出后仍保留恢复事件，避免错过重试窗口后的显示重连。
+        queue.async { [weak self] in
+            guard let self, self.recoveryFailed else { return }
+            self.scheduleRecoveryRetry(after: 0)
+        }
     }
 
     private func readGuardSnapshot(_ record: RecoveryRecord) throws -> Snapshot {
@@ -413,10 +441,15 @@ final class GuardSession: @unchecked Sendable {
         reapplication.cancel()
         if !forSleep { authorizationLock.withLock { lifecycle.requestPause() } }
         do {
-            var restored = try restoreRecord()
+            var restored = try InternalSleepPreparation.restore(stopObserving: {
+                traceInternalLifecycle(.observerDrainStarted)
+                stopConnectionObserver()
+                traceInternalLifecycle(.observerDrainFinished)
+            }, operation: { try restoreRecord() })
             record = restored
-            stopConnectionObserver()
+            traceInternalLifecycle(.pauseVerificationStarted)
             let snapshot = try pausedSnapshot(restored)
+            traceInternalLifecycle(.pauseVerificationFinished)
             guard let responsibility = restored.internalDisplay else { throw GuardError.identity }
             try restored.resumeInternalObservation(
                 current: snapshot.layout(),
@@ -431,9 +464,10 @@ final class GuardSession: @unchecked Sendable {
             scheduleWakeReapplication()
             return true
         } catch {
+            traceInternalLifecycle(.restorationFailed, succeeded: false, error: error)
             loseProtection()
             print("暂停前恢复未能核验；保留责任，转入恢复退出。")
-            stop()
+            if !forSleep || !authorizationLock.withLock({ lifecycle.preparingForSleep }) { stop() }
             return false
         }
     }
@@ -479,27 +513,43 @@ final class GuardSession: @unchecked Sendable {
         }
     }
 
-    private func willSleep() {
+    private func prepareForSleep() -> Bool {
         let deadline = DispatchTime.now() + .seconds(10)
         reapplication.invalidate()
-        authorizationLock.withLock { lifecycle.willSleep() }
+        guard authorizationLock.withLock({ lifecycle.willSleep() }) else { return false }
+        traceInternalLifecycle(.sleepRequested)
         let restored = InternalSleepPreparation.wait(
             on: queue, alreadyOnQueue: DispatchQueue.getSpecific(key: queueKey) != nil,
             deadline: deadline
         ) { [weak self] in self?.pauseForConfiguration(forSleep: true) ?? false }
-        authorizationLock.withLock { lifecycle.finishSleepPreparation(restored: restored) }
         if !restored {
             loseProtection()
-            print("睡前恢复未能在同步等待期限内核验；禁止新停用，保留恢复责任。")
+            print("睡前恢复未完成核验；禁止新停用，保留恢复责任。")
         }
+        traceInternalLifecycle(.sleepWaitFinished, succeeded: restored)
+        return restored
+    }
+
+    private func didPrepareForSleep(restored: Bool, acknowledged: Bool) {
+        traceInternalLifecycle(.powerAcknowledged, succeeded: acknowledged)
+        let accepted = authorizationLock.withLock {
+            guard !lifecycle.exiting else { return false }
+            lifecycle.finishSleepPreparation(restored: restored && acknowledged)
+            return true
+        }
+        guard accepted else { return }
+        if !acknowledged { loseProtection() }
         queue.async { [weak self] in
             guard let self else { return }
-            if restored { self.scheduleWakeReapplication() }
-            else { self.stop() }
+            InternalSleepPreparation.complete(
+                restored: restored, acknowledged: acknowledged, stopping: self.stopping,
+                stop: { self.stop() }, resume: { self.scheduleWakeReapplication() }
+            )
         }
     }
 
     private func didWake() {
+        traceInternalLifecycle(.systemHasPoweredOn)
         authorizationLock.withLock { lifecycle.didWake() }
         queue.async { [weak self] in
             guard let self else { return }
@@ -552,6 +602,7 @@ final class GuardSession: @unchecked Sendable {
                 guard let enableTransaction = self.enableTransaction else { throw GuardError.protectionLost }
                 try enableTransaction.enableInternalForRecovery(
                     record: restoring, loadRecord: { try self.store.load() },
+                    trace: { traceInternalLifecycle($0, cgError: $1) },
                     internalReader: { identity in
                         guard let id = self.internalDisplayIDHint else { throw GuardError.identity }
                         return try freshInternalDisplay(identity: identity, numericIDHint: id,
@@ -562,7 +613,8 @@ final class GuardSession: @unchecked Sendable {
             originWriter: { origins in
                 guard self.operation == .disableInternal else { throw GuardError.protectionLost }
                 try configureOrigins(origins, option: .forSession)
-            }
+            },
+            trace: { traceInternalLifecycle($0) }
         )
     }
 
@@ -584,9 +636,14 @@ final class GuardSession: @unchecked Sendable {
                 print("保护失效；禁止新控制，恢复结果已核验。")
             }
             print("主进程核验完成；辅助进程将等待主进程退出后独立读回，记录暂不清除。")
+            guard authorizationLock.withLock({ lifecycle.beginExitAfterRecovery() }) else {
+                print("恢复已核验；等待电源通知确认后退出，保护与记录继续保留。")
+                return
+            }
             exit(EXIT_SUCCESS)
         } catch {
             if operation == .disableInternal {
+                traceInternalLifecycle(.restorationFailed, succeeded: false, error: error)
                 loseProtection()
                 recoveryFailed = true
                 print("恢复未完成；禁止新停用，主进程保留责任。可输入 stop 重试。")
@@ -754,6 +811,7 @@ final class DisplayGuard: @unchecked Sendable {
                     guard let enableTransaction else { throw GuardError.protectionLost }
                     try enableTransaction.enableInternalForRecovery(
                         record: record, loadRecord: { try self.store.load() },
+                        trace: { traceInternalLifecycle($0, role: .helper, cgError: $1) },
                         internalReader: { [self] identity in
                             guard let internalDisplayIDHint else { throw GuardError.identity }
                             return try freshInternalDisplay(identity: identity, numericIDHint: internalDisplayIDHint,
@@ -765,7 +823,8 @@ final class DisplayGuard: @unchecked Sendable {
                     guard let responsibility = record.internalDisplay,
                           responsibility.pending, !responsibility.applied else { throw GuardError.protectionLost }
                     try configureOrigins(origins, option: .forSession)
-                }
+                },
+                trace: { traceInternalLifecycle($0, role: .helper) }
             )
             stage = "读取完成计时"
             let elapsed = try ContinuousClock.nanoseconds() - (notificationAt ?? 0)
@@ -773,6 +832,7 @@ final class DisplayGuard: @unchecked Sendable {
             exit(EXIT_SUCCESS)
         } catch {
             attemptCount += 1
+            traceInternalLifecycle(.restorationFailed, role: .helper, succeeded: false, error: error)
             if lastFailureStage != stage {
                 print("辅助进程尚未核验恢复；失败阶段=\(stage)，保留责任，不提前退出。")
                 lastFailureStage = stage
@@ -791,6 +851,14 @@ final class DisplayGuard: @unchecked Sendable {
             }
         }
     }
+}
+
+private func guardSessionDisplayCallback(
+    _ display: CGDirectDisplayID, _ flags: CGDisplayChangeSummaryFlags,
+    _ context: UnsafeMutableRawPointer?
+) {
+    guard let context else { return }
+    Unmanaged<GuardSession>.fromOpaque(context).takeUnretainedValue().displayChangedForRecovery()
 }
 
 private func guardDisplayCallback(

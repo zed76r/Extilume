@@ -152,6 +152,16 @@ private enum ProbeError: Error, CustomStringConvertible {
 
 // 仅输出固定分类，不插入底层错误描述或设备身份。
 func snapshotWitnessFailureCode(_ error: Error) -> String {
+    if let error = error as? DisplayEnableTransactionError {
+        switch error {
+        case .symbolUnavailable: return "enable-symbol-unavailable"
+        case .invalidDisplay: return "enable-invalid-display"
+        case .beginFailed: return "enable-begin-failed"
+        case .configurationFailed: return "enable-configure-failed"
+        case .commitFailed: return "enable-complete-failed"
+        case .unsafeTopology: return "enable-unsafe-topology"
+        }
+    }
     if let error = error as? ProbeError {
         switch error {
         case .displayListReadFailed("在线"): return "online-list"
@@ -159,7 +169,16 @@ func snapshotWitnessFailureCode(_ error: Error) -> String {
         default: return "display-read"
         }
     }
-    if let error = error as? RecoveryError, case .identityConflict = error { return "identity-conflict" }
+    if let error = error as? RecoveryError {
+        switch error {
+        case .identityConflict: return "identity-conflict"
+        case .invalidRecord: return "recovery-invalid-record"
+        case .unresolvedSource: return "recovery-unresolved-source"
+        case .unfinishedTransaction: return "recovery-unfinished-transaction"
+        case .invalidTransition: return "recovery-invalid-transition"
+        }
+    }
+    if error is RecoveryStoreError { return "recovery-store" }
     if let error = error as? GuardChannelError {
         switch error {
         case .timedOut: return "channel-timeout"
@@ -462,6 +481,7 @@ public func runDisplayProbe() {
             try recoverInternalRecord(directory: URL(fileURLWithPath: CommandLine.arguments[2]))
             print("内屏责任恢复及独立读回完成；记录保留，未自动清除。")
         } catch {
+            traceInternalLifecycle(.restorationFailed, role: .recoveryEntry, succeeded: false, error: error)
             fputs("内屏责任恢复未完成，类别=\(snapshotWitnessFailureCode(error))；记录保留。\n", stderr)
             exit(EXIT_FAILURE)
         }

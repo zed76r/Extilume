@@ -14,6 +14,32 @@ final class GuardRecoveryTests: XCTestCase {
 
     private enum FixtureError: Error { case injected }
 
+    func testFailedLayoutReadLeavesStageOpenAndRecoveryResponsibilityPending() throws {
+        let baseline = try layout()
+        let target = try layout(mainExternal: true)
+        let record = try applyingRecord(baseline: baseline, target: target)
+        try withStore { store, _ in
+            try store.save(record)
+            var enabled = false
+            var stages: [InternalLifecycleStage] = []
+            XCTAssertThrowsError(try recoverGuardRecord(
+                store: store, contract: contract(for: record),
+                snapshotReader: { throw FixtureError.injected },
+                internalReader: { identity in
+                    try self.snapshot(target, internalActive: enabled).internalDisplayState(identity: identity)
+                },
+                enableInternal: { _ in enabled = true },
+                originWriter: { _ in XCTFail("failed snapshot cannot authorize origins") },
+                trace: { stages.append($0) }
+            ))
+            XCTAssertTrue(stages.contains(.enableFinished))
+            XCTAssertEqual(stages.last, .layoutReadStarted)
+            XCTAssertFalse(stages.contains(.restorationVerified))
+            XCTAssertEqual(try store.load()?.phase, .restoring)
+            XCTAssertFalse(try XCTUnwrap(store.load()).canClear)
+        }
+    }
+
     func testInternalRecoveryRetriesHaveBoundedDelayAndThenWaitForEvents() throws {
         XCTAssertEqual(internalRecoveryRetryDelay(attemptCount: 0, elapsed: 0), 0.1)
         XCTAssertEqual(internalRecoveryRetryDelay(attemptCount: 1, elapsed: 0), 0.2)
@@ -83,6 +109,7 @@ final class GuardRecoveryTests: XCTestCase {
             try store.save(record)
             var current = self.snapshot(target, internalActive: false)
             var events: [String] = []
+            var stages: [InternalLifecycleStage] = []
             let restored = try recoverGuardRecord(
                 store: store,
                 contract: contract(for: record),
@@ -108,12 +135,17 @@ final class GuardRecoveryTests: XCTestCase {
                         40: DisplayOrigin(x: 1728, y: 0)
                     ])
                     current = self.snapshot(baseline)
-                }
+                },
+                trace: { stages.append($0) }
             )
 
             XCTAssertEqual(events.filter { $0 == "enable" || $0 == "origins" }, ["enable", "origins"])
             XCTAssertEqual(restored.phase, .restored)
             XCTAssertEqual(try store.load(), restored)
+            XCTAssertEqual(stages.first, .restorationStarted)
+            XCTAssertEqual(stages.last, .restorationVerified)
+            XCTAssertLessThan(try XCTUnwrap(stages.firstIndex(of: .enableFinished)),
+                              try XCTUnwrap(stages.firstIndex(of: .originsStarted)))
         }
     }
 

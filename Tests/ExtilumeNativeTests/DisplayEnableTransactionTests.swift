@@ -40,6 +40,7 @@ final class DisplayEnableTransactionTests: XCTestCase {
             providesHandle: Bool = true,
             configureResult: CGError = .success,
             completeResult: CGError = .success,
+            cancelResult: CGError = .success,
             configureHook: (() -> Void)? = nil
         ) -> DisplayEnableTransaction {
             let configure: DisplayEnableTransaction.Configure?
@@ -65,7 +66,7 @@ final class DisplayEnableTransactionTests: XCTestCase {
                 },
                 cancel: { [self] _ in
                     events.append("cancel")
-                    return .success
+                    return cancelResult
                 }
             )
         }
@@ -427,6 +428,126 @@ final class DisplayEnableTransactionTests: XCTestCase {
         XCTAssertTrue(record.internalDisplay?.pending == true)
     }
 
+    func testRecoveryTraceReportsExactSuccessfulEnableStagesIncludingIdentityReads() throws {
+        let record = try makeRestoringRecord(sourceUnresolved: true)
+        let fake = FakeCalls()
+        var traceEntries: [String] = []
+        let trace: DisplayEnableTransaction.Trace = { stage, status in
+            traceEntries.append(self.lifecycleEvent(stage, status))
+        }
+
+        try fake.transaction().enableInternalForRecovery(
+            record: record, loadRecord: { record }, trace: trace,
+            internalReader: { identity in self.internalState(identity: identity, hardwareIdentity: self.internalHardwareIdentity) }
+        )
+
+        XCTAssertEqual(traceEntries, [
+            lifecycleEvent(.enableIdentityReadStarted), lifecycleEvent(.enableIdentityReadFinished),
+            lifecycleEvent(.enablePreValidationStarted),
+            lifecycleEvent(.enableIdentityReadStarted), lifecycleEvent(.enableIdentityReadFinished),
+            lifecycleEvent(.enablePreValidationFinished),
+            lifecycleEvent(.enableBeginStarted), lifecycleEvent(.enableBeginFinished, .success),
+            lifecycleEvent(.enableConfigureStarted), lifecycleEvent(.enableConfigureFinished, .success),
+            lifecycleEvent(.enablePostValidationStarted),
+            lifecycleEvent(.enableIdentityReadStarted), lifecycleEvent(.enableIdentityReadFinished),
+            lifecycleEvent(.enablePostValidationFinished), lifecycleEvent(.enableCompleteStarted),
+            lifecycleEvent(.enableCompleteFinished, .success)
+        ])
+        XCTAssertEqual(fake.events, ["begin", "configure:80:true", "complete:\(CGConfigureOption.forSession.rawValue)"])
+    }
+
+    func testEnableTraceCancelsAfterConfigurationOrReadFailureWithoutCompletion() throws {
+        let configureFake = FakeCalls()
+        var configureTrace: [String] = []
+        let configureRecorder: DisplayEnableTransaction.Trace = { stage, status in
+            configureTrace.append(self.lifecycleEvent(stage, status))
+        }
+        XCTAssertThrowsError(try configureFake.transaction(configureResult: .failure).setEnabled(
+            display: 42, enabled: true, trace: configureRecorder, validate: {}
+        )) {
+            XCTAssertEqual($0 as? DisplayEnableTransactionError, .configurationFailed)
+        }
+        XCTAssertEqual(configureTrace, [
+            lifecycleEvent(.enablePreValidationStarted), lifecycleEvent(.enablePreValidationFinished),
+            lifecycleEvent(.enableBeginStarted), lifecycleEvent(.enableBeginFinished, .success),
+            lifecycleEvent(.enableConfigureStarted), lifecycleEvent(.enableConfigureFinished, .failure),
+            lifecycleEvent(.enableCancelStarted), lifecycleEvent(.enableCancelFinished, .success)
+        ])
+        XCTAssertEqual(configureFake.events, ["begin", "configure:42:true", "cancel"])
+
+        let record = try makeRestoringRecord()
+        let readFake = FakeCalls()
+        var reads = 0
+        var readTrace: [String] = []
+        let readRecorder: DisplayEnableTransaction.Trace = { stage, status in
+            readTrace.append(self.lifecycleEvent(stage, status))
+        }
+        XCTAssertThrowsError(try readFake.transaction().enableInternalForRecovery(
+            record: record, loadRecord: { record }, trace: readRecorder,
+            internalReader: { identity in
+                reads += 1
+                if reads == 3 { throw ValidationError.revoked }
+                return self.internalState(identity: identity, hardwareIdentity: self.internalHardwareIdentity)
+            }
+        )) {
+            XCTAssertEqual($0 as? ValidationError, .revoked)
+        }
+        XCTAssertEqual(readTrace, [
+            lifecycleEvent(.enableIdentityReadStarted), lifecycleEvent(.enableIdentityReadFinished),
+            lifecycleEvent(.enablePreValidationStarted),
+            lifecycleEvent(.enableIdentityReadStarted), lifecycleEvent(.enableIdentityReadFinished),
+            lifecycleEvent(.enablePreValidationFinished),
+            lifecycleEvent(.enableBeginStarted), lifecycleEvent(.enableBeginFinished, .success),
+            lifecycleEvent(.enableConfigureStarted), lifecycleEvent(.enableConfigureFinished, .success),
+            lifecycleEvent(.enablePostValidationStarted), lifecycleEvent(.enableIdentityReadStarted),
+            lifecycleEvent(.enableCancelStarted), lifecycleEvent(.enableCancelFinished, .success)
+        ])
+        XCTAssertEqual(readFake.events, ["begin", "configure:80:true", "cancel"])
+    }
+
+    func testEnableTraceRecordsCompleteFailureWithoutCancellingConsumedHandle() {
+        let fake = FakeCalls()
+        var traceEntries: [String] = []
+        let trace: DisplayEnableTransaction.Trace = { stage, status in
+            traceEntries.append(self.lifecycleEvent(stage, status))
+        }
+
+        XCTAssertThrowsError(try fake.transaction(completeResult: .failure).setEnabled(
+            display: 42, enabled: true, trace: trace, validate: {}
+        )) {
+            XCTAssertEqual($0 as? DisplayEnableTransactionError, .commitFailed)
+        }
+        XCTAssertEqual(traceEntries, [
+            lifecycleEvent(.enablePreValidationStarted), lifecycleEvent(.enablePreValidationFinished),
+            lifecycleEvent(.enableBeginStarted), lifecycleEvent(.enableBeginFinished, .success),
+            lifecycleEvent(.enableConfigureStarted), lifecycleEvent(.enableConfigureFinished, .success),
+            lifecycleEvent(.enablePostValidationStarted), lifecycleEvent(.enablePostValidationFinished),
+            lifecycleEvent(.enableCompleteStarted), lifecycleEvent(.enableCompleteFinished, .failure)
+        ])
+        XCTAssertEqual(fake.events, ["begin", "configure:42:true", "complete:\(CGConfigureOption.forSession.rawValue)"])
+    }
+
+    func testEnableTraceRecordsCancellationFailureAndPreservesOriginalError() {
+        let fake = FakeCalls()
+        var traceEntries: [String] = []
+        let trace: DisplayEnableTransaction.Trace = { stage, status in
+            traceEntries.append(self.lifecycleEvent(stage, status))
+        }
+
+        XCTAssertThrowsError(try fake.transaction(configureResult: .failure, cancelResult: .failure).setEnabled(
+            display: 42, enabled: true, trace: trace, validate: {}
+        )) {
+            XCTAssertEqual($0 as? DisplayEnableTransactionError, .configurationFailed)
+        }
+        XCTAssertEqual(traceEntries, [
+            lifecycleEvent(.enablePreValidationStarted), lifecycleEvent(.enablePreValidationFinished),
+            lifecycleEvent(.enableBeginStarted), lifecycleEvent(.enableBeginFinished, .success),
+            lifecycleEvent(.enableConfigureStarted), lifecycleEvent(.enableConfigureFinished, .failure),
+            lifecycleEvent(.enableCancelStarted), lifecycleEvent(.enableCancelFinished, .failure)
+        ])
+        XCTAssertEqual(fake.events, ["begin", "configure:42:true", "cancel"])
+    }
+
     func testRecoveryRejectsMissingOrCollidingBuiltInIdentityBeforeNativeCalls() throws {
         let applied = try layout(mainExternal: true)
         let cases: [(RecoveryRecord, Snapshot)] = [
@@ -622,5 +743,9 @@ final class DisplayEnableTransactionTests: XCTestCase {
             id: 80, identityUUID: identity, isBuiltIn: true, isOnline: true, isActive: true,
             hardwareIdentity: hardwareIdentity, reportedIdentityUUID: identity
         )
+    }
+
+    private func lifecycleEvent(_ stage: InternalLifecycleStage, _ status: CGError? = nil) -> String {
+        "\(stage.rawValue):\(status.map { String($0.rawValue) } ?? "nil")"
     }
 }

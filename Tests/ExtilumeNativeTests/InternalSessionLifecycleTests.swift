@@ -2,6 +2,31 @@ import XCTest
 @testable import ExtilumeNative
 
 final class InternalSessionLifecycleTests: XCTestCase {
+    func testExitWaitsForAllAcceptedPowerAcknowledgements() {
+        var state = InternalSessionLifecycle()
+        XCTAssertTrue(state.willSleep())
+        XCTAssertTrue(state.willSleep())
+        state.didRestore()
+        XCTAssertFalse(state.beginExitAfterRecovery())
+        state.finishSleepPreparation(restored: true)
+        XCTAssertFalse(state.beginExitAfterRecovery())
+        state.finishSleepPreparation(restored: false)
+        XCTAssertTrue(state.beginExitAfterRecovery())
+        XCTAssertTrue(state.faulted)
+    }
+
+    func testLateSleepAfterExitDecisionCannotQueueRecoveryOrControls() {
+        var state = InternalSessionLifecycle()
+        state.didRestore()
+        XCTAssertTrue(state.beginExitAfterRecovery())
+        XCTAssertFalse(state.willSleep())
+        XCTAssertFalse(state.preparingForSleep)
+        state.didWake()
+        XCTAssertFalse(state.permitsControls)
+        XCTAssertFalse(state.shouldResumeAfterWake)
+        XCTAssertThrowsError(try state.beginReapplication())
+    }
+
     func testSleepBeforeRestoreAndEarlyWakeStillBlockWrites() throws {
         var state = InternalSessionLifecycle()
         state.willSleep()

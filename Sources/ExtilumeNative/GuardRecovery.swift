@@ -82,10 +82,12 @@ func recoverInternalRecord(directory: URL) throws {
         enableInternal: { restoring in
             try transaction.enableInternalForRecovery(
                 record: restoring, loadRecord: { try store.load() },
+                trace: { traceInternalLifecycle($0, role: .recoveryEntry, cgError: $1) },
                 internalReader: { try freshInternalDisplay(identity: $0, numericIDHint: hint, hardwareIdentity: responsibility.hardwareIdentity) }
             )
         },
-        originWriter: { try configureOrigins($0, option: .forSession) }
+        originWriter: { try configureOrigins($0, option: .forSession) },
+        trace: { traceInternalLifecycle($0, role: .recoveryEntry) }
     )
 }
 
@@ -96,8 +98,22 @@ func recoverGuardRecord(
     snapshotReader: () throws -> Snapshot,
     internalReader: (UUID) throws -> InternalDisplayState,
     enableInternal: (RecoveryRecord) throws -> Void,
-    originWriter: ([UInt32: DisplayOrigin]) throws -> Void
+    originWriter: ([UInt32: DisplayOrigin]) throws -> Void,
+    trace: (InternalLifecycleStage) -> Void = { _ in }
 ) throws -> RecoveryRecord {
+    trace(.restorationStarted)
+    func readInternal(_ identity: UUID) throws -> InternalDisplayState {
+        trace(.internalReadStarted)
+        let state = try internalReader(identity)
+        trace(.internalReadFinished)
+        return state
+    }
+    func readSnapshot() throws -> Snapshot {
+        trace(.layoutReadStarted)
+        let snapshot = try snapshotReader()
+        trace(.layoutReadFinished)
+        return snapshot
+    }
     guard var record = try store.load(), contract.accepts(record: record) else {
         throw RecoveryError.identityConflict
     }
@@ -113,38 +129,42 @@ func recoverGuardRecord(
             try store.save(record)
         }
         if let responsibility = record.internalDisplay, responsibility.pending {
-            let before = try internalReader(responsibility.identity)
+            let before = try readInternal(responsibility.identity)
             guard before.matches(identity: responsibility.identity, hardwareIdentity: responsibility.hardwareIdentity) else { throw RecoveryError.identityConflict }
             if !before.isEnabled {
                 guard try store.load() == record else { throw RecoveryError.unfinishedTransaction }
+                trace(.enableStarted)
                 try enableInternal(record)
+                trace(.enableFinished)
             }
-            let enabled = try internalReader(responsibility.identity)
+            let enabled = try readInternal(responsibility.identity)
             guard enabled.matches(identity: responsibility.identity, hardwareIdentity: responsibility.hardwareIdentity), enabled.isEnabled else {
                 throw RecoveryError.unfinishedTransaction
             }
         }
-        let before = try snapshotReader()
+        let before = try readSnapshot()
         let current = try before.layout()
         let connected = try before.connected()
         if !record.sourceUnresolved || current != record.baseline {
             let plan = try record.layoutRestorePlan(connected: connected, current: current)
             if !plan.origins.isEmpty {
-                let fresh = try snapshotReader()
+                let fresh = try readSnapshot()
                 guard try fresh.layout() == current,
                       try fresh.connected().count == connected.count,
                       try fresh.connected().allSatisfy({ connected.contains($0) }),
                       try store.load() == record else { throw RecoveryError.unfinishedTransaction }
+                trace(.originsStarted)
                 try originWriter(plan.origins)
+                trace(.originsFinished)
             }
             guard plan.missing.isEmpty else { throw RecoveryError.unfinishedTransaction }
         }
     }
 
-    let actual = try snapshotReader()
+    let actual = try readSnapshot()
     let layout = try actual.layout()
     let internalEnabled: Bool? = try record.internalDisplay.map {
-        let display = try internalReader($0.identity)
+        let display = try readInternal($0.identity)
         guard display.matches(identity: $0.identity, hardwareIdentity: $0.hardwareIdentity) else { throw RecoveryError.identityConflict }
         return display.isEnabled
     }
@@ -158,5 +178,6 @@ func recoverGuardRecord(
         try record.confirmRestored(actual: layout, internalEnabled: internalEnabled)
         try store.save(record)
     }
+    trace(.restorationVerified)
     return record
 }
