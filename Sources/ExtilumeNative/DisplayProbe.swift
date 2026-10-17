@@ -10,7 +10,7 @@ import Foundation
 struct DisplayState: Equatable, Codable {
     let id: CGDirectDisplayID
     let identity: DisplayIdentity
-    let identityUUID: UUID?
+    var identityUUID: UUID?
     let isOnline: Bool
     let isActive: Bool
     let isMain: Bool
@@ -150,10 +150,43 @@ private enum ProbeError: Error, CustomStringConvertible {
     }
 }
 
+// 仅输出固定分类，不插入底层错误描述或设备身份。
+func snapshotWitnessFailureCode(_ error: Error) -> String {
+    if let error = error as? ProbeError {
+        switch error {
+        case .displayListReadFailed("在线"): return "online-list"
+        case .displayListReadFailed("活动"): return "active-list"
+        default: return "display-read"
+        }
+    }
+    if let error = error as? RecoveryError, case .identityConflict = error { return "identity-conflict" }
+    if let error = error as? GuardChannelError {
+        switch error {
+        case .timedOut: return "channel-timeout"
+        case .peerClosed: return "channel-closed"
+        case .systemCall: return "channel-system-call"
+        default: return "channel-invalid"
+        }
+    }
+    if let error = error as? SnapshotWitnessError {
+        switch error {
+        case .spawnFailed: return "witness-spawn"
+        case .communicationFailed: return "witness-communication"
+        case .timedOut: return "witness-timeout"
+        case .invalidSnapshot: return "witness-invalid-state"
+        case .snapshotUnavailable: return "witness-unavailable"
+        case .processFailed: return "witness-exit"
+        case .cleanupFailed: return "witness-cleanup"
+        case .internalStateChanged: return "internal-state-changed"
+        }
+    }
+    return "unclassified"
+}
+
 private func displayList(_ name: String, read: (UInt32, UnsafeMutablePointer<CGDirectDisplayID>?, UnsafeMutablePointer<UInt32>?) -> CGError) throws -> [CGDirectDisplayID] {
     var count: UInt32 = 0
     guard read(0, nil, &count) == .success else { throw ProbeError.displayListReadFailed(name) }
-    guard count > 0 else { throw ProbeError.noDisplays(name) }
+    guard count > 0 else { return [] }
 
     var ids = [CGDirectDisplayID](repeating: 0, count: Int(count))
     var actualCount = count
@@ -161,19 +194,57 @@ private func displayList(_ name: String, read: (UInt32, UnsafeMutablePointer<CGD
         read(UInt32(buffer.count), buffer.baseAddress, &actualCount)
     }
     guard result == .success else { throw ProbeError.displayListReadFailed(name) }
-    guard actualCount > 0 else { throw ProbeError.noDisplays(name) }
     return Array(ids.prefix(Int(actualCount)))
 }
 
-func readSnapshot() throws -> Snapshot {
+private func readInternalHardwareIdentity(_ info: [String: Any]) -> InternalDisplayHardwareIdentity? {
+    var boot = [CChar](repeating: 0, count: 128)
+    var size = boot.count
+    guard sysctlbyname("kern.bootsessionuuid", &boot, &size, nil, 0) == 0,
+          size > 0, size <= boot.count, boot[size - 1] == 0,
+          let bootSession = boot.withUnsafeBufferPointer({ UUID(uuidString: String(cString: $0.baseAddress!)) }),
+          let location = info["IODisplayLocation"] as? String else { return nil }
+    let service = IORegistryEntryFromPath(kIOMainPortDefault, location)
+    guard service != IO_OBJECT_NULL else { return nil }
+    defer { IOObjectRelease(service) }
+    var entryID: UInt64 = 0
+    guard IOObjectConformsTo(service, "IOMobileFramebufferShim") != 0,
+          IORegistryEntryGetRegistryEntryID(service, &entryID) == KERN_SUCCESS, entryID != 0 else { return nil }
+    return InternalDisplayHardwareIdentity(bootSession: bootSession, registryEntryID: entryID)
+}
+
+func readInternalDisplay(
+    identity: UUID, numericIDHint: UInt32,
+    hardwareIdentity: InternalDisplayHardwareIdentity? = nil
+) throws -> InternalDisplayState {
+    try hardwareIdentity?.validate()
     let online = try displayList("在线", read: CGGetOnlineDisplayList)
     let active = try displayList("活动", read: CGGetActiveDisplayList)
+    return try matchInternalDisplay(identity: identity, hardwareIdentity: hardwareIdentity, candidates: online + active + [numericIDHint]) { id in
+        guard let info = coreDisplayCreateInfo?(id)?.takeRetainedValue() as? [String: Any],
+              (info["kCGDisplayID"] as? NSNumber)?.uint32Value == id,
+              let text = (info["DisplayUUID"] as? String) ?? (info["kCGDisplayUUID"] as? String),
+              let uuid = UUID(uuidString: text) else { return nil }
+        return InternalDisplayState(
+            id: id, identityUUID: uuid, isBuiltIn: CGDisplayIsBuiltin(id) != 0,
+            isOnline: CGDisplayIsOnline(id) != 0,
+            isActive: CGDisplayIsActive(id) != 0,
+            hardwareIdentity: readInternalHardwareIdentity(info), reportedIdentityUUID: uuid
+        )
+    }
+}
+
+func readSnapshot(activeOnly: Bool = false) throws -> Snapshot {
+    let online = try displayList("在线", read: CGGetOnlineDisplayList)
+    let active = try displayList("活动", read: CGGetActiveDisplayList)
+    guard !online.isEmpty else { throw ProbeError.noDisplays("在线") }
+    guard !active.isEmpty else { throw ProbeError.noDisplays("活动") }
     let onlineSet = Set(online)
     let activeSet = Set(active)
     let mainID = CGMainDisplayID()
     let candidates = registryEvidence()
 
-    let states = try Set(online + active).map { id -> DisplayState in
+    let states = try Set(activeOnly ? active : online + active).map { id -> DisplayState in
         let bounds = CGDisplayBounds(id)
         guard let mode = CGDisplayCopyDisplayMode(id) else { throw ProbeError.displayModeReadFailed }
         let mirrored = CGDisplayIsInMirrorSet(id) != 0 || CGDisplayMirrorsDisplay(id) != kCGNullDirectDisplay
@@ -272,7 +343,7 @@ private func render(_ snapshot: Snapshot, unchanged: Bool) -> String {
     }
     lines.append("启动前后布局、在线/活动、主屏、分辨率、旋转及显示模式读回一致：\(yesNo(unchanged))")
     lines.append("内屏启用位私有符号：\((try? DisplayEnableTransaction()) != nil ? "可解析（未调用，效果未验收）" : "不可用（禁止启停）")")
-    lines.append("本次只读运行未执行显示配置写入。主屏验证须显式指定 --verify-primary；内屏停用未实现。")
+    lines.append("本次只读运行未执行显示配置写入。主动验证须显式指定对应入口；内屏停用效果尚未实机验收。")
     return lines.joined(separator: "\n")
 }
 
@@ -342,11 +413,13 @@ public func runDisplayProbe() {
         已手动修改 C、原进程退出后确认来源：extilume-probe --confirm-user-primary <同一状态目录>
         不改显示设置的保护演练：extilume-probe --guard-drill <0700 状态目录>
         内屏恢复合同无写入演练：extilume-probe --guard-drill-internal <0700 状态目录>
+        内屏责任独立恢复（记录保留）：extilume-probe --recover-internal <同一状态目录>
+        受保护内屏停用验证（需先开盖且外屏为主屏）：extilume-probe --verify-internal-disable <0700 状态目录>
         只读物理事件观察：extilume-probe --watch-connection（mark / stop）
         离线计时检查：extilume-probe --check-recovery-timing <故障最早ns> <故障最晚ns> <通知ns> <恢复核验ns>
         人工动作计时窗口：extilume-probe --record-connection-timing（JSON 行输出；不读写显示状态）
         验证命令：status、confirm-user（仅在你已手动修改布局后）、reapply、stop。
-        内屏停用未实现。主动验证尚需开盖实机验收。
+        内屏停用验证命令：status、stop。效果及故障恢复时限尚未实机验收。
         """)
     } else if CommandLine.arguments.dropFirst().first == "--check-recovery-timing" {
         do { print(try recoveryTimingReport(arguments: Array(CommandLine.arguments.dropFirst(2)))) }
@@ -384,9 +457,25 @@ public func runDisplayProbe() {
             fputs("HDMI 物理事件观察未就绪；未执行配置写入。\n", stderr)
             exit(EXIT_FAILURE)
         }
-    } else if CommandLine.arguments.count == 3, CommandLine.arguments[1] == "--display-snapshot",
+    } else if CommandLine.arguments.count == 3, CommandLine.arguments[1] == "--recover-internal" {
+        do {
+            try recoverInternalRecord(directory: URL(fileURLWithPath: CommandLine.arguments[2]))
+            print("内屏责任恢复及独立读回完成；记录保留，未自动清除。")
+        } catch {
+            fputs("内屏责任恢复未完成，类别=\(snapshotWitnessFailureCode(error))；记录保留。\n", stderr)
+            exit(EXIT_FAILURE)
+        }
+    } else if CommandLine.arguments.count == 3, CommandLine.arguments[1] == "--internal-display-snapshot",
               let descriptor = Int32(CommandLine.arguments[2]), descriptor >= 3 {
-        do { try serveSnapshot(descriptor: descriptor) }
+        do { try serveInternalDisplay(descriptor: descriptor) }
+        catch {
+            fputs("独立内屏身份与启用位读回未完成，类别=\(snapshotWitnessFailureCode(error))；未执行配置写入。\n", stderr)
+            exit(EXIT_FAILURE)
+        }
+    } else if CommandLine.arguments.count == 3,
+              ["--display-snapshot", "--active-display-snapshot"].contains(CommandLine.arguments[1]),
+              let descriptor = Int32(CommandLine.arguments[2]), descriptor >= 3 {
+        do { try serveSnapshot(descriptor: descriptor, activeOnly: CommandLine.arguments[1] == "--active-display-snapshot") }
         catch {
             fputs("独立显示读回未完成；未执行配置写入。\n", stderr)
             exit(EXIT_FAILURE)
@@ -394,24 +483,49 @@ public func runDisplayProbe() {
     } else if CommandLine.arguments.count == 4, CommandLine.arguments[1] == "--display-guard",
               let descriptor = Int32(CommandLine.arguments[3]), descriptor >= 3 {
         do {
+            let application = try displayEventApplication()
             let guardProcess = try DisplayGuard(directory: URL(fileURLWithPath: CommandLine.arguments[2]), descriptor: descriptor)
-            try guardProcess.start()
-            withExtendedLifetime(guardProcess) { CFRunLoopRun() }
+            DispatchQueue.main.async {
+                do { try guardProcess.start() }
+                catch {
+                    fputs("辅助进程未就绪；未授权任何内屏停用。责任记录保留。\n", stderr)
+                    exit(EXIT_FAILURE)
+                }
+            }
+            withExtendedLifetime(guardProcess) { application.run() }
         } catch {
             fputs("辅助进程未就绪；未授权任何内屏停用。责任记录保留。\n", stderr)
             exit(EXIT_FAILURE)
         }
     } else if CommandLine.arguments.count == 3,
-              ["--guard-drill", "--guard-drill-internal"].contains(CommandLine.arguments[1]) {
+              ["--guard-drill", "--guard-drill-internal", "--verify-internal-disable"].contains(CommandLine.arguments[1]) {
         do {
-            let drill = try GuardDrill(
+            let application = try displayEventApplication()
+            let operation: GuardSessionOperation = switch CommandLine.arguments[1] {
+            case "--verify-internal-disable": .disableInternal
+            case "--guard-drill-internal": .internalDrill
+            default: .drill
+            }
+            let drill = try GuardSession(
                 directory: URL(fileURLWithPath: CommandLine.arguments[2]),
-                internalRecovery: CommandLine.arguments[1] == "--guard-drill-internal"
+                operation: operation
             )
-            try drill.start()
-            withExtendedLifetime(drill) { CFRunLoopRun() }
+            DispatchQueue.main.async {
+                DispatchQueue.global().async {
+                    do { try drill.start() }
+                    catch {
+                        fputs("验证会话未能启动；已有责任记录保留。\n", stderr)
+                        exit(EXIT_FAILURE)
+                    }
+                }
+            }
+            withExtendedLifetime(drill) { application.run() }
         } catch {
-            fputs("保护演练未完成；显示配置未写入，已有责任保留。\n", stderr)
+            if CommandLine.arguments[1] == "--verify-internal-disable" {
+                fputs("停用验证未能启动；禁止新控制，已有责任记录保留。\n", stderr)
+            } else {
+                fputs("保护演练未完成；显示配置未写入，已有责任保留。\n", stderr)
+            }
             exit(EXIT_FAILURE)
         }
     } else if CommandLine.arguments.count == 3,
@@ -442,7 +556,7 @@ public func runDisplayProbe() {
             let after = try readSnapshot()
             print(render(after, unchanged: before == after))
         } catch {
-            fputs("Extilume 本机显示只读探测\n运行模式：只读\n系统：\(ProcessInfo.processInfo.operatingSystemVersionString)\n架构：\(architectureName())\n内屏开合：\(clamshellState())\n显示拓扑：不可读\n阻塞：\(error)。未执行显示配置写入。\n主动验证模式：主屏已实现；内屏停用未实现\n", stderr)
+            fputs("Extilume 本机显示只读探测\n运行模式：只读\n系统：\(ProcessInfo.processInfo.operatingSystemVersionString)\n架构：\(architectureName())\n内屏开合：\(clamshellState())\n显示拓扑：不可读\n阻塞：\(error)。未执行显示配置写入。\n主动验证模式：需显式指定；内屏停用效果尚未实机验收\n", stderr)
             exit(EXIT_FAILURE)
         }
     }

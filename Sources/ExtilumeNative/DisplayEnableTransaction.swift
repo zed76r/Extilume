@@ -61,12 +61,14 @@ final class DisplayEnableTransaction {
         loadRecord: () throws -> RecoveryRecord?,
         snapshotReader: () throws -> Snapshot,
         lidIsOpen: () -> Bool,
-        checkProtection: (RecoveryRecord) throws -> Void
+        checkProtection: (RecoveryRecord) throws -> Void,
+        internalReader: (UUID) throws -> InternalDisplayState = { _ in throw RecoveryError.identityConflict }
     ) throws {
         try record.validate()
         guard record.phase == .applying, !record.sourceUnresolved,
               let responsibility = record.internalDisplay,
-              responsibility.baseline, !responsibility.applied, responsibility.pending else {
+              responsibility.baseline, !responsibility.applied, responsibility.pending,
+              responsibility.hardwareIdentity != nil else {
             throw RecoveryError.invalidRecord
         }
         let initial = try snapshotReader()
@@ -88,6 +90,12 @@ final class DisplayEnableTransaction {
                 throw DisplayEnableTransactionError.unsafeTopology
             }
             guard try loadRecord() == record else { throw RecoveryError.unfinishedTransaction }
+            let state = try internalReader(responsibility.identity)
+            guard state.matches(identity: responsibility.identity, hardwareIdentity: responsibility.hardwareIdentity),
+                  state.id == display, state.isEnabled,
+                  state.reportedIdentityUUID == snapshot.displays.first(where: { $0.id == display })?.identityUUID else {
+                throw RecoveryError.identityConflict
+            }
             try checkProtection(record)
         }
     }
@@ -96,24 +104,26 @@ final class DisplayEnableTransaction {
     func enableInternalForRecovery(
         record: RecoveryRecord,
         loadRecord: () throws -> RecoveryRecord?,
-        snapshotReader: () throws -> Snapshot
+        internalReader: (UUID) throws -> InternalDisplayState
     ) throws {
         try record.validate()
         guard record.phase == .restoring, let responsibility = record.internalDisplay,
               responsibility.baseline, responsibility.pending else { throw RecoveryError.invalidRecord }
-        let initial = try snapshotReader()
-        let display = try initial.builtInDisplay(identity: responsibility.identity).id
+        let initial = try internalReader(responsibility.identity)
+        guard initial.matches(identity: responsibility.identity, hardwareIdentity: responsibility.hardwareIdentity) else { throw RecoveryError.identityConflict }
+        let display = initial.id
         try setEnabled(display: display, enabled: true) {
             guard try loadRecord() == record else { throw RecoveryError.unfinishedTransaction }
-            let snapshot = try snapshotReader()
-            guard try snapshot.builtInDisplay(identity: responsibility.identity).id == display else {
+            let actual = try internalReader(responsibility.identity)
+            guard actual.matches(identity: responsibility.identity, hardwareIdentity: responsibility.hardwareIdentity),
+                  actual.id == display, actual.reportedIdentityUUID == initial.reportedIdentityUUID else {
                 throw RecoveryError.identityConflict
             }
             guard try loadRecord() == record else { throw RecoveryError.unfinishedTransaction }
         }
     }
 
-    // 调用方须校验已落盘责任、身份、拓扑和独立保护；当前没有真实启停入口。
+    // 仅由持锁控制／恢复入口调用；调用方须校验落盘责任、身份和适用保护。
     func setEnabled(display: CGDirectDisplayID, enabled: Bool, validate: () throws -> Void) throws {
         guard display != kCGNullDirectDisplay else { throw DisplayEnableTransactionError.invalidDisplay }
         guard let configure else { throw DisplayEnableTransactionError.symbolUnavailable }

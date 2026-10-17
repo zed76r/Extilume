@@ -1,13 +1,16 @@
 """GUI 桌面须已唤醒；仅验证无显示写入的辅助进程演练。"""
 import ctypes
+import fcntl
 import json
 import os
 from pathlib import Path
+import pty
 import select
 import signal
 import subprocess
 import sys
 import tempfile
+import termios
 import time
 
 
@@ -16,9 +19,9 @@ def require(condition, message):
         raise RuntimeError(message)
 
 
-def ready_line(process, timeout=5):
+def ready_line(process, timeout=5, output_fd=None):
     deadline = time.monotonic() + timeout
-    fd = process.stdout.fileno()
+    fd = process.stdout.fileno() if output_fd is None else output_fd
     line = bytearray()
     while True:
         remaining = deadline - time.monotonic()
@@ -115,7 +118,9 @@ def run_case(binary, command):
                 require("模拟连接安全条件失效；不代表实际拔线" in output, "缺少模拟事件标记")
                 require("连接安全条件失效；禁止新控制" in output, "缺少连接失效撤权处理")
         elif command == "lose-guard":
-            require("辅助进程失效；禁止新控制" in output, "缺少保护失效处理")
+            require(any(marker in output for marker in (
+                "辅助进程失效；禁止新控制", "保护通信失效；禁止新控制", "保护失效；禁止新控制，恢复结果已核验"
+            )), "缺少保护失效处理")
         require(json.loads(record_path.read_text())["phase"] == "restored", "未保存恢复结果")
         require(not any(int(row[0]) in (process.pid, child_pid) and not row[3].startswith("Z") for row in processes()), "存在未退出演练进程")
         final = subprocess.run([str(binary), "--finalize-primary", str(directory)], capture_output=True, timeout=5)
@@ -143,8 +148,100 @@ def run_case(binary, command):
         raise
 
 
+def run_pty_hangup_case(binary):
+    directory = Path(tempfile.mkdtemp(prefix="extilume-guard-pty-", dir="/private/tmp"))
+    master_fd = None
+    slave_fd = None
+    process = None
+    child_pid = None
+    preserve_master = False
+    try:
+        master_fd, slave_fd = pty.openpty()
+
+        def acquire_controlling_terminal():
+            os.setsid()
+            fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+
+        process = subprocess.Popen(
+            [str(binary), "--guard-drill", str(directory)],
+            stdin=slave_fd, stdout=slave_fd, stderr=slave_fd,
+            preexec_fn=acquire_controlling_terminal,
+        )
+        os.close(slave_fd)
+        slave_fd = None
+        ready_line(process, output_fd=master_fd)
+
+        record_path = directory / "recovery-record.json"
+        record = json.loads(record_path.read_text())
+        require(record["phase"] == "owned" and record["baseline"] == record["applied"], "非无写入演练记录")
+        require(directory.stat().st_mode & 0o777 == 0o700, "PTY 演练目录权限不符")
+        require(record_path.stat().st_uid == os.getuid() and record_path.stat().st_mode & 0o777 == 0o600, "记录权限不符")
+        children = [row for row in processes() if int(row[1]) == process.pid and "--display-guard" in row[4]]
+        require(len(children) == 1 and int(children[0][2]) == os.getuid(), "同用户独立辅助进程不符")
+        child_pid = int(children[0][0])
+
+        script_group = os.getpgrp()
+        script_session = os.getsid(0)
+        parent_group = os.getpgid(process.pid)
+        parent_session = os.getsid(process.pid)
+        require(
+            parent_group == process.pid and parent_session == process.pid
+            and parent_group != script_group and parent_session != script_session,
+            "PTY 主进程未隔离为本轮控制 session/process group；不发送 hangup",
+        )
+        helper_group = os.getpgid(child_pid)
+        helper_session = os.getsid(child_pid)
+        require(
+            helper_group != parent_group and helper_session != parent_session,
+            "辅助进程仍与 PTY 主进程共享 session/process group；不发送 hangup",
+        )
+        # 只有确认目标是本轮独占进程组且辅助进程已脱离后，才模拟终端 hangup。
+        require(
+            process.poll() is None and os.getpgid(process.pid) == parent_group
+            and os.getsid(process.pid) == parent_session,
+            "本轮 PTY 主进程已退出或改变归属；不发送 hangup",
+        )
+        os.killpg(parent_group, signal.SIGHUP)
+        os.close(master_fd)
+        master_fd = None
+        require(process.wait(timeout=8) == -signal.SIGHUP, "PTY 主进程未因 SIGHUP 退出")
+
+        wait_for_helper_exit(child_pid)
+        require(json.loads(record_path.read_text())["phase"] == "restored", "辅助进程未保存恢复结果")
+        require(
+            not any(int(row[0]) == child_pid and not row[3].startswith("Z") for row in processes()),
+            "辅助进程仍在运行",
+        )
+        final = subprocess.run([str(binary), "--finalize-primary", str(directory)], capture_output=True, timeout=5)
+        require(final.returncode == 0 and not list(directory.iterdir()), "独立终验或清理失败")
+        directory.rmdir()
+        print("pty-hangup: 辅助进程隔离、主进程组 hangup、恢复核验及清理通过", flush=True)
+    except BaseException:
+        if process is not None:
+            # 强杀 session leader 也会 SIGHUP 未隔离的辅助进程，先正常恢复。
+            preserve_master = True
+            try:
+                if process.poll() is None:
+                    require(master_fd is not None, "PTY 已关闭，无法发送 stop")
+                    os.write(master_fd, b"stop\n")
+                process.wait(timeout=5)
+                if child_pid is not None:
+                    wait_for_helper_exit(child_pid)
+                preserve_master = False
+            except Exception as cleanup_error:
+                print("PTY 正常收束未完成；未主动关闭终端，记录保留：" + str(cleanup_error), file=sys.stderr)
+        print("PTY 演练未完成；状态保留于 " + str(directory), file=sys.stderr)
+        raise
+    finally:
+        if slave_fd is not None:
+            os.close(slave_fd)
+        if master_fd is not None and not preserve_master:
+            os.close(master_fd)
+
+
 if __name__ == "__main__":
     require(len(sys.argv) == 2, "用法：python3 scripts/verify-guard-drill.py <extilume-probe>")
     binary = Path(sys.argv[1]).resolve(strict=True)
     for case in ("stop", "crash", "lose-guard", "kill", "invalidate-connection"):
         run_case(binary, case)
+    run_pty_hangup_case(binary)

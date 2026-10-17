@@ -13,10 +13,166 @@ final class RecoveryRecordTests: XCTestCase {
         ])
     }
 
+    private func externalOnlyLayout() throws -> DisplayLayout {
+        try DisplayLayout(main: externalID, origins: [externalID: DisplayOrigin(x: 0, y: 0)])
+    }
+
+    private func internalOnlyLayout() throws -> DisplayLayout {
+        try DisplayLayout(main: internalID, origins: [internalID: DisplayOrigin(x: 0, y: 0)])
+    }
+
     private func ownedRecord(internalDisplay: InternalDisplayResponsibility? = nil) throws -> RecoveryRecord {
         var record = try RecoveryRecord(baseline: layout(), target: layout(mainExternal: true), internalDisplay: internalDisplay)
         try record.markApplying()
-        try record.confirmApplied(layout(mainExternal: true), internalEnabled: internalDisplay?.applied)
+        let actual = internalDisplay.map { $0.baseline && !$0.applied } == true
+            ? try externalOnlyLayout()
+            : try layout(mainExternal: true)
+        try record.confirmApplied(actual, internalEnabled: internalDisplay?.applied)
+        return record
+    }
+
+    func testDisabledLayoutUsesV2SubsetAndRestoresLatestCWithOrWithoutExternalDisplay() throws {
+        let c = try layout(distance: -1920)
+        let b = try layout(mainExternal: true)
+        let subset = try externalOnlyLayout()
+        let responsibility = InternalDisplayResponsibility(identity: internalID, baseline: true, applied: false)
+        var record = try RecoveryRecord(baseline: c, target: b, internalDisplay: responsibility)
+        try record.markApplying()
+        try record.confirmApplied(subset, internalEnabled: false)
+
+        XCTAssertEqual(record.version, 2)
+        XCTAssertEqual(record.baseline, c)
+        XCTAssertEqual(record.applied, subset)
+        XCTAssertEqual(record.preDisableLayout, b)
+        XCTAssertTrue(record.layoutPending)
+        XCTAssertEqual(record.phase, .owned)
+        try record.validate()
+        let decoded = try JSONDecoder().decode(RecoveryRecord.self, from: JSONEncoder().encode(record))
+        try decoded.validate()
+        XCTAssertEqual(decoded, record)
+
+        let fullPlan = try record.layoutRestorePlan(connected: [
+            ConnectedDisplay(identity: internalID, numericID: 90),
+            ConnectedDisplay(identity: externalID, numericID: 40)
+        ], current: b)
+        XCTAssertEqual(fullPlan.origins[90], c.origins[internalID])
+        XCTAssertEqual(fullPlan.origins[40], c.origins[externalID])
+        XCTAssertTrue(fullPlan.missing.isEmpty)
+
+        let partialPlan = try record.layoutRestorePlan(connected: [
+            ConnectedDisplay(identity: internalID, numericID: 90)
+        ], current: try internalOnlyLayout())
+        XCTAssertEqual(partialPlan.origins, [90: DisplayOrigin(x: 0, y: 0)])
+        XCTAssertEqual(partialPlan.missing, [externalID])
+
+        var reapplication = decoded
+        try reapplication.prepareReapplication(current: subset, target: b)
+        XCTAssertNil(reapplication.preDisableLayout)
+        XCTAssertEqual(reapplication.applied, b)
+    }
+
+    func testDisableConfirmationRejectsContradictoryOrUnprovenActualLayouts() throws {
+        let b = try layout(mainExternal: true)
+        let subset = try externalOnlyLayout()
+        let responsibility = InternalDisplayResponsibility(identity: internalID, baseline: true, applied: false)
+        let invalidActuals: [(DisplayLayout, Bool?)] = [
+            (b, false),
+            (try internalOnlyLayout(), false),
+            (subset, true),
+            (subset, nil)
+        ]
+        for (actual, enabled) in invalidActuals {
+            var record = try RecoveryRecord(baseline: layout(), target: b, internalDisplay: responsibility)
+            try record.markApplying()
+            XCTAssertThrowsError(try record.confirmApplied(actual, internalEnabled: enabled))
+            XCTAssertTrue(record.sourceUnresolved)
+            XCTAssertEqual(record.applied, b)
+            XCTAssertNil(record.preDisableLayout)
+        }
+
+        var wrongMain = try RecoveryRecord(baseline: layout(), target: layout(), internalDisplay: responsibility)
+        try wrongMain.markApplying()
+        XCTAssertThrowsError(try wrongMain.confirmApplied(subset, internalEnabled: false))
+        XCTAssertTrue(wrongMain.sourceUnresolved)
+
+        let threeDisplayBaseline = try DisplayLayout(main: internalID, origins: [
+            internalID: DisplayOrigin(x: 0, y: 0),
+            externalID: DisplayOrigin(x: 1728, y: 0),
+            otherID: DisplayOrigin(x: 3000, y: 0)
+        ])
+        let threeDisplayTarget = try DisplayLayout(main: externalID, origins: [
+            internalID: DisplayOrigin(x: -1728, y: 0),
+            externalID: DisplayOrigin(x: 0, y: 0),
+            otherID: DisplayOrigin(x: 1200, y: 0)
+        ])
+        let wrongOrigin = try DisplayLayout(main: externalID, origins: [
+            externalID: DisplayOrigin(x: 0, y: 0),
+            otherID: DisplayOrigin(x: 1201, y: 0)
+        ])
+        var wrongOriginRecord = try RecoveryRecord(
+            baseline: threeDisplayBaseline, target: threeDisplayTarget, internalDisplay: responsibility
+        )
+        try wrongOriginRecord.markApplying()
+        XCTAssertThrowsError(try wrongOriginRecord.confirmApplied(wrongOrigin, internalEnabled: false))
+        XCTAssertTrue(wrongOriginRecord.sourceUnresolved)
+
+        var prepared = try RecoveryRecord(baseline: layout(), target: b, internalDisplay: responsibility)
+        XCTAssertThrowsError(try prepared.confirmApplied(subset, internalEnabled: false))
+        XCTAssertTrue(prepared.sourceUnresolved)
+
+        var legacyJSON = try XCTUnwrap(JSONSerialization.jsonObject(
+            with: JSONEncoder().encode(try applyingInternalDisableRecord(target: b))
+        ) as? [String: Any])
+        legacyJSON["version"] = 1
+        legacyJSON.removeValue(forKey: "preDisableLayout")
+        let legacyApplying = try JSONDecoder().decode(
+            RecoveryRecord.self, from: JSONSerialization.data(withJSONObject: legacyJSON)
+        )
+        try legacyApplying.validate()
+        var legacy = legacyApplying
+        XCTAssertThrowsError(try legacy.confirmApplied(subset, internalEnabled: false))
+        XCTAssertTrue(legacy.sourceUnresolved)
+    }
+
+    func testV1LegacyRecordStillDecodesAndRestoredSubsetHistoryRemainsValid() throws {
+        var oldRecord = try JSONSerialization.jsonObject(
+            with: JSONEncoder().encode(RecoveryRecord(baseline: layout(), target: layout(mainExternal: true)))
+        ) as! [String: Any]
+        oldRecord["version"] = 1
+        oldRecord.removeValue(forKey: "preDisableLayout")
+        let legacy = try JSONDecoder().decode(
+            RecoveryRecord.self, from: JSONSerialization.data(withJSONObject: oldRecord)
+        )
+        XCTAssertEqual(legacy.version, 1)
+        XCTAssertNil(legacy.preDisableLayout)
+        try legacy.validate()
+
+        let c = try layout(distance: -1920)
+        let b = try layout(mainExternal: true)
+        let responsibility = InternalDisplayResponsibility(identity: internalID, baseline: true, applied: false)
+        var record = try RecoveryRecord(baseline: c, target: b, internalDisplay: responsibility)
+        try record.markApplying()
+        try record.confirmApplied(try externalOnlyLayout(), internalEnabled: false)
+        record.beginRestoration()
+        try record.confirmRestored(actual: c, internalEnabled: true)
+        XCTAssertEqual(record.phase, .restored)
+        XCTAssertFalse(record.layoutPending)
+        XCTAssertEqual(record.baseline, c)
+        XCTAssertEqual(record.applied, try externalOnlyLayout())
+        XCTAssertEqual(record.preDisableLayout, b)
+        XCTAssertTrue(record.canClear)
+        try record.validate()
+        let restored = try JSONDecoder().decode(RecoveryRecord.self, from: JSONEncoder().encode(record))
+        try restored.validate()
+        XCTAssertEqual(restored.preDisableLayout, b)
+    }
+
+    private func applyingInternalDisableRecord(target: DisplayLayout) throws -> RecoveryRecord {
+        var record = try RecoveryRecord(
+            baseline: layout(), target: target,
+            internalDisplay: InternalDisplayResponsibility(identity: internalID, baseline: true, applied: false)
+        )
+        try record.markApplying()
         return record
     }
 
@@ -283,7 +439,7 @@ final class RecoveryRecordTests: XCTestCase {
         XCTAssertThrowsError(try DisplayLayout(main: internalID, origins: [:]))
         let record = try ownedRecord()
         var json = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(record)) as? [String: Any])
-        json["version"] = 2
+        json["version"] = 99
         let decoded = try JSONDecoder().decode(RecoveryRecord.self, from: JSONSerialization.data(withJSONObject: json))
         XCTAssertThrowsError(try decoded.validate())
     }

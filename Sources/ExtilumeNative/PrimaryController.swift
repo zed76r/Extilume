@@ -32,11 +32,11 @@ extension Snapshot {
     }
 }
 
-func stableSnapshot() throws -> Snapshot {
-    var before = try readSnapshot()
+func stableSnapshot(activeOnly: Bool = false) throws -> Snapshot {
+    var before = try readSnapshot(activeOnly: activeOnly)
     for _ in 0..<20 {
         Thread.sleep(forTimeInterval: 0.1)
-        let after = try readSnapshot()
+        let after = try readSnapshot(activeOnly: activeOnly)
         if before == after { return after }
         before = after
     }

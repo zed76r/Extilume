@@ -2,7 +2,7 @@ import Darwin
 import ExtilumeCore
 import Foundation
 
-private enum SnapshotWitnessError: Error {
+enum SnapshotWitnessError: Error {
     case spawnFailed
     case communicationFailed
     case timedOut
@@ -10,9 +10,47 @@ private enum SnapshotWitnessError: Error {
     case snapshotUnavailable
     case processFailed
     case cleanupFailed
+    case internalStateChanged
 }
 
 func freshSnapshot() throws -> Snapshot {
+    try freshWitness(Snapshot.self, arguments: ["--display-snapshot"], validate: isValid)
+}
+
+func freshActiveSnapshot() throws -> Snapshot {
+    try freshWitness(Snapshot.self, arguments: ["--active-display-snapshot"], validate: isValid)
+}
+
+private struct InternalDisplayRequest: Codable {
+    let identity: UUID
+    let numericIDHint: UInt32
+    let hardwareIdentity: InternalDisplayHardwareIdentity?
+}
+
+func freshInternalDisplay(
+    identity: UUID, numericIDHint: UInt32,
+    hardwareIdentity: InternalDisplayHardwareIdentity? = nil
+) throws -> InternalDisplayState {
+    guard numericIDHint != 0 else { throw SnapshotWitnessError.invalidSnapshot }
+    let request = InternalDisplayRequest(identity: identity, numericIDHint: numericIDHint, hardwareIdentity: hardwareIdentity)
+    do {
+        return try freshWitness(
+            InternalDisplayState.self, arguments: ["--internal-display-snapshot"],
+            prepare: { try $0.send(request) },
+            validate: { $0.matches(identity: identity, hardwareIdentity: hardwareIdentity) }
+        )
+    } catch {
+        fputs("内屏独立观测失败，类别=\(snapshotWitnessFailureCode(error))；保留恢复责任。\n", stderr)
+        throw error
+    }
+}
+
+private func freshWitness<Value: Decodable>(
+    _ type: Value.Type,
+    arguments: [String],
+    prepare: (GuardChannel) throws -> Void = { _ in },
+    validate: (Value) -> Bool
+) throws -> Value {
     let parentChannel: GuardChannel
     var childChannel: GuardChannel?
     do {
@@ -26,7 +64,7 @@ func freshSnapshot() throws -> Snapshot {
     let witness: pid_t
     do {
         guard let childChannel else { throw SnapshotWitnessError.spawnFailed }
-        witness = try spawnProbe(["--display-snapshot"], channel: childChannel)
+        witness = try spawnProbe(arguments, channel: childChannel)
     } catch {
         childChannel = nil
         throw SnapshotWitnessError.spawnFailed
@@ -35,16 +73,17 @@ func freshSnapshot() throws -> Snapshot {
 
     var reaped = false
     do {
-        let snapshot: Snapshot
+        let snapshot: Value
         do {
-            snapshot = try parentChannel.receive(Snapshot.self)
+            try prepare(parentChannel)
+            snapshot = try parentChannel.receive(type)
         } catch let error as GuardChannelError where error == .timedOut {
             throw SnapshotWitnessError.timedOut
         } catch {
             throw SnapshotWitnessError.communicationFailed
         }
 
-        guard isValid(snapshot) else { throw SnapshotWitnessError.invalidSnapshot }
+        guard validate(snapshot) else { throw SnapshotWitnessError.invalidSnapshot }
         guard let status = try waitForExit(witness, polls: 100) else {
             throw SnapshotWitnessError.timedOut
         }
@@ -62,7 +101,30 @@ func freshSnapshot() throws -> Snapshot {
     }
 }
 
-func serveSnapshot(descriptor: Int32) throws {
+func serveInternalDisplay(
+    descriptor: Int32,
+    reader: (UUID, UInt32, InternalDisplayHardwareIdentity?) throws -> InternalDisplayState = {
+        try readInternalDisplay(identity: $0, numericIDHint: $1, hardwareIdentity: $2)
+    }
+) throws {
+    let channel: GuardChannel
+    do { channel = try GuardChannel(descriptor: descriptor) }
+    catch {
+        Darwin.close(descriptor)
+        throw SnapshotWitnessError.communicationFailed
+    }
+    let request = try channel.receive(InternalDisplayRequest.self)
+    guard request.numericIDHint != 0 else { throw SnapshotWitnessError.invalidSnapshot }
+    let before = try reader(request.identity, request.numericIDHint, request.hardwareIdentity)
+    let after = try reader(request.identity, request.numericIDHint, request.hardwareIdentity)
+    guard before == after else { throw SnapshotWitnessError.internalStateChanged }
+    guard after.matches(identity: request.identity, hardwareIdentity: request.hardwareIdentity) else {
+        throw SnapshotWitnessError.invalidSnapshot
+    }
+    try channel.send(after)
+}
+
+func serveSnapshot(descriptor: Int32, activeOnly: Bool = false) throws {
     let channel: GuardChannel
     do {
         channel = try GuardChannel(descriptor: descriptor)
@@ -73,7 +135,7 @@ func serveSnapshot(descriptor: Int32) throws {
 
     let snapshot: Snapshot
     do {
-        snapshot = try stableSnapshot()
+        snapshot = try stableSnapshot(activeOnly: activeOnly)
     } catch {
         throw SnapshotWitnessError.snapshotUnavailable
     }

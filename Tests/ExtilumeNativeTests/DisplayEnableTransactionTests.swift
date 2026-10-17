@@ -9,6 +9,9 @@ final class DisplayEnableTransactionTests: XCTestCase {
     private let externalID = UUID(uuidString: "00000000-0000-4000-8000-000000000002")!
     private let session = UUID(uuidString: "11111111-2222-4333-8444-555555555555")!
     private let otherSession = UUID(uuidString: "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee")!
+    private var internalHardwareIdentity: InternalDisplayHardwareIdentity {
+        InternalDisplayHardwareIdentity(bootSession: session, registryEntryID: 123)
+    }
 
     private enum ValidationError: Error, Equatable {
         case revoked
@@ -175,6 +178,30 @@ final class DisplayEnableTransactionTests: XCTestCase {
         ])
     }
 
+    func testDisableInternalRejectsMissingHardwareIdentityBeforeNativeCalls() throws {
+        let record = try makeRecord(includeHardwareIdentity: false)
+        let fake = FakeCalls()
+        var snapshotReads = 0
+        var internalReads = 0
+
+        XCTAssertThrowsError(try runDisable(
+            fake.transaction(), record: record, storedRecord: { record },
+            snapshotReader: {
+                snapshotReads += 1
+                return makeSnapshot(try layout(mainExternal: true))
+            },
+            internalReader: { _ in
+                internalReads += 1
+                throw RecoveryError.identityConflict
+            },
+            checkProtection: { _ in }
+        ))
+
+        XCTAssertEqual(snapshotReads, 0)
+        XCTAssertEqual(internalReads, 0)
+        XCTAssertTrue(fake.events.isEmpty)
+    }
+
     func testDisableInternalRejectsUnsupportedTopologyOrClosedLidBeforeNativeCalls() throws {
         let record = try makeRecord()
         let protection = try readyProtection(for: record)
@@ -294,6 +321,29 @@ final class DisplayEnableTransactionTests: XCTestCase {
         }
     }
 
+    func testDisableInternalCancelsBeforeCommitWhenHardwareIdentityChanges() throws {
+        let record = try makeRecord()
+        let snapshot = makeSnapshot(try layout(mainExternal: true))
+        let protection = try readyProtection(for: record)
+        var currentHardwareIdentity = internalHardwareIdentity
+        var internalReads = 0
+        let fake = FakeCalls()
+
+        XCTAssertThrowsError(try runDisable(
+            fake.transaction(configureHook: {
+                currentHardwareIdentity = InternalDisplayHardwareIdentity(bootSession: self.session, registryEntryID: 124)
+            }), record: record, storedRecord: { record }, snapshotReader: { snapshot },
+            internalReader: { identity in
+                internalReads += 1
+                return self.internalState(identity: identity, hardwareIdentity: currentHardwareIdentity)
+            },
+            checkProtection: { try protection.authorize(record: $0) }
+        ))
+
+        XCTAssertEqual(internalReads, 2)
+        XCTAssertEqual(fake.events, ["begin", "configure:80:false", "cancel"])
+    }
+
     func testDisableInternalRejectsProtectionLostDuringSnapshotReadAndCancels() throws {
         let record = try makeRecord()
         let snapshot = makeSnapshot(try layout(mainExternal: true))
@@ -327,7 +377,14 @@ final class DisplayEnableTransactionTests: XCTestCase {
         let fake = FakeCalls()
 
         try fake.transaction().enableInternalForRecovery(
-            record: record, loadRecord: { record }, snapshotReader: { snapshot }
+            record: record, loadRecord: { record },
+            internalReader: { identity in
+                let state = try snapshot.internalDisplayState(identity: identity)
+                return InternalDisplayState(id: state.id, identityUUID: state.identityUUID, isBuiltIn: state.isBuiltIn,
+                                            isOnline: state.isOnline, isActive: state.isActive,
+                                            hardwareIdentity: record.internalDisplay?.hardwareIdentity,
+                                            reportedIdentityUUID: state.identityUUID)
+            }
         )
 
         XCTAssertEqual(fake.events, [
@@ -338,19 +395,45 @@ final class DisplayEnableTransactionTests: XCTestCase {
         XCTAssertTrue(record.internalDisplay?.pending == true)
     }
 
-    func testRecoveryRejectsMissingWrongOrCollidingBuiltInIdentityBeforeNativeCalls() throws {
+    func testRecoveryRejectsMissingOrCollidingBuiltInIdentityBeforeNativeCalls() throws {
         let applied = try layout(mainExternal: true)
         let cases: [(RecoveryRecord, Snapshot)] = [
             (try makeRestoringRecord(), makeSnapshot(applied, includeInternal: false)),
-            (try makeRestoringRecord(internalIdentity: externalID), makeSnapshot(applied)),
             (try makeRestoringRecord(), makeSnapshot(applied, externalDisplayID: 80))
         ]
 
         for (record, snapshot) in cases {
             let fake = FakeCalls()
             XCTAssertThrowsError(try fake.transaction().enableInternalForRecovery(
-                record: record, loadRecord: { record }, snapshotReader: { snapshot }
+                record: record, loadRecord: { record },
+                internalReader: { identity in try snapshot.internalDisplayState(identity: identity) }
             ))
+            XCTAssertTrue(fake.events.isEmpty)
+        }
+    }
+
+    func testRecoveryRejectsWrongUUIDNonBuiltInAndZeroInternalReadbackBeforeNativeCalls() throws {
+        let record = try makeRestoringRecord()
+        let invalidStates = [
+            InternalDisplayState(id: 80, identityUUID: externalID, isBuiltIn: true, isOnline: true, isActive: false),
+            InternalDisplayState(id: 80, identityUUID: internalID, isBuiltIn: false, isOnline: true, isActive: false),
+            InternalDisplayState(id: 80, identityUUID: internalID, isBuiltIn: true, isOnline: false, isActive: false,
+                                 hardwareIdentity: InternalDisplayHardwareIdentity(bootSession: session, registryEntryID: 999),
+                                 reportedIdentityUUID: internalID),
+            InternalDisplayState(id: 0, identityUUID: internalID, isBuiltIn: true, isOnline: true, isActive: false)
+        ]
+
+        for invalidState in invalidStates {
+            let fake = FakeCalls()
+            XCTAssertThrowsError(try fake.transaction().enableInternalForRecovery(
+                record: record, loadRecord: { record }, internalReader: { _ in invalidState }
+            )) { error in
+                guard let recoveryError = error as? RecoveryError,
+                      case .identityConflict = recoveryError else {
+                    XCTFail("expected identityConflict, got \(error)")
+                    return
+                }
+            }
             XCTAssertTrue(fake.events.isEmpty)
         }
     }
@@ -361,6 +444,7 @@ final class DisplayEnableTransactionTests: XCTestCase {
         storedRecord: () throws -> RecoveryRecord?,
         snapshotReader: () throws -> Snapshot,
         lidIsOpen: () -> Bool = { true },
+        internalReader: ((UUID) throws -> InternalDisplayState)? = nil,
         checkProtection: (RecoveryRecord) throws -> Void
     ) throws {
         try transaction.disableInternal(
@@ -368,14 +452,18 @@ final class DisplayEnableTransactionTests: XCTestCase {
             loadRecord: storedRecord,
             snapshotReader: snapshotReader,
             lidIsOpen: lidIsOpen,
-            checkProtection: checkProtection
+            checkProtection: checkProtection,
+            internalReader: internalReader ?? { [self] identity in
+                self.internalState(identity: identity, hardwareIdentity: self.internalHardwareIdentity)
+            }
         )
     }
 
     private func readyProtection(for record: RecoveryRecord) throws -> ProtectionAuthorization {
         let handshake = try ProtectionHandshake(
             session: record.session, generation: record.generation, parentPID: 42,
-            internalDisplayIdentity: record.internalDisplay?.identity
+            internalDisplayIdentity: record.internalDisplay?.identity,
+            internalDisplayHardwareIdentity: record.internalDisplay?.hardwareIdentity
         )
         var protection = ProtectionAuthorization()
         try protection.acknowledge(receipt: handshake, expected: handshake)
@@ -388,7 +476,8 @@ final class DisplayEnableTransactionTests: XCTestCase {
         internalBaseline: Bool = true,
         internalApplied: Bool = false,
         applying: Bool = true,
-        includeResponsibility: Bool = true
+        includeResponsibility: Bool = true,
+        includeHardwareIdentity: Bool = true
     ) throws -> RecoveryRecord {
         var record = try RecoveryRecord(
             session: session ?? self.session,
@@ -397,19 +486,17 @@ final class DisplayEnableTransactionTests: XCTestCase {
             internalDisplay: includeResponsibility ? InternalDisplayResponsibility(
                 identity: internalIdentity ?? internalID,
                 baseline: internalBaseline,
-                applied: internalApplied
+                applied: internalApplied,
+                hardwareIdentity: includeHardwareIdentity ? internalHardwareIdentity : nil
             ) : nil
         )
         if applying { try record.markApplying() }
         return record
     }
 
-    private func makeRestoringRecord(
-        internalIdentity: UUID? = nil,
-        sourceUnresolved: Bool = false
-    ) throws -> RecoveryRecord {
-        var record = try makeRecord(internalIdentity: internalIdentity)
-        try record.confirmApplied(try layout(mainExternal: true), internalEnabled: false)
+    private func makeRestoringRecord(sourceUnresolved: Bool = false) throws -> RecoveryRecord {
+        var record = try makeRecord()
+        try record.confirmApplied(try externalOnlyLayout(), internalEnabled: false)
         if sourceUnresolved {
             let unknownLayout = try layout(mainExternal: true, internalX: -1900)
             XCTAssertThrowsError(try record.observe(unknownLayout, source: .unknown))
@@ -421,8 +508,8 @@ final class DisplayEnableTransactionTests: XCTestCase {
     private func makeNewerApplyingRecord() throws -> RecoveryRecord {
         var record = try makeRecord()
         let target = try layout(mainExternal: true)
-        try record.confirmApplied(target, internalEnabled: false)
-        try record.prepareReapplication(current: target, target: target)
+        try record.confirmApplied(try externalOnlyLayout(), internalEnabled: false)
+        try record.prepareReapplication(current: try externalOnlyLayout(), target: target)
         try record.markApplying()
         return record
     }
@@ -430,8 +517,8 @@ final class DisplayEnableTransactionTests: XCTestCase {
     private func makeUnresolvedApplyingRecord() throws -> RecoveryRecord {
         var record = try makeRecord()
         let target = try layout(mainExternal: true)
-        try record.confirmApplied(target, internalEnabled: false)
-        try record.prepareReapplication(current: target, target: target)
+        try record.confirmApplied(try externalOnlyLayout(), internalEnabled: false)
+        try record.prepareReapplication(current: try externalOnlyLayout(), target: target)
         try record.markApplying()
         try record.observe(layout(mainExternal: true, internalX: -1900), source: .unknown)
         XCTAssertTrue(record.sourceUnresolved)
@@ -443,6 +530,10 @@ final class DisplayEnableTransactionTests: XCTestCase {
             internalID: DisplayOrigin(x: mainExternal ? (internalX ?? -1728) : 0, y: 0),
             externalID: DisplayOrigin(x: mainExternal ? 0 : 1728, y: 0)
         ])
+    }
+
+    private func externalOnlyLayout() throws -> DisplayLayout {
+        try DisplayLayout(main: externalID, origins: [externalID: DisplayOrigin(x: 0, y: 0)])
     }
 
     private func makeSnapshot(
@@ -488,6 +579,16 @@ final class DisplayEnableTransactionTests: XCTestCase {
             height: 1080,
             rotation: 0,
             mode: DisplayModeState(width: 1920, height: 1080, pixelWidth: 1920, pixelHeight: 1080, refreshRate: 60, ioDisplayModeID: 1)
+        )
+    }
+
+    private func internalState(
+        identity: UUID,
+        hardwareIdentity: InternalDisplayHardwareIdentity
+    ) -> InternalDisplayState {
+        InternalDisplayState(
+            id: 80, identityUUID: identity, isBuiltIn: true, isOnline: true, isActive: true,
+            hardwareIdentity: hardwareIdentity, reportedIdentityUUID: identity
         )
     }
 }

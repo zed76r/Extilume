@@ -234,7 +234,8 @@ def check_record(directory, phase, generation):
 
 
 def check_record_data(record, phase, generation):
-    require(record.get("version") == 1, "责任记录版本不符")
+    require(type(record.get("version")) is int and record["version"] in (1, 2), "责任记录版本不符")
+    require(record.get("preDisableLayout") is None, "责任记录超出无写入范围")
     require(record.get("phase") == phase and record.get("generation") == generation, "责任记录阶段不符")
     require(layout_key(record.get("baseline")) == layout_key(record.get("applied")), "责任记录非无写入布局")
     require(record.get("layoutPending") is False, "责任记录仍有待处理布局")

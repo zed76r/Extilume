@@ -84,9 +84,12 @@ final class ProtectionHandshakeTests: XCTestCase {
 
         var newer = try makeRecord(internalDisplayIdentity: firstDisplay)
         try newer.markApplying()
-        try newer.confirmApplied(newer.applied, internalEnabled: false)
+        let target = newer.applied
+        try newer.confirmApplied(DisplayLayout(main: secondDisplay, origins: [
+            secondDisplay: DisplayOrigin(x: 0, y: 0)
+        ]), internalEnabled: false)
         let current = newer.applied
-        try newer.prepareReapplication(current: current, target: current)
+        try newer.prepareReapplication(current: current, target: target)
 
         XCTAssertGreaterThan(newer.generation, scoped.generation)
         XCTAssertTrue(scoped.accepts(record: newer))

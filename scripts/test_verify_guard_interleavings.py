@@ -23,6 +23,26 @@ EXTERNAL = str(uuid.UUID(int=0xFEDCBAFEDCBAFEDCBAFEDCBAFEDCBAFE))
 
 
 class LayoutKeyTests(unittest.TestCase):
+    def test_supported_record_versions_still_require_no_write_scope(self):
+        layout = {"main": MAIN, "origins": [MAIN, {"x": 0, "y": 0}]}
+        record = {
+            "version": 1, "phase": "applying", "generation": 1,
+            "baseline": layout, "applied": layout, "layoutPending": False,
+            "internalDisplay": None, "sourceUnresolved": False,
+        }
+        for version in (1, 2):
+            with self.subTest(version=version):
+                record["version"] = version
+                self.assertIs(INTERLEAVINGS.check_record_data(record, "applying", 1), record)
+        for version in (0, 3, True, "2", None):
+            with self.subTest(invalid_version=version), self.assertRaisesRegex(RuntimeError, "版本"):
+                record["version"] = version
+                INTERLEAVINGS.check_record_data(record, "applying", 1)
+        record["version"] = 2
+        record["preDisableLayout"] = layout
+        with self.assertRaisesRegex(RuntimeError, "无写入范围"):
+            INTERLEAVINGS.check_record_data(record, "applying", 1)
+
     def test_origin_reordering_and_uuid_case_are_equivalent(self):
         first = {"main": MAIN, "origins": [MAIN, {"x": 0, "y": 0}, EXTERNAL, {"x": 1280, "y": 0}]}
         second = {

@@ -105,7 +105,7 @@ final class RecoveryStoreTests: XCTestCase {
             let store = try RecoveryStore(directory: directory)
             let validData = try JSONEncoder().encode(makeRecord(pendingLayout: false))
             var payload = try XCTUnwrap(JSONSerialization.jsonObject(with: validData) as? [String: Any])
-            payload["version"] = 2
+            payload["version"] = 99
             let invalidRecord = try JSONSerialization.data(withJSONObject: payload)
             let url = recordURL(in: directory)
             try invalidRecord.write(to: url)
@@ -229,6 +229,121 @@ final class RecoveryStoreTests: XCTestCase {
             }
             XCTAssertEqual(owned.phase, .owned)
             XCTAssertEqual(try store.load(), owned)
+        }
+    }
+
+    func testInternalDisableStoresActualSubsetAndFullLayoutWitness() throws {
+        try withTemporaryDirectory { directory in
+            let store = try RecoveryStore(directory: directory)
+            try store.acquireExclusiveOwnership()
+            let fixture = try internalDisableFixture()
+            let owned = try store.apply(fixture.prepared) {
+                XCTAssertEqual(try store.load()?.phase, .applying)
+                return (fixture.subset, false)
+            }
+
+            XCTAssertEqual(owned.phase, .owned)
+            XCTAssertEqual(owned.baseline, fixture.baseline)
+            XCTAssertEqual(owned.applied, fixture.subset)
+            XCTAssertEqual(owned.preDisableLayout, fixture.target)
+            XCTAssertTrue(owned.layoutPending)
+            XCTAssertEqual(try store.load(), owned)
+        }
+    }
+
+    func testFailedSubsetConfirmationPersistsUnresolvedApplyingRecord() throws {
+        try withTemporaryDirectory { directory in
+            let store = try RecoveryStore(directory: directory)
+            try store.acquireExclusiveOwnership()
+            let fixture = try internalDisableFixture()
+
+            XCTAssertThrowsError(try store.apply(fixture.prepared) { (fixture.target, false) }) { error in
+                XCTAssertEqual(error as? RecoveryError, .unresolvedSource)
+            }
+
+            let failed = try XCTUnwrap(store.load())
+            XCTAssertEqual(failed.phase, .applying)
+            XCTAssertTrue(failed.sourceUnresolved)
+            XCTAssertEqual(failed.baseline, fixture.baseline)
+            XCTAssertEqual(failed.applied, fixture.target)
+            XCTAssertNil(failed.preDisableLayout)
+            XCTAssertFalse(failed.canClear)
+        }
+    }
+
+    func testPrewriteCancellationRestoresPreviousSubsetWitness() throws {
+        try withTemporaryDirectory { directory in
+            let store = try RecoveryStore(directory: directory)
+            try store.acquireExclusiveOwnership()
+            let fixture = try internalDisableFixture()
+            let original = try store.apply(fixture.prepared) { (fixture.subset, false) }
+            var prepared = original
+            try prepared.prepareReapplication(current: fixture.subset, target: fixture.target)
+            XCTAssertNil(prepared.preDisableLayout)
+
+            XCTAssertThrowsError(try store.apply(prepared, beforeOperation: {
+                throw CancellationError()
+            }) { (fixture.target, false) }) { error in
+                XCTAssertTrue(error is CancellationError)
+            }
+
+            let cancelled = try XCTUnwrap(store.load())
+            XCTAssertEqual(cancelled.phase, .owned)
+            XCTAssertEqual(cancelled.generation, prepared.generation)
+            XCTAssertEqual(cancelled.baseline, fixture.baseline)
+            XCTAssertEqual(cancelled.applied, fixture.subset)
+            XCTAssertEqual(cancelled.preDisableLayout, fixture.target)
+        }
+    }
+
+    func testFailedConfirmationCannotOverwriteNewerGeneration() throws {
+        try withTemporaryDirectory { directory in
+            let store = try RecoveryStore(directory: directory)
+            try store.acquireExclusiveOwnership()
+            let fixture = try internalDisableFixture()
+            var newerGeneration: RecoveryRecord?
+
+            XCTAssertThrowsError(try store.apply(fixture.prepared) {
+                var newer = try XCTUnwrap(store.load())
+                try newer.confirmApplied(fixture.subset, internalEnabled: false)
+                try newer.prepareReapplication(current: fixture.subset, target: fixture.target)
+                newerGeneration = newer
+                try store.save(newer)
+                return (fixture.target, false)
+            }) { error in
+                XCTAssertEqual(error as? RecoveryError, .unresolvedSource)
+            }
+
+            let persisted = try XCTUnwrap(store.load())
+            XCTAssertEqual(persisted, try XCTUnwrap(newerGeneration))
+            XCTAssertGreaterThan(persisted.generation, fixture.prepared.generation)
+            XCTAssertEqual(persisted.phase, .prepared)
+            XCTAssertFalse(persisted.sourceUnresolved)
+        }
+    }
+
+    func testFinalSaveFailureLeavesApplyingRecordOnDisk() throws {
+        try withTemporaryDirectory { directory in
+            let store = try RecoveryStore(directory: directory)
+            try store.acquireExclusiveOwnership()
+            let prepared = try makeRecord(pendingLayout: true)
+            let url = recordURL(in: directory)
+            var applyingBeforeOperation: RecoveryRecord?
+            defer { _ = chmod(url.path, mode_t(0o600)) }
+
+            XCTAssertThrowsError(try store.apply(prepared) {
+                applyingBeforeOperation = try store.load()
+                XCTAssertEqual(applyingBeforeOperation?.phase, .applying)
+                XCTAssertEqual(chmod(url.path, mode_t(0o400)), 0)
+                return (prepared.applied, nil)
+            }) { error in
+                XCTAssertEqual(error as? RecoveryStoreError, .unsafeRecordFile)
+            }
+
+            XCTAssertEqual(chmod(url.path, mode_t(0o600)), 0)
+            let applying = try XCTUnwrap(store.load())
+            XCTAssertEqual(applying.phase, .applying)
+            XCTAssertEqual(applying, try XCTUnwrap(applyingBeforeOperation))
         }
     }
 
@@ -592,6 +707,27 @@ final class RecoveryStoreTests: XCTestCase {
             target: target,
             internalDisplay: responsibility
         )
+    }
+
+    private func internalDisableFixture() throws -> (
+        prepared: RecoveryRecord,
+        baseline: DisplayLayout,
+        target: DisplayLayout,
+        subset: DisplayLayout
+    ) {
+        let baseline = try DisplayLayout(main: mainIdentity, origins: [
+            mainIdentity: DisplayOrigin(x: 0, y: 0), outerIdentity: DisplayOrigin(x: 100, y: 0)
+        ])
+        let target = try DisplayLayout(main: outerIdentity, origins: [
+            mainIdentity: DisplayOrigin(x: -100, y: 0), outerIdentity: DisplayOrigin(x: 0, y: 0)
+        ])
+        let subset = try DisplayLayout(main: outerIdentity, origins: [outerIdentity: DisplayOrigin(x: 0, y: 0)])
+        let prepared = try RecoveryRecord(
+            baseline: baseline,
+            target: target,
+            internalDisplay: InternalDisplayResponsibility(identity: mainIdentity, baseline: true, applied: false)
+        )
+        return (prepared, baseline, target, subset)
     }
 
     private func layout(otherX: Int32) throws -> DisplayLayout {

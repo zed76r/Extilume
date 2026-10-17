@@ -81,8 +81,16 @@ public final class RecoveryStore {
             throw error
         }
         // 控制回调只能在责任记录已原子落盘后运行；失败保留 applying 责任。
+        let applyingRecord = record
         let actual = try operation()
-        try record.confirmApplied(actual.layout, internalEnabled: actual.internalEnabled)
+        do { try record.confirmApplied(actual.layout, internalEnabled: actual.internalEnabled) }
+        catch {
+            let confirmationError = error
+            if record.sourceUnresolved, (try? load()) == applyingRecord {
+                try save(record)
+            }
+            throw confirmationError
+        }
         try save(record)
         return record
     }
