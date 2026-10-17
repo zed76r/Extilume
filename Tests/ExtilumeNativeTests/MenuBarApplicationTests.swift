@@ -76,6 +76,10 @@ final class MenuBarApplicationTests: XCTestCase {
             (.quitFailed, "恢复失败，尚未退出", [
                 "重试": (true, false), "重试恢复": (false, true), "保留当前配置": (false, true),
                 "打开显示设置": (false, true), "退出并恢复": (false, false)
+            ]),
+            (.quitWaitingForDisplays, "显示器未齐，等待恢复退出", [
+                "重试": (true, false), "重试恢复": (false, true), "保留当前配置": (true, false),
+                "打开显示设置": (false, true), "退出并恢复": (false, false)
             ])
         ]
 
@@ -187,6 +191,62 @@ final class MenuBarApplicationTests: XCTestCase {
         XCTAssertEqual(fixture.session.recoveries, 0)
         XCTAssertEqual(delegate.applicationShouldTerminate(.shared), .terminateLater)
         XCTAssertEqual(fixture.session.quitCompletions.count, 2)
+    }
+
+    func testWaitingForDisplaysSurvivesEitherTerminationCallbackOrderAndRetriesExit() async throws {
+        for statusFirst in [true, false] {
+            let fixture = Fixture()
+            let delegate = fixture.delegate
+            delegate.startSession()
+            XCTAssertEqual(delegate.applicationShouldTerminate(.shared), .terminateLater)
+            if statusFirst {
+                fixture.session.emit(.quitWaitingForDisplays)
+                await drainMainQueue()
+                XCTAssertNotNil(delegate.menu.item(withTitle: "显示器未齐，等待恢复退出"))
+                let recover = try item("重试恢复", in: delegate)
+                XCTAssertFalse(recover.isEnabled)
+                try dispatch(recover)
+                XCTAssertEqual(fixture.terminationRequests, 0)
+            }
+            fixture.session.quitCompletions[0](false)
+            await drainMainQueue()
+            XCTAssertEqual(fixture.terminationReplies, [false])
+            if !statusFirst {
+                XCTAssertNotNil(delegate.menu.item(withTitle: "恢复失败，尚未退出"))
+                fixture.session.emit(.quitWaitingForDisplays)
+                await drainMainQueue()
+            }
+
+            let state = try item("显示器未齐，等待恢复退出", in: delegate)
+            let recover = try item("重试恢复", in: delegate)
+            let hint = "请打开笔记本上盖或接回原外接显示器，再点“重试恢复”以恢复并退出。"
+            XCTAssertEqual(state.toolTip, hint)
+            XCTAssertEqual(recover.toolTip, hint)
+            XCTAssertFalse(recover.isHidden)
+            XCTAssertTrue(recover.isEnabled)
+            for title in ["重试", "保留当前配置", "退出并恢复"] {
+                let action = try item(title, in: delegate)
+                XCTAssertFalse(action.isEnabled)
+                try dispatch(action)
+            }
+            XCTAssertEqual(fixture.session.retries, 0)
+            XCTAssertEqual(fixture.session.confirmations, 0)
+            XCTAssertEqual(fixture.terminationRequests, 0)
+
+            try dispatch(recover)
+            XCTAssertEqual(fixture.terminationRequests, 1)
+            XCTAssertEqual(fixture.session.recoveries, 0)
+            XCTAssertEqual(delegate.applicationShouldTerminate(.shared), .terminateLater)
+            XCTAssertEqual(fixture.session.quitCompletions.count, 2)
+            XCTAssertNil(recover.toolTip)
+            XCTAssertNil(try item("正在恢复并退出…", in: delegate).toolTip)
+            // A later ordinary failure must not inherit the previous missing-display state.
+            fixture.session.quitCompletions[1](false)
+            await drainMainQueue()
+            XCTAssertEqual(fixture.terminationReplies, [false, false])
+            XCTAssertNotNil(delegate.menu.item(withTitle: "恢复失败，尚未退出"))
+            XCTAssertTrue(try item("保留当前配置", in: delegate).isEnabled)
+        }
     }
 
     func testSuccessfulTerminationRepliesOnlyAfterRecoveryCompletion() async {

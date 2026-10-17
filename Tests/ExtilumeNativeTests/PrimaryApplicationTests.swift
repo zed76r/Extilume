@@ -133,6 +133,53 @@ final class PrimaryApplicationTests: XCTestCase {
         controller = nil
     }
 
+    func testQuitWaitsForMissingDisplaysAndRetriesWithoutReapplication() throws {
+        for missingInternal in [true, false] {
+            let directory = try makeTemporaryDirectory()
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let baseline = try layout()
+            let target = try layout(mainExternal: true)
+            let fixture = ControllerFixture(snapshot: try makeSnapshot(baseline))
+            let statuses = StatusRecorder()
+            let controller = try makeController(directory: directory, fixture: fixture)
+            controller.startApplication(registerEvents: false) { statuses.append($0) }
+            XCTAssertTrue(statuses.wait(for: .applied))
+            let original = try XCTUnwrap(readRecord(in: directory))
+
+            fixture.setLid(missingInternal ? "合盖" : "开盖")
+            fixture.setSnapshot(try makeSnapshot(
+                missingInternal ? target : baseline,
+                includeInternal: !missingInternal, includeExternal: missingInternal
+            ))
+            let firstQuit = CompletionRecorder()
+            controller.quitApplication { firstQuit.finish($0) }
+            XCTAssertEqual(firstQuit.wait(), false)
+            XCTAssertTrue(statuses.wait(for: .quitWaitingForDisplays))
+            let pending = try XCTUnwrap(readRecord(in: directory))
+            XCTAssertEqual(pending.session, original.session)
+            XCTAssertEqual(pending.generation, original.generation)
+            XCTAssertEqual(pending.baseline, baseline)
+            XCTAssertTrue(pending.layoutPending)
+            XCTAssertFalse(pending.sourceUnresolved)
+            XCTAssertFalse(pending.canClear)
+
+            fixture.setLid("开盖")
+            fixture.setSnapshot(try makeSnapshot(missingInternal ? baseline : target))
+            controller.displayChanged(.addFlag)
+            controller.systemDidWake()
+            let retry = CompletionRecorder()
+            controller.quitApplication { retry.finish($0) }
+            XCTAssertEqual(retry.wait(), true)
+            let restored = try XCTUnwrap(readRecord(in: directory))
+            XCTAssertEqual(restored.session, original.session)
+            XCTAssertEqual(restored.generation, original.generation)
+            XCTAssertEqual(restored.baseline, baseline)
+            XCTAssertTrue(restored.canClear)
+            XCTAssertEqual(try fixture.snapshot().layout(), baseline)
+            XCTAssertEqual(fixture.writes.filter(\.appOnly).count, 1)
+        }
+    }
+
     func testRepeatedRetryClicksDoNotQueueMoreFailedApplications() throws {
         let directory = try makeTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }

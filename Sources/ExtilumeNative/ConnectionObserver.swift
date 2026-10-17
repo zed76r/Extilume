@@ -23,6 +23,8 @@ final class ConnectionObserver: @unchecked Sendable {
     private let service: io_service_t
     private let targetEntryID: UInt64
     private let targetEDIDUUID: UUID
+    private let onInvalidation: @Sendable () -> Void
+    private let reportsEvents: Bool
     private let queue = DispatchQueue(label: "Extilume.connection-observer")
     private let queueKey = DispatchSpecificKey<Bool>()
 
@@ -38,7 +40,8 @@ final class ConnectionObserver: @unchecked Sendable {
     private var started = false
     private var resourcesReleased = false
 
-    init(service: io_service_t) throws {
+    init(service: io_service_t, reportsEvents: Bool = true,
+         onInvalidation: @escaping @Sendable () -> Void = {}) throws {
         var ownsService = true
         defer { if ownsService { _ = IOObjectRelease(service) } }
 
@@ -53,6 +56,8 @@ final class ConnectionObserver: @unchecked Sendable {
         self.service = service
         targetEntryID = entryID
         targetEDIDUUID = edidUUID
+        self.reportsEvents = reportsEvents
+        self.onInvalidation = onInvalidation
         ownsService = false
         queue.setSpecific(key: queueKey, value: true)
     }
@@ -108,7 +113,9 @@ final class ConnectionObserver: @unchecked Sendable {
                     try registerMatchingNotification(.matched, className: candidate.rawValue)
                     try registerMatchingNotification(.terminated, className: candidate.rawValue)
                 }
-                guard !candidateSetupFailed else { throw ConnectionObserverError.setupFailed }
+                guard !candidateSetupFailed, candidates.hasCandidates else {
+                    throw ConnectionObserverError.setupFailed
+                }
                 started = true
             } catch {
                 releaseResourcesOnQueue()
@@ -178,13 +185,14 @@ final class ConnectionObserver: @unchecked Sendable {
             defer { _ = IOObjectRelease(candidate) }
             let observedAt = try? ContinuousClock.nanoseconds()
             var entryID: UInt64 = 0
-            if IORegistryEntryGetRegistryEntryID(candidate, &entryID) == KERN_SUCCESS {
-                if kind == .terminated,
-                   invalidateCandidate(entryID, terminated: true,
-                       event: initial ? "initial-not-physical termination" : "termination", observedAt: observedAt) {
-                    releaseCandidate(entryID)
-                    continue
-                }
+            let identified = IORegistryEntryGetRegistryEntryID(candidate, &entryID) == KERN_SUCCESS
+            if kind == .terminated,
+               invalidateCandidate(identified ? entryID : 0, terminated: true,
+                   event: initial ? "initial-not-physical termination" : "termination", observedAt: observedAt) {
+                releaseCandidate(entryID)
+                continue
+            }
+            if identified {
                 if kind == .matched,
                    let candidateClass = ExternalConnectionService.allCases.first(where: {
                        IOObjectConformsTo(candidate, $0.rawValue) != 0
@@ -223,7 +231,9 @@ final class ConnectionObserver: @unchecked Sendable {
     }
 
     private func invalidateCandidate(_ entryID: UInt64, terminated: Bool, event: String, observedAt: UInt64?) -> Bool {
-        guard let candidateClass = candidates.invalidate(entryID: entryID, terminated: terminated) else { return false }
+        let candidateClass = candidates.invalidate(entryID: entryID, terminated: terminated)
+        onInvalidation()
+        guard let candidateClass else { return false }
         log("candidate \(event) class=\(candidateClass.rawValue) invalidated=true（仅安全条件失效，非已确认拔线）", observedAt: observedAt)
         return true
     }
@@ -253,7 +263,10 @@ final class ConnectionObserver: @unchecked Sendable {
         guard !resourcesReleased else { return }
         let observedAt = try? ContinuousClock.nanoseconds()
         var entryID: UInt64 = 0
-        guard IORegistryEntryGetRegistryEntryID(service, &entryID) == KERN_SUCCESS else { return }
+        guard IORegistryEntryGetRegistryEntryID(service, &entryID) == KERN_SUCCESS else {
+            _ = invalidateCandidate(0, terminated: false, event: "unclassified interest", observedAt: observedAt)
+            return
+        }
         if invalidateCandidate(entryID, terminated: false, event: "interest type=\(messageType)", observedAt: observedAt) {
             return
         }
@@ -270,8 +283,13 @@ final class ConnectionObserver: @unchecked Sendable {
 
     fileprivate func enqueueDisplayChange(_ flags: CGDisplayChangeSummaryFlags) {
         let observedAt = try? ContinuousClock.nanoseconds()
+        let invalidated = !flags.intersection([.removeFlag, .disabledFlag]).isEmpty
+        // 撤权不能等在可能阻塞的显示快照之后。
+        if invalidated { onInvalidation() }
         queue.async { [weak self] in
             guard let self, !self.resourcesReleased else { return }
+            if invalidated { _ = self.candidates.invalidate(entryID: 0, terminated: false) }
+            guard self.reportsEvents else { return }
             let activeCount = (try? readSnapshot().displays.filter(\.isActive).count)
                 .map(String.init) ?? "不可读"
             self.log("display-change flags=\(flags.rawValue) 活动数=\(activeCount) candidate-invalidated=\(self.candidates.invalidated)（仅作观测，不证明可用）", observedAt: observedAt)
@@ -279,7 +297,7 @@ final class ConnectionObserver: @unchecked Sendable {
     }
 
     private func log(_ event: String, observedAt: UInt64? = nil) {
-        guard let startedAt,
+        guard reportsEvents, let startedAt,
               let now = observedAt ?? (try? ContinuousClock.nanoseconds()),
               now >= startedAt else { return }
         print("[\((now - startedAt) / 1_000_000)ms] \(event) continuousNs=\(now)")

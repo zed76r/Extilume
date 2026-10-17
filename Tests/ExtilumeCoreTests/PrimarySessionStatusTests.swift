@@ -14,7 +14,8 @@ final class PrimarySessionStatusTests: XCTestCase {
             (.unconfirmed, "无法确认显示状态", false, true, false),
             (.confirmationFailed, "未能保留当前配置", false, true, false),
             (.restoringAndQuitting, "正在恢复并退出…", false, false, false),
-            (.quitFailed, "恢复失败，尚未退出", false, true, false)
+            (.quitFailed, "恢复失败，尚未退出", false, true, false),
+            (.quitWaitingForDisplays, "显示器未齐，等待恢复退出", false, true, false)
         ]
         for (status, text, retry, recover, quit) in cases {
             XCTAssertEqual(status.text, text)

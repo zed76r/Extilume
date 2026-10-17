@@ -43,7 +43,7 @@ func stableSnapshot() throws -> Snapshot {
     throw PrimaryError.unstable
 }
 
-private func configureOrigins(_ origins: [UInt32: DisplayOrigin], option: CGConfigureOption) throws {
+func configureOrigins(_ origins: [UInt32: DisplayOrigin], option: CGConfigureOption) throws {
     guard !origins.isEmpty else { return }
     var configuration: CGDisplayConfigRef?
     guard CGBeginDisplayConfiguration(&configuration) == .success, let configuration else {
@@ -392,7 +392,7 @@ final class PrimaryController: @unchecked Sendable {
                 else { try restore(allowKnownBaseline: true) }
                 publish(.applicationFailedRestored)
             } catch {
-                if stopping { publish(.quitFailed) }
+                if stopping { publish(quitRecoveryFailureStatus()) }
                 else if !priorResponsibility, record?.phase == .owned, record?.sourceUnresolved == true {
                     publish(.unconfirmed)
                 } else { publish(.recoveryIncomplete) }
@@ -469,7 +469,7 @@ final class PrimaryController: @unchecked Sendable {
                 sleepObserver = nil
                 completion(true)
             } catch {
-                publish(.quitFailed)
+                publish(quitRecoveryFailureStatus())
                 completion(false)
             }
         }
@@ -504,6 +504,14 @@ final class PrimaryController: @unchecked Sendable {
             endApplicationRequest(request)
         }
         statusHandler?(status)
+    }
+
+    private func quitRecoveryFailureStatus() -> PrimarySessionStatus {
+        if let record, let current = try? snapshotReader().layout(),
+           !Set(record.baseline.origins.keys).isSubset(of: Set(current.origins.keys)) {
+            return .quitWaitingForDisplays
+        }
+        return .quitFailed
     }
 
     private func reconcilePreviousApplication() throws {

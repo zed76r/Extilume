@@ -140,7 +140,7 @@ final class MenuBarApplicationDelegate: NSObject, NSApplicationDelegate {
 
     private func receive(_ newStatus: PrimarySessionStatus) {
         print("会话状态：\(newStatus.text)")
-        guard !terminationPending else { return }
+        guard !terminationPending || newStatus == .quitWaitingForDisplays else { return }
         status = newStatus
         recoveryInProgress = false
         confirmationInProgress = false
@@ -163,6 +163,10 @@ final class MenuBarApplicationDelegate: NSObject, NSApplicationDelegate {
         retryItem.isEnabled = status.canRetryApplication && !busy
         recoverItem.isHidden = !status.canRetryRecovery
         recoverItem.isEnabled = status.canRetryRecovery && !busy
+        let recoveryHint = status == .quitWaitingForDisplays
+            ? "请打开笔记本上盖或接回原外接显示器，再点“重试恢复”以恢复并退出。" : nil
+        stateItem.toolTip = recoveryHint
+        recoverItem.toolTip = recoveryHint
         confirmItem.isHidden = !status.canConfirmConfiguration
         confirmItem.isEnabled = status.canConfirmConfiguration && controller != nil && !busy
         confirmItem.toolTip = status == .quitFailed
@@ -184,11 +188,12 @@ final class MenuBarApplicationDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func retryRecovery() {
         guard status.canRetryRecovery, !recoveryInProgress, !confirmationInProgress, !terminationPending else { return }
-        if status == .quitFailed, controller != nil {
+        let retryQuit = status == .quitFailed || status == .quitWaitingForDisplays
+        if retryQuit, controller != nil {
             requestTermination()
             return
         }
-        quitAfterRecovery = status == .quitFailed
+        quitAfterRecovery = retryQuit
         recoveryInProgress = true
         render()
         if let controller {
@@ -236,7 +241,9 @@ final class MenuBarApplicationDelegate: NSObject, NSApplicationDelegate {
                     guard let self else { return }
                     self.terminationPending = false
                     if !restored {
-                        self.status = .quitFailed
+                        if self.status != .quitWaitingForDisplays {
+                            self.status = .quitFailed
+                        }
                         self.render()
                     }
                     print(restored ? "退出恢复已确认" : "退出恢复未完成")

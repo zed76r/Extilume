@@ -8,6 +8,8 @@ struct ConnectionCandidateState {
     private(set) var invalidated = false
     private var services: [UInt64: ExternalConnectionService] = [:]
 
+    var hasCandidates: Bool { !services.isEmpty }
+
     mutating func matched(
         entryID: UInt64,
         service: ExternalConnectionService,
@@ -22,9 +24,9 @@ struct ConnectionCandidateState {
         entryID: UInt64,
         terminated: Bool
     ) -> ExternalConnectionService? {
-        guard let service = services[entryID] else { return nil }
-        // 重新匹配不能证明连接已恢复，因此失效标记不会自动清除。
+        // 无法分类的负向事件也撤权；后续匹配不能证明连接已恢复。
         invalidated = true
+        guard let service = services[entryID] else { return nil }
         if terminated { services.removeValue(forKey: entryID) }
         return service
     }

@@ -17,18 +17,31 @@ final class ProtectionHandshakeTests: XCTestCase {
     }
 
     func testAcknowledgementRequiresFullValidContractEquality() throws {
-        let expected = try handshake()
+        let expected = try handshake(internalDisplayIdentity: firstDisplay)
         try expected.validate()
-        let decoded = try JSONDecoder().decode(ProtectionHandshake.self, from: JSONEncoder().encode(expected))
+        let encoded = try JSONEncoder().encode(expected)
+        let payload = try XCTUnwrap(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+        XCTAssertNotNil(payload["internalDisplayIdentity"])
+        let decoded = try JSONDecoder().decode(ProtectionHandshake.self, from: encoded)
         XCTAssertEqual(decoded, expected)
 
-        let wrongPID = try ProtectionHandshake(session: session, generation: 1, parentPID: 43)
+        let wrongPID = try ProtectionHandshake(
+            session: session, generation: 1, parentPID: 43, internalDisplayIdentity: firstDisplay
+        )
         var authorization = ProtectionAuthorization()
 
         XCTAssertThrowsError(try authorization.acknowledge(receipt: wrongPID, expected: expected))
         XCTAssertFalse(authorization.ready)
         try authorization.acknowledge(receipt: expected, expected: expected)
         XCTAssertTrue(authorization.ready)
+    }
+
+    func testLegacyHandshakeWithoutInternalIdentityDecodesToNilAndOmitsNilWhenEncoded() throws {
+        let decoded = try JSONDecoder().decode(ProtectionHandshake.self, from: encoded())
+
+        XCTAssertNil(decoded.internalDisplayIdentity)
+        let payload = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(decoded)) as? [String: Any])
+        XCTAssertNil(payload["internalDisplayIdentity"])
     }
 
     func testRejectsDifferentSessionAndOlderGeneration() throws {
@@ -56,6 +69,39 @@ final class ProtectionHandshakeTests: XCTestCase {
 
         try prepared.markApplying()
         XCTAssertNoThrow(try authorization.authorize(record: prepared))
+    }
+
+    func testAcceptanceRequiresMatchingInternalDisplayIdentityAndAllowsNewerGeneration() throws {
+        let unscoped = try handshake()
+        let withResponsibility = try makeRecord(internalDisplayIdentity: firstDisplay)
+        XCTAssertFalse(unscoped.accepts(record: withResponsibility))
+
+        let scoped = try handshake(internalDisplayIdentity: firstDisplay)
+        let withoutResponsibility = try makeRecord()
+        let withOtherIdentity = try makeRecord(internalDisplayIdentity: secondDisplay)
+        XCTAssertFalse(scoped.accepts(record: withoutResponsibility))
+        XCTAssertFalse(scoped.accepts(record: withOtherIdentity))
+
+        var newer = try makeRecord(internalDisplayIdentity: firstDisplay)
+        try newer.markApplying()
+        try newer.confirmApplied(newer.applied, internalEnabled: false)
+        let current = newer.applied
+        try newer.prepareReapplication(current: current, target: current)
+
+        XCTAssertGreaterThan(newer.generation, scoped.generation)
+        XCTAssertTrue(scoped.accepts(record: newer))
+    }
+
+    func testWrongInternalScopeAcknowledgementRevokesPreviousReadiness() throws {
+        let firstScope = try handshake(internalDisplayIdentity: firstDisplay)
+        let otherScope = try handshake(internalDisplayIdentity: secondDisplay)
+        var authorization = ProtectionAuthorization()
+        try authorization.acknowledge(receipt: firstScope, expected: firstScope)
+        XCTAssertTrue(authorization.ready)
+
+        XCTAssertThrowsError(try authorization.acknowledge(receipt: firstScope, expected: otherScope))
+        XCTAssertFalse(authorization.ready)
+        XCTAssertThrowsError(try authorization.authorize(record: makeRecord(internalDisplayIdentity: firstDisplay)))
     }
 
     func testFailedNewGenerationAcknowledgementRevokesPreviousReadiness() throws {
@@ -117,11 +163,30 @@ final class ProtectionHandshakeTests: XCTestCase {
         XCTAssertThrowsError(try authorization.authorize(record: makeRecord()))
     }
 
-    private func handshake(generation: UInt64 = 1) throws -> ProtectionHandshake {
-        try ProtectionHandshake(session: session, generation: generation, parentPID: 42)
+    func testLossBeforeReadyRejectsLateCorrectAcknowledgement() throws {
+        let contract = try handshake()
+        var authorization = ProtectionAuthorization()
+        authorization.markLost()
+
+        XCTAssertTrue(authorization.lost)
+        XCTAssertFalse(authorization.ready)
+        XCTAssertThrowsError(try authorization.acknowledge(receipt: contract, expected: contract))
+        XCTAssertThrowsError(try authorization.authorize(record: makeRecord()))
     }
 
-    private func makeRecord(session: UUID? = nil) throws -> RecoveryRecord {
+    private func handshake(
+        generation: UInt64 = 1,
+        internalDisplayIdentity: UUID? = nil
+    ) throws -> ProtectionHandshake {
+        try ProtectionHandshake(
+            session: session,
+            generation: generation,
+            parentPID: 42,
+            internalDisplayIdentity: internalDisplayIdentity
+        )
+    }
+
+    private func makeRecord(session: UUID? = nil, internalDisplayIdentity: UUID? = nil) throws -> RecoveryRecord {
         try RecoveryRecord(
             session: session ?? self.session,
             baseline: DisplayLayout(main: firstDisplay, origins: [
@@ -131,7 +196,10 @@ final class ProtectionHandshakeTests: XCTestCase {
             target: DisplayLayout(main: secondDisplay, origins: [
                 firstDisplay: DisplayOrigin(x: -100, y: 0),
                 secondDisplay: DisplayOrigin(x: 0, y: 0)
-            ])
+            ]),
+            internalDisplay: internalDisplayIdentity.map {
+                InternalDisplayResponsibility(identity: $0, baseline: true, applied: false)
+            }
         )
     }
 

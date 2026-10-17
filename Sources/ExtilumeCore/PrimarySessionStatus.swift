@@ -10,6 +10,7 @@ public enum PrimarySessionStatus: Sendable, Equatable {
     case confirmationFailed
     case restoringAndQuitting
     case quitFailed
+    case quitWaitingForDisplays
 
     public var text: String {
         switch self {
@@ -24,6 +25,7 @@ public enum PrimarySessionStatus: Sendable, Equatable {
         case .confirmationFailed: "未能保留当前配置"
         case .restoringAndQuitting: "正在恢复并退出…"
         case .quitFailed: "恢复失败，尚未退出"
+        case .quitWaitingForDisplays: "显示器未齐，等待恢复退出"
         }
     }
 
@@ -31,7 +33,7 @@ public enum PrimarySessionStatus: Sendable, Equatable {
 
     public var canRetryRecovery: Bool {
         switch self {
-        case .recoveryIncomplete, .unconfirmed, .confirmationFailed, .quitFailed: true
+        case .recoveryIncomplete, .unconfirmed, .confirmationFailed, .quitFailed, .quitWaitingForDisplays: true
         default: false
         }
     }
@@ -47,7 +49,7 @@ public enum PrimarySessionStatus: Sendable, Equatable {
 
     public var canQuit: Bool {
         switch self {
-        case .recoveryIncomplete, .unconfirmed, .confirmationFailed, .restoringAndQuitting, .quitFailed: false
+        case .recoveryIncomplete, .unconfirmed, .confirmationFailed, .restoringAndQuitting, .quitFailed, .quitWaitingForDisplays: false
         default: true
         }
     }

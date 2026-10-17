@@ -5,12 +5,19 @@ public struct ProtectionHandshake: Codable, Equatable {
     public let session: UUID
     public let generation: UInt64
     public let parentPID: Int32
+    public let internalDisplayIdentity: UUID?
 
-    public init(session: UUID, generation: UInt64, parentPID: Int32) throws {
+    public init(
+        session: UUID,
+        generation: UInt64,
+        parentPID: Int32,
+        internalDisplayIdentity: UUID? = nil
+    ) throws {
         version = 1
         self.session = session
         self.generation = generation
         self.parentPID = parentPID
+        self.internalDisplayIdentity = internalDisplayIdentity
         try validate()
     }
 
@@ -19,11 +26,12 @@ public struct ProtectionHandshake: Codable, Equatable {
     }
 
     public func accepts(record: RecoveryRecord) -> Bool {
-        session == record.session && record.generation >= generation
+        session == record.session && record.generation >= generation &&
+            internalDisplayIdentity == record.internalDisplay?.identity
     }
 
     private enum CodingKeys: String, CodingKey {
-        case version, session, generation, parentPID
+        case version, session, generation, parentPID, internalDisplayIdentity
     }
 
     public init(from decoder: Decoder) throws {
@@ -32,6 +40,7 @@ public struct ProtectionHandshake: Codable, Equatable {
         session = try values.decode(UUID.self, forKey: .session)
         generation = try values.decode(UInt64.self, forKey: .generation)
         parentPID = try values.decode(Int32.self, forKey: .parentPID)
+        internalDisplayIdentity = try values.decodeIfPresent(UUID.self, forKey: .internalDisplayIdentity)
         do {
             try validate()
         } catch {

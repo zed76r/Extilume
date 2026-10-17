@@ -109,8 +109,11 @@ def run_case(binary, command):
         else:
             output, _ = process.communicate(command + "\n", timeout=8)
             require(process.returncode == (99 if command == "crash" else 0), "主进程退出状态不符")
-        if command in ("stop", "crash", "kill"):
+        if command in ("stop", "crash", "kill", "invalidate-connection"):
             require("主进程退出后独立读取并核验完成" in output, "缺少退出后独立核验")
+            if command == "invalidate-connection":
+                require("模拟连接安全条件失效；不代表实际拔线" in output, "缺少模拟事件标记")
+                require("连接安全条件失效；禁止新控制" in output, "缺少连接失效撤权处理")
         elif command == "lose-guard":
             require("辅助进程失效；禁止新控制" in output, "缺少保护失效处理")
         require(json.loads(record_path.read_text())["phase"] == "restored", "未保存恢复结果")
@@ -143,5 +146,5 @@ def run_case(binary, command):
 if __name__ == "__main__":
     require(len(sys.argv) == 2, "用法：python3 scripts/verify-guard-drill.py <extilume-probe>")
     binary = Path(sys.argv[1]).resolve(strict=True)
-    for case in ("stop", "crash", "lose-guard", "kill"):
+    for case in ("stop", "crash", "lose-guard", "kill", "invalidate-connection"):
         run_case(binary, case)

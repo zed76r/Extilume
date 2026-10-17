@@ -271,6 +271,7 @@ private func render(_ snapshot: Snapshot, unchanged: Bool) -> String {
         lines.append("范围判定：不支持（\(snapshot.assessment.issues.map(issueDescription).joined(separator: "；"))）")
     }
     lines.append("启动前后布局、在线/活动、主屏、分辨率、旋转及显示模式读回一致：\(yesNo(unchanged))")
+    lines.append("内屏启用位私有符号：\((try? DisplayEnableTransaction()) != nil ? "可解析（未调用，效果未验收）" : "不可用（禁止启停）")")
     lines.append("本次只读运行未执行显示配置写入。主屏验证须显式指定 --verify-primary；内屏停用未实现。")
     return lines.joined(separator: "\n")
 }
@@ -304,6 +305,32 @@ private func displayEventApplication() throws -> NSApplication {
 }
 
 @MainActor
+private func recordConnectionTiming() throws -> Bool {
+    let application = NSApplication.shared
+    guard application.setActivationPolicy(.accessory) else { throw ProbeError.eventLoopUnavailable }
+    func writeLine(_ line: String) throws {
+        guard fputs(line + "\n", stdout) >= 0, fflush(stdout) == 0 else {
+            throw ProbeError.eventLoopUnavailable
+        }
+    }
+    var markers = ConnectionTimingMarkers()
+    let controller = ConnectionTimingWindowController(record: { action in
+        let timestamp = try ContinuousClock.nanoseconds()
+        var next = markers
+        let line = try next.record(action, at: timestamp)
+        try writeLine(line)
+        markers = next
+    }, finish: { application.stop(nil) })
+    try writeLine(#"{"type":"manual-connection-session","event":"started","clock":"mach_continuous_time/ns"}"#)
+    controller.showWindow(nil)
+    application.activate(ignoringOtherApps: true)
+    withExtendedLifetime(controller) { application.run() }
+    let event = markers.isComplete ? "completed" : "incomplete"
+    try writeLine("{\"type\":\"manual-connection-session\",\"event\":\"\(event)\"}")
+    return markers.isComplete
+}
+
+@MainActor
 public func runDisplayProbe() {
     setlinebuf(stdout) // 辅助进程共享管道时，逐行证据须及时可见。
     if CommandLine.arguments.dropFirst().contains(where: { $0 == "--help" || $0 == "-h" }) {
@@ -314,10 +341,33 @@ public func runDisplayProbe() {
         退出后独立核对并清除：extilume-probe --finalize-primary <同一状态目录>
         已手动修改 C、原进程退出后确认来源：extilume-probe --confirm-user-primary <同一状态目录>
         不改显示设置的保护演练：extilume-probe --guard-drill <0700 状态目录>
+        内屏恢复合同无写入演练：extilume-probe --guard-drill-internal <0700 状态目录>
         只读物理事件观察：extilume-probe --watch-connection（mark / stop）
+        离线计时检查：extilume-probe --check-recovery-timing <故障最早ns> <故障最晚ns> <通知ns> <恢复核验ns>
+        人工动作计时窗口：extilume-probe --record-connection-timing（JSON 行输出；不读写显示状态）
         验证命令：status、confirm-user（仅在你已手动修改布局后）、reapply、stop。
         内屏停用未实现。主动验证尚需开盖实机验收。
         """)
+    } else if CommandLine.arguments.dropFirst().first == "--check-recovery-timing" {
+        do { print(try recoveryTimingReport(arguments: Array(CommandLine.arguments.dropFirst(2)))) }
+        catch {
+            fputs("计时输入无效；须提供四个同一连续时基的 UInt64 纳秒值，并满足故障区间及通知／核验顺序。未读取或修改显示状态。\n", stderr)
+            exit(EXIT_FAILURE)
+        }
+    } else if CommandLine.arguments.dropFirst().first == "--record-connection-timing" {
+        guard CommandLine.arguments.count == 2 else {
+            fputs("人工计时窗口不接受额外参数；未读取或修改显示状态。\n", stderr)
+            exit(EXIT_FAILURE)
+        }
+        do {
+            guard try recordConnectionTiming() else {
+                fputs("人工动作记录未完成；保留已输出的部分记录，不构成验收。\n", stderr)
+                exit(EXIT_FAILURE)
+            }
+        } catch {
+            fputs("人工计时记录失败；不构成验收，未读取或修改显示状态。\n", stderr)
+            exit(EXIT_FAILURE)
+        }
     } else if CommandLine.arguments.count == 2, CommandLine.arguments[1] == "--watch-connection" {
         do {
             let application = try displayEventApplication()
@@ -351,9 +401,13 @@ public func runDisplayProbe() {
             fputs("辅助进程未就绪；未授权任何内屏停用。责任记录保留。\n", stderr)
             exit(EXIT_FAILURE)
         }
-    } else if CommandLine.arguments.count == 3, CommandLine.arguments[1] == "--guard-drill" {
+    } else if CommandLine.arguments.count == 3,
+              ["--guard-drill", "--guard-drill-internal"].contains(CommandLine.arguments[1]) {
         do {
-            let drill = try GuardDrill(directory: URL(fileURLWithPath: CommandLine.arguments[2]))
+            let drill = try GuardDrill(
+                directory: URL(fileURLWithPath: CommandLine.arguments[2]),
+                internalRecovery: CommandLine.arguments[1] == "--guard-drill-internal"
+            )
             try drill.start()
             withExtendedLifetime(drill) { CFRunLoopRun() }
         } catch {

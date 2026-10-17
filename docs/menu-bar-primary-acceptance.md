@@ -2,7 +2,7 @@
 
 2026-10-16：阶段一 18/18 项任务的本机验收完成。当前 Mac 的主屏控制、生命周期与用户配置恢复关键路径已有实机证据，11 种注入状态的产品菜单已逐项展开核对，键盘访问和已生效入口的实际旁白名称通过。可在下述已验收配置中日常使用；长期稳定性及其他硬件组合不包含在本次结论中。
 
-适用范围为 macOS 27.0.1、arm64、开盖、单台 MG27U 经 Mac 自带 HDMI 直连、双屏非镜像。Hub、多外屏、虚拟屏及内屏停用未获得本阶段验收。当前本地运行包与构建产物一致；未安装、签名公证或发布，也未提交或推送本轮改动。
+适用范围为 macOS 27.0.1、arm64、开盖、单台 MG27U 经 Mac 自带 HDMI 直连、双屏非镜像。Hub、多外屏、虚拟屏及内屏停用未获得本阶段验收。当前本地应用包与构建产物一致；未安装、签名公证或发布，也未提交或推送本轮改动。
 
 ## 证据类型
 
@@ -16,7 +16,7 @@
 
 ## 当前回归结果
 
-当前代码全套通过：156 项 Swift（96 Core、60 Native，其中 12 项菜单集成）及 16 项 Python。新增菜单用例用独立预期表检查全部 11 种状态的文字、信息项禁用、五类动作的隐藏／启用，以及 Command-Q；没有安装状态栏入口或操作真实显示。
+当前代码全套通过：200 项 Swift（99 Core、101 Native，其中 13 项菜单集成）及 17 项 Python。菜单用例以独立预期表检查包括缺屏等待在内的 12 种状态、动作与 Command-Q，并覆盖退出状态和完成回调的两种到达顺序；不创建实际状态栏入口或操作真实显示。
 
 ```sh
 CLANG_MODULE_CACHE_PATH=/private/tmp/extilume-clang-cache swift test --disable-sandbox --cache-path /private/tmp/extilume-swift-cache
@@ -49,6 +49,7 @@ openspec validate --specs --strict
 | 无法确认恢复 | `testUnknownSourceAtDifferentLayoutCannotBeRecoveredOrQuit`、`testUnconfirmedStatusRejectsTakeoverAndRepeatedRecovery` | 真实手动修改保持来源未决、不抢回；已有恢复未完成桌面截图。全部未决／失败子状态的注入桌面呈现已逐项通过。 |
 | 显式恢复完整原基准 | `testUnknownSourceAtBaselineCanBeExplicitlyRecoveredAndRecordRetained`、`testUnknownSourceAtBaselineCanQuitAfterRestorationAndRetainsRecord` | 原基准的显式恢复、正常退出后独立读回和终验路径已有实机证据；陌生布局保持保护由模拟覆盖。 |
 | 退出恢复成功 | `testSuccessfulTerminationRepliesOnlyAfterRecoveryCompletion`、`testQuitDuringInitialControlDrainsQueuedEventsWithoutStaleReapplication` | 正常退出及控制写入前取消均通过；应用结束后独立原基准／C、终验再重启。“正在恢复并退出…”的注入菜单呈现通过，未单独截取真实退出过程的瞬态。 |
+| 缺屏等待后恢复退出 | `testQuitWaitsForMissingDisplaysAndRetriesWithoutReapplication`、`testWaitingForDisplaysSurvivesEitherTerminationCallbackOrderAndRetriesExit` | 合盖实际仅有外屏时保留责任；开盖后通过应用标准退出流程完成，退出后独立布局与完整显示快照保持，记录为 restored、应用已退出。新增等待文案和动作仅有进程内菜单验证，未完成实际桌面呈现验收。 |
 | 退出恢复失败 | `testFailedTerminationCancelsAndLateStatusCannotReplacePendingExit`、`testFailedQuitKeepsRecordAndRecoveryCanRetry` | 实际缺屏退出取消并保留责任，接回后重试恢复、独立 C 与终验通过；“恢复失败，尚未退出”有实际菜单状态输出；对应注入状态桌面呈现及动作可用性通过。 |
 
 ## 生命周期集成结果
@@ -73,4 +74,4 @@ openspec validate --specs --strict
 
 实际可访问名称由用户的旁白操作独立确认：用户定位到 Extilume 状态菜单并听到播报，旁白字幕截图包含应用名、模式“外屏主屏”和状态“外屏主屏已生效”。其他状态及动态名称切换未单独以旁白验证；组件 getter 不代替实际读屏。方向键导航、回车打开系统“显示器”页面和 Esc 关闭均已核对。Command-Q 的 `q` 和 `.command` 已检查，未另行执行日常应用的真实快捷键退出。
 
-临时验收窗口与辅助功能检查器均已退出，用户已确认关闭旁白。最后一轮验收前后，日常应用保持同一进程、完整显示快照和恢复目录文件校验值均未变化。本轮只补取呈现证据并更新文档，未重启或替换日常应用。
+临时验收窗口与辅助功能检查器均已退出，用户已确认关闭旁白。上述 11 种状态的呈现验收未重启或替换日常应用，前后完整显示快照与恢复目录文件校验一致。缺屏等待修正已构建到本地包；应用在用户要求的正常恢复后保持退出，新增状态尚未完成实际菜单呈现验收。
