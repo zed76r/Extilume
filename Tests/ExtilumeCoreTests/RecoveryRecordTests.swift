@@ -34,12 +34,101 @@ final class RecoveryRecordTests: XCTestCase {
         return record
     }
 
+    private func restoredRecord(internalDisplay: InternalDisplayResponsibility? = nil) throws -> RecoveryRecord {
+        var record = try ownedRecord(internalDisplay: internalDisplay)
+        record.beginRestoration()
+        try record.confirmRestored(actual: record.baseline, internalEnabled: internalDisplay?.baseline)
+        return record
+    }
+
     private func assertResumeRejected(
         _ record: RecoveryRecord, current: DisplayLayout, internalEnabled: Bool
     ) throws {
         var rejected = record
         XCTAssertThrowsError(try rejected.resumeInternalObservation(current: current, internalEnabled: internalEnabled))
         XCTAssertEqual(rejected, record)
+    }
+
+    func testIndependentGuardVerificationRemainsOptionalForLegacyRecords() throws {
+        let record = try ownedRecord()
+        var json = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(record)) as? [String: Any])
+        XCTAssertNil(json["independentGuardVerified"])
+
+        json.removeValue(forKey: "independentGuardVerified")
+        let decoded = try JSONDecoder().decode(RecoveryRecord.self, from: JSONSerialization.data(withJSONObject: json))
+
+        XCTAssertNil(decoded.independentGuardVerified)
+        XCTAssertEqual(decoded, record)
+    }
+
+    func testIndependentGuardVerificationRequiresClearableRecordWithInternalDisplay() throws {
+        let responsibility = InternalDisplayResponsibility(identity: internalID, baseline: true, applied: false)
+        var unfinished = try ownedRecord(internalDisplay: responsibility)
+        XCTAssertFalse(unfinished.canClear)
+        XCTAssertThrowsError(try unfinished.confirmIndependentGuardVerification())
+        XCTAssertNil(unfinished.independentGuardVerified)
+
+        var noInternalDisplay = try restoredRecord()
+        XCTAssertTrue(noInternalDisplay.canClear)
+        XCTAssertThrowsError(try noInternalDisplay.confirmIndependentGuardVerification())
+        XCTAssertNil(noInternalDisplay.independentGuardVerified)
+    }
+
+    func testIndependentGuardVerificationPersistsAcrossRestart() throws {
+        let responsibility = InternalDisplayResponsibility(
+            identity: internalID, baseline: true, applied: false, hardwareIdentity: internalHardwareIdentity
+        )
+        var record = try restoredRecord(internalDisplay: responsibility)
+        try record.confirmIndependentGuardVerification()
+
+        XCTAssertEqual(record.independentGuardVerified, true)
+        let decoded = try JSONDecoder().decode(RecoveryRecord.self, from: JSONEncoder().encode(record))
+        try decoded.validate()
+        XCTAssertEqual(decoded.independentGuardVerified, true)
+        XCTAssertEqual(decoded, record)
+    }
+
+    func testIndependentGuardVerificationValidationRejectsInvalidPersistedSeal() throws {
+        func decodedRecord(_ base: RecoveryRecord, seal: Bool) throws -> RecoveryRecord {
+            var json = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(base)) as? [String: Any])
+            json["independentGuardVerified"] = seal
+            return try JSONDecoder().decode(RecoveryRecord.self, from: JSONSerialization.data(withJSONObject: json))
+        }
+
+        let responsibility = InternalDisplayResponsibility(identity: internalID, baseline: true, applied: false)
+        let restored = try restoredRecord(internalDisplay: responsibility)
+        XCTAssertThrowsError(try decodedRecord(restored, seal: false).validate())
+
+        let noInternalDisplay = try restoredRecord()
+        XCTAssertThrowsError(try decodedRecord(noInternalDisplay, seal: true).validate())
+
+        let notClearable = try ownedRecord(internalDisplay: responsibility)
+        XCTAssertThrowsError(try decodedRecord(notClearable, seal: true).validate())
+    }
+
+    func testIndependentGuardVerificationClearsAcrossLifecycleTransitions() throws {
+        let responsibility = InternalDisplayResponsibility(
+            identity: internalID, baseline: true, applied: false, hardwareIdentity: internalHardwareIdentity
+        )
+        var sealed = try restoredRecord(internalDisplay: responsibility)
+        try sealed.confirmIndependentGuardVerification()
+
+        var restoring = sealed
+        restoring.beginRestoration()
+        XCTAssertNil(restoring.independentGuardVerified)
+        try restoring.confirmRestored(actual: restoring.baseline, internalEnabled: true)
+        XCTAssertNil(restoring.independentGuardVerified)
+
+        var resumed = sealed
+        try resumed.resumeInternalObservation(current: resumed.baseline, internalEnabled: true)
+        XCTAssertNil(resumed.independentGuardVerified)
+        XCTAssertEqual(resumed.phase, .owned)
+
+        let target = try XCTUnwrap(resumed.preDisableLayout)
+        try resumed.prepareReapplication(current: resumed.applied, target: target)
+        XCTAssertNil(resumed.independentGuardVerified)
+        XCTAssertEqual(resumed.phase, .prepared)
+        try resumed.validate()
     }
 
     func testDisabledLayoutUsesV2SubsetAndRestoresLatestCWithOrWithoutExternalDisplay() throws {
@@ -579,6 +668,32 @@ final class RecoveryRecordTests: XCTestCase {
         XCTAssertEqual(record.session, session)
         XCTAssertEqual(record.generation, generation)
         XCTAssertEqual(record.baseline, try layout())
+    }
+
+    func testReconnectToExactExternalOnlyBRetainsConfirmedCAndRearmsLayout() throws {
+        var record = try RecoveryRecord(
+            baseline: layout(mainExternal: true), target: layout(mainExternal: true),
+            internalDisplay: InternalDisplayResponsibility(identity: internalID, baseline: true, applied: false)
+        )
+        try record.markApplying()
+        let b = try DisplayLayout(main: externalID, origins: [externalID: DisplayOrigin(x: 0, y: 0)])
+        try record.confirmApplied(b, internalEnabled: false)
+        let c = try layout()
+        try record.observe(c, source: .confirmedUser)
+        try record.observeInternalEnabled(true, source: .confirmedUser)
+        let confirmed = record
+
+        XCTAssertThrowsError(try record.observe(b, source: .confirmedUser))
+        XCTAssertEqual(record.baseline, c)
+        record = confirmed
+        try record.observe(b, source: .reconnect)
+        try record.observeInternalEnabled(false, source: .reconnect)
+        XCTAssertTrue(record.layoutPending)
+        XCTAssertTrue(try XCTUnwrap(record.internalDisplay).pending)
+        XCTAssertEqual(record.baseline, c)
+        XCTAssertEqual(record.session, confirmed.session)
+        XCTAssertEqual(record.generation, confirmed.generation)
+        XCTAssertFalse(record.sourceUnresolved)
     }
 
     func testUnobservedDDoesNotMasqueradeAsDirectCExit() throws {

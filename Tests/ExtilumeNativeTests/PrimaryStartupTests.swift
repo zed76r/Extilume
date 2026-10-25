@@ -151,6 +151,99 @@ final class PrimaryStartupTests: XCTestCase {
         controller = nil
     }
 
+    func testCompletedPriorLayoutChangeRequiresConfirmationThenCanApplyAndRestoreNewBaseline() throws {
+        let directory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let original = try seedRestoredRecord(in: directory)
+        let changed = try layout(externalX: -2560)
+        let target = try layoutByMakingMain(changed, target: externalID)
+        let fixture = ControllerFixture(snapshot: try makeSnapshot(changed),
+                                        afterApplication: try makeSnapshot(target),
+                                        afterRestoration: try makeSnapshot(changed))
+        let statuses = StatusRecorder()
+        var controller: PrimaryController? = try makeController(directory: directory, fixture: fixture)
+        controller?.startApplication(registerEvents: false) { statuses.append($0) }
+
+        XCTAssertTrue(statuses.wait(for: .unconfirmed))
+        XCTAssertEqual(try readRecord(in: directory), original)
+        XCTAssertTrue(fixture.writes.isEmpty)
+        controller?.recoverApplication()
+        XCTAssertTrue(statuses.wait(for: .unconfirmed, count: 2))
+        XCTAssertEqual(try readRecord(in: directory), original)
+        XCTAssertTrue(fixture.writes.isEmpty)
+
+        controller?.displayChanged(.desktopShapeChangedFlag)
+        controller?.confirmCurrentConfiguration()
+        XCTAssertTrue(statuses.wait(for: .manualConfiguration))
+        let confirmed = try XCTUnwrap(readRecord(in: directory))
+        XCTAssertNotEqual(confirmed.session, original.session)
+        XCTAssertEqual(confirmed.phase, .owned)
+        XCTAssertEqual(confirmed.baseline, changed)
+        XCTAssertEqual(confirmed.applied, changed)
+        XCTAssertFalse(confirmed.sourceUnresolved)
+        XCTAssertFalse(confirmed.layoutPending)
+        XCTAssertTrue(fixture.writes.isEmpty)
+
+        controller?.retryApplication()
+        XCTAssertTrue(statuses.wait(for: .applied))
+        XCTAssertEqual(try readRecord(in: directory)?.baseline, changed)
+        XCTAssertEqual(try readRecord(in: directory)?.applied, target)
+        XCTAssertEqual(fixture.writes.map(\.appOnly), [true])
+
+        let quit = expectation(description: "restore explicitly selected layout")
+        controller?.quitApplication { success in
+            XCTAssertTrue(success)
+            quit.fulfill()
+        }
+        wait(for: [quit], timeout: 4)
+        XCTAssertEqual(try fixture.snapshot().layout(), changed)
+        XCTAssertEqual(try readRecord(in: directory)?.phase, .restored)
+        XCTAssertEqual(try readRecord(in: directory)?.baseline, changed)
+        XCTAssertEqual(fixture.writes.map(\.appOnly), [true, false])
+        controller = nil
+    }
+
+    func testChangeAfterRestartConfirmationCannotBeAdoptedByExplicitApplication() throws {
+        let directory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        _ = try seedRestoredRecord(in: directory)
+        let changed = try layout(externalX: -2560)
+        let fixture = ControllerFixture(snapshot: try makeSnapshot(changed))
+        let statuses = StatusRecorder()
+        var controller: PrimaryController? = try makeController(directory: directory, fixture: fixture)
+        controller?.startApplication(registerEvents: false) { statuses.append($0) }
+        XCTAssertTrue(statuses.wait(for: .unconfirmed))
+        controller?.confirmCurrentConfiguration()
+        XCTAssertTrue(statuses.wait(for: .manualConfiguration))
+
+        fixture.setSnapshot(try makeSnapshot(try layout(externalX: -3000)))
+        controller?.retryApplication()
+        XCTAssertTrue(statuses.wait(for: .unconfirmed, count: 2))
+        let retained = try XCTUnwrap(readRecord(in: directory))
+        XCTAssertEqual(retained.baseline, changed)
+        XCTAssertTrue(retained.sourceUnresolved)
+        XCTAssertTrue(fixture.writes.isEmpty)
+        controller = nil
+    }
+
+    func testRestartConfirmationRejectsOldAppliedLayoutAndMissingDisplays() throws {
+        for snapshot in [try makeSnapshot(try layout(mainExternal: true)), try builtInOnlySnapshot()] {
+            let directory = try makeTemporaryDirectory()
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let original = try seedRestoredRecord(in: directory)
+            let fixture = ControllerFixture(snapshot: snapshot)
+            let statuses = StatusRecorder()
+            var controller: PrimaryController? = try makeController(directory: directory, fixture: fixture)
+            controller?.startApplication(registerEvents: false) { statuses.append($0) }
+            XCTAssertTrue(statuses.wait(for: .unconfirmed))
+            controller?.confirmCurrentConfiguration()
+            XCTAssertTrue(statuses.wait(for: .confirmationFailed))
+            XCTAssertEqual(try readRecord(in: directory), original)
+            XCTAssertTrue(fixture.writes.isEmpty)
+            controller = nil
+        }
+    }
+
     private struct WriteCall: Equatable {
         let origins: [UInt32: DisplayOrigin]
         let appOnly: Bool
@@ -161,20 +254,25 @@ final class PrimaryStartupTests: XCTestCase {
         private var current: Snapshot
         private var recordedWrites: [WriteCall] = []
         private let afterApplication: Snapshot?
+        private let afterRestoration: Snapshot?
 
-        init(snapshot: Snapshot, afterApplication: Snapshot? = nil) {
+        init(snapshot: Snapshot, afterApplication: Snapshot? = nil, afterRestoration: Snapshot? = nil) {
             current = snapshot
             self.afterApplication = afterApplication
+            self.afterRestoration = afterRestoration
         }
 
         var writes: [WriteCall] { lock.withLock { recordedWrites } }
 
         func snapshot() -> Snapshot { lock.withLock { current } }
 
+        func setSnapshot(_ snapshot: Snapshot) { lock.withLock { current = snapshot } }
+
         func write(_ origins: [UInt32: DisplayOrigin], option: CGConfigureOption) {
             lock.withLock {
                 recordedWrites.append(WriteCall(origins: origins, appOnly: option == .forAppOnly))
                 if option == .forAppOnly, let afterApplication { current = afterApplication }
+                if option == .forSession, let afterRestoration { current = afterRestoration }
             }
         }
     }
@@ -210,9 +308,9 @@ final class PrimaryStartupTests: XCTestCase {
         )
     }
 
-    private func layout(mainExternal: Bool = false, internalX: Int32? = nil) throws -> DisplayLayout {
+    private func layout(mainExternal: Bool = false, internalX: Int32? = nil, externalX: Int32? = nil) throws -> DisplayLayout {
         let builtInX = internalX ?? (mainExternal ? -1728 : 0)
-        let externalX: Int32 = mainExternal ? 0 : 1728
+        let externalX: Int32 = externalX ?? (mainExternal ? 0 : 1728)
         return try DisplayLayout(
             main: mainExternal ? externalID : internalID,
             origins: [

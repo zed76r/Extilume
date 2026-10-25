@@ -466,7 +466,7 @@ final class PrimaryApplicationTests: XCTestCase {
         XCTAssertEqual(firstQuit.wait(), false)
         XCTAssertTrue(session.statuses.wait(for: .quitFailed))
         session.controller?.confirmCurrentConfiguration()
-        XCTAssertTrue(session.statuses.wait(for: .manualConfiguration))
+        XCTAssertTrue(session.statuses.wait(for: .manualConfigurationForQuit))
         session.controller?.systemDidWake()
         XCTAssertFalse(session.statuses.wait(for: .applied, count: 2, timeout: 1.2))
         XCTAssertEqual(session.fixture.writes.map(\.appOnly), [true])

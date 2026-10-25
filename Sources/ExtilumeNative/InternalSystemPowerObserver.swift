@@ -1,6 +1,7 @@
 import Dispatch
 import IOKit
 import IOKit.pwr_mgt
+import ExtilumeCore
 
 // IOMessage.h exposes these as C macros; sys_iokit is err_system(0x38) and the common subcode is 0.
 enum InternalSystemPowerMessage {
@@ -30,6 +31,7 @@ final class InternalSystemPowerObserver: @unchecked Sendable {
     }
 
     private let queue = DispatchQueue(label: "Extilume.system-power-observer")
+    private let traceQueue = DispatchQueue(label: "Extilume.system-power-trace")
     private let queueKey = DispatchSpecificKey<Bool>()
     private let prepareForSleep: @Sendable () -> Bool
     private let didPrepareForSleep: @Sendable (Bool, Bool) -> Void
@@ -118,9 +120,10 @@ final class InternalSystemPowerObserver: @unchecked Sendable {
                 if !acknowledgeSleep() { onFailure() }
                 return
             }
-            let restored = prepareForSleep()
+            // 此闭包只设置门禁和排队；不得等待显示读取或原生提交。
+            let accepted = prepareForSleep()
             let acknowledged = acknowledgeSleep()
-            didPrepareForSleep(restored, acknowledged)
+            didPrepareForSleep(accepted, acknowledged)
             if !acknowledged { onFailure() }
         case InternalSystemPowerMessage.systemHasPoweredOn:
             if active { didWake() }
@@ -140,7 +143,10 @@ final class InternalSystemPowerObserver: @unchecked Sendable {
             },
             didPrepareForSleep: didPrepareForSleep,
             didWake: didWake,
-            trace: { traceInternalLifecycle($0, succeeded: $1) },
+            trace: { [traceQueue] stage, succeeded in
+                let timestamp = try? ContinuousClock.nanoseconds()
+                traceQueue.async { traceInternalLifecycle(stage, succeeded: succeeded, observedAt: timestamp) }
+            },
             onFailure: onFailure
         )
     }

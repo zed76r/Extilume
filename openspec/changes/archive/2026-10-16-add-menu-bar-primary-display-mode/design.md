@@ -2,7 +2,7 @@
 
 ## Context
 
-动机与范围见 [proposal.md](proposal.md)，行为见 [spec.md](specs/primary-display-session/spec.md)。本阶段依赖 [阶段零](../../validate-local-display-control/design.md) 的主屏路径本机通过，包括应用退出后恢复 C 的最终读回；规划存在或原型编译成功都不满足依赖。内屏停用未通过不阻断此阶段。
+动机与范围见 [proposal.md](proposal.md)，行为见 [spec.md](specs/primary-display-session/spec.md)。本阶段依赖 [阶段零](../2026-10-24-validate-local-display-control/design.md) 的主屏路径本机通过，包括应用退出后恢复 C 的最终读回；规划存在或原型编译成功都不满足依赖。内屏停用未通过不阻断此阶段。
 
 当前没有应用目标。这里将已验证的原生控制与恢复代码放进最小菜单栏应用，不重新引入另一套显示工具。公开 [显示重配置回调](https://developer.apple.com/documentation/coregraphics/cgdisplayreconfigurationcallback) 可来自本应用、其他应用或硬件变化，因此不能把所有回调都当作自动重新应用命令。
 

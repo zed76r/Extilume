@@ -72,6 +72,127 @@ final class DisplayEnableTransactionTests: XCTestCase {
         }
     }
 
+    func testSleepBeforeBeginMakesNoNativeCalls() {
+        let gate = InternalPowerGate()
+        gate.didRegister()
+        let fake = FakeCalls()
+        let transaction = fake.transaction()
+        XCTAssertThrowsError(try transaction.setEnabled(display: 42, enabled: false, nativeCall: { call in
+            gate.willSleep()
+            return try gate.perform(call)
+        }, validate: {})) { error in
+            XCTAssertEqual(error as? InternalPowerGateError, .suspended)
+        }
+        XCTAssertTrue(fake.events.isEmpty)
+    }
+
+    func testSleepAfterStagingCancelsValidHandleWithoutSubmitting() {
+        let gate = InternalPowerGate()
+        gate.didRegister()
+        let fake = FakeCalls()
+        let transaction = fake.transaction(configureHook: { gate.willSleep() })
+        XCTAssertThrowsError(try transaction.setEnabled(display: 42, enabled: false,
+            nativeCall: { try gate.perform($0) }, validate: {})) { error in
+            XCTAssertEqual(error as? InternalPowerGateError, .suspended)
+        }
+        XCTAssertEqual(fake.events, ["begin", "configure:42:false", "cancel"])
+    }
+
+    func testRecoveryBudgetExpiryDuringBeginCancelsBeforeConfigure() {
+        let fake = FakeCalls()
+        var budgetExpired = false
+
+        XCTAssertThrowsError(try fake.transaction().setEnabled(
+            display: 42, enabled: true,
+            nativeCall: { invoke in
+                guard !budgetExpired else { throw GuardError.suspended }
+                let result = try invoke()
+                budgetExpired = true
+                return result
+            }, validate: {}
+        )) { error in
+            XCTAssertEqual(error as? GuardError, .suspended)
+        }
+
+        XCTAssertEqual(fake.events, ["begin", "cancel"])
+    }
+
+    func testNotificationDuringPreCommitTraceCannotReachNativeCompletion() {
+        let fake = FakeCalls()
+        let gate = InternalLinkReconfigurationGate(onTimeout: { _ in XCTFail("unexpected timeout") })
+        XCTAssertThrowsError(try fake.transaction().setEnabled(
+            display: 42, enabled: false,
+            trace: { stage, _ in
+                if stage == .enableCompleteStarted {
+                    XCTAssertFalse(gate.consume(entryID: 1, messageType: 0xe0115004, argument: .one, at: 101))
+                    _ = gate.invalidate(observedAt: 101)
+                }
+            },
+            completionCall: { invoke in
+                guard gate.prepare(candidates: [1: .device, 2: .service, 3: .videoInterface]) else {
+                    throw ValidationError.revoked
+                }
+                return try gate.performNative(invoke).result
+            }, validate: {}
+        ))
+        XCTAssertEqual(fake.events, ["begin", "configure:42:false", "cancel"])
+    }
+
+    func testCompletionWrapperFailureDoesNotCancelConsumedNativeHandle() {
+        for result in [CGError.success, .failure] {
+            let fake = FakeCalls()
+            XCTAssertThrowsError(try fake.transaction(completeResult: result).setEnabled(
+                display: 42, enabled: false,
+                completionCall: { invoke in
+                    XCTAssertEqual(invoke(), result)
+                    throw ValidationError.revoked
+                }, validate: {}
+            ))
+            XCTAssertEqual(fake.events, ["begin", "configure:42:false", "complete:\(CGConfigureOption.forAppOnly.rawValue)"])
+        }
+    }
+
+    func testCompletionWrapperRejectedBeforeNativeCallCancelsStagedHandle() {
+        let fake = FakeCalls()
+        XCTAssertThrowsError(try fake.transaction().setEnabled(
+            display: 42, enabled: false,
+            completionCall: { _ in throw ValidationError.revoked }, validate: {}
+        ))
+        XCTAssertEqual(fake.events, ["begin", "configure:42:false", "cancel"])
+    }
+
+    func testSleepDuringCommitKeepsActualResultAndConsumesHandleOnce() throws {
+        for result in [CGError.success, .failure] {
+            let gate = InternalPowerGate()
+            gate.didRegister()
+            let fake = FakeCalls()
+            var commits = 0
+            var cancels = 0
+            let transaction = DisplayEnableTransaction(
+                configure: { _, _, _ in .success },
+                begin: { $0.pointee = fake.handle; return .success },
+                complete: { _, _ in
+                    gate.willSleep()
+                    gate.didAcknowledgeSleep(true)
+                    commits += 1
+                    return result
+                },
+                cancel: { _ in cancels += 1; return .success }
+            )
+            if result == .success {
+                try transaction.setEnabled(display: 42, enabled: true, nativeCall: { try gate.perform($0) }, validate: {})
+            } else {
+                XCTAssertThrowsError(try transaction.setEnabled(display: 42, enabled: true,
+                    nativeCall: { try gate.perform($0) }, validate: {})) { error in
+                    XCTAssertEqual(error as? DisplayEnableTransactionError, .commitFailed)
+                }
+            }
+            XCTAssertEqual(commits, 1)
+            XCTAssertEqual(cancels, 0)
+            XCTAssertThrowsError(try gate.check())
+        }
+    }
+
     func testMissingSymbolAndNullDisplayRefuseBeforeNativeCalls() {
         let missingSymbol = FakeCalls()
         let missingSymbolTransaction = missingSymbol.transaction(configureAvailable: false)
@@ -177,6 +298,92 @@ final class DisplayEnableTransactionTests: XCTestCase {
         XCTAssertEqual(fake.events, [
             "begin", "configure:80:false", "complete:\(CGConfigureOption.forAppOnly.rawValue)"
         ])
+    }
+
+    func testDisableInternalTraceReportsAllNativeStagesAndCGErrors() throws {
+        let record = try makeRecord()
+        let protection = try readyProtection(for: record)
+        let snapshot = makeSnapshot(try layout(mainExternal: true))
+        let fake = FakeCalls()
+        var traceEntries: [String] = []
+        let trace: DisplayEnableTransaction.Trace = { stage, status in
+            traceEntries.append(self.lifecycleEvent(stage, status))
+        }
+
+        try runDisable(
+            fake.transaction(), record: record, storedRecord: { record }, snapshotReader: { snapshot },
+            trace: trace, checkProtection: { try protection.authorize(record: $0) }
+        )
+
+        XCTAssertEqual(traceEntries, [
+            lifecycleEvent(.enablePreValidationStarted), lifecycleEvent(.enablePreValidationFinished),
+            lifecycleEvent(.enableBeginStarted), lifecycleEvent(.enableBeginFinished, .success),
+            lifecycleEvent(.enableConfigureStarted), lifecycleEvent(.enableConfigureFinished, .success),
+            lifecycleEvent(.enablePostValidationStarted), lifecycleEvent(.enablePostValidationFinished),
+            lifecycleEvent(.enableCompleteStarted), lifecycleEvent(.enableCompleteFinished, .success)
+        ])
+        XCTAssertEqual(fake.events, [
+            "begin", "configure:80:false", "complete:\(CGConfigureOption.forAppOnly.rawValue)"
+        ])
+    }
+
+    func testDisableInternalTracePreservesNativeFailuresAndCancellation() throws {
+        let record = try makeRecord()
+        let protection = try readyProtection(for: record)
+        let snapshot = makeSnapshot(try layout(mainExternal: true))
+
+        let beginFake = FakeCalls()
+        let beginTransaction = beginFake.transaction(beginResult: .failure)
+        var beginTrace: [String] = []
+        XCTAssertThrowsError(try runDisable(
+            beginTransaction, record: record, storedRecord: { record }, snapshotReader: { snapshot },
+            trace: { beginTrace.append(self.lifecycleEvent($0, $1)) },
+            checkProtection: { try protection.authorize(record: $0) }
+        )) {
+            XCTAssertEqual($0 as? DisplayEnableTransactionError, .beginFailed)
+        }
+        XCTAssertEqual(beginTrace, [
+            lifecycleEvent(.enablePreValidationStarted), lifecycleEvent(.enablePreValidationFinished),
+            lifecycleEvent(.enableBeginStarted), lifecycleEvent(.enableBeginFinished, .failure)
+        ])
+        XCTAssertEqual(beginFake.events, ["begin"])
+
+        let configureFake = FakeCalls()
+        let configureTransaction = configureFake.transaction(configureResult: .failure, cancelResult: .failure)
+        var configureTrace: [String] = []
+        XCTAssertThrowsError(try runDisable(
+            configureTransaction, record: record, storedRecord: { record }, snapshotReader: { snapshot },
+            trace: { configureTrace.append(self.lifecycleEvent($0, $1)) },
+            checkProtection: { try protection.authorize(record: $0) }
+        )) {
+            XCTAssertEqual($0 as? DisplayEnableTransactionError, .configurationFailed)
+        }
+        XCTAssertEqual(configureTrace, [
+            lifecycleEvent(.enablePreValidationStarted), lifecycleEvent(.enablePreValidationFinished),
+            lifecycleEvent(.enableBeginStarted), lifecycleEvent(.enableBeginFinished, .success),
+            lifecycleEvent(.enableConfigureStarted), lifecycleEvent(.enableConfigureFinished, .failure),
+            lifecycleEvent(.enableCancelStarted), lifecycleEvent(.enableCancelFinished, .failure)
+        ])
+        XCTAssertEqual(configureFake.events, ["begin", "configure:80:false", "cancel"])
+
+        let completeFake = FakeCalls()
+        let completeTransaction = completeFake.transaction(completeResult: .failure)
+        var completeTrace: [String] = []
+        XCTAssertThrowsError(try runDisable(
+            completeTransaction, record: record, storedRecord: { record }, snapshotReader: { snapshot },
+            trace: { completeTrace.append(self.lifecycleEvent($0, $1)) },
+            checkProtection: { try protection.authorize(record: $0) }
+        )) {
+            XCTAssertEqual($0 as? DisplayEnableTransactionError, .commitFailed)
+        }
+        XCTAssertEqual(completeTrace, [
+            lifecycleEvent(.enablePreValidationStarted), lifecycleEvent(.enablePreValidationFinished),
+            lifecycleEvent(.enableBeginStarted), lifecycleEvent(.enableBeginFinished, .success),
+            lifecycleEvent(.enableConfigureStarted), lifecycleEvent(.enableConfigureFinished, .success),
+            lifecycleEvent(.enablePostValidationStarted), lifecycleEvent(.enablePostValidationFinished),
+            lifecycleEvent(.enableCompleteStarted), lifecycleEvent(.enableCompleteFinished, .failure)
+        ])
+        XCTAssertEqual(completeFake.events, ["begin", "configure:80:false", "complete:\(CGConfigureOption.forAppOnly.rawValue)"])
     }
 
     func testDisableInternalRejectsMissingHardwareIdentityBeforeNativeCalls() throws {
@@ -598,6 +805,7 @@ final class DisplayEnableTransactionTests: XCTestCase {
         snapshotReader: () throws -> Snapshot,
         lidIsOpen: () -> Bool = { true },
         internalReader: ((UUID) throws -> InternalDisplayState)? = nil,
+        trace: @escaping DisplayEnableTransaction.Trace = { _, _ in },
         checkProtection: (RecoveryRecord) throws -> Void
     ) throws {
         try transaction.disableInternal(
@@ -606,6 +814,7 @@ final class DisplayEnableTransactionTests: XCTestCase {
             snapshotReader: snapshotReader,
             lidIsOpen: lidIsOpen,
             checkProtection: checkProtection,
+            trace: trace,
             internalReader: internalReader ?? { [self] identity in
                 self.internalState(identity: identity, hardwareIdentity: self.internalHardwareIdentity)
             }

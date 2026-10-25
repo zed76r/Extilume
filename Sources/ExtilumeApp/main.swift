@@ -4,7 +4,10 @@ import Foundation
 
 setlinebuf(stdout)
 
-if CommandLine.arguments.dropFirst().first == "--display-snapshot" {
+if runInternalApplicationWorkerIfRequested() {
+    // The private session owner runs independently of the menu process.
+} else if ["--display-snapshot", "--active-display-snapshot", "--internal-display-snapshot", "--display-guard"]
+    .contains(CommandLine.arguments.dropFirst().first ?? "") {
     runDisplayProbe()
 } else {
     do {

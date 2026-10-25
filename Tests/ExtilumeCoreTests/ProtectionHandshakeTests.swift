@@ -53,6 +53,83 @@ final class ProtectionHandshakeTests: XCTestCase {
         XCTAssertFalse(contract.accepts(record: older))
     }
 
+    func testVerifyAcknowledgementAcceptsOwnedRecordWithoutAuthorizingControl() throws {
+        let hardware = InternalDisplayHardwareIdentity(bootSession: session, registryEntryID: 42)
+        let contract = try handshake(
+            internalDisplayIdentity: firstDisplay, internalDisplayHardwareIdentity: hardware
+        )
+        var authorization = ProtectionAuthorization()
+        try authorization.acknowledge(receipt: contract, expected: contract)
+
+        var owned = try makeRecord(
+            internalDisplayIdentity: firstDisplay, internalDisplayHardwareIdentity: hardware
+        )
+        try owned.markApplying()
+        try owned.confirmApplied(DisplayLayout(main: secondDisplay, origins: [
+            secondDisplay: DisplayOrigin(x: 0, y: 0)
+        ]), internalEnabled: false)
+        XCTAssertEqual(owned.phase, .owned)
+
+        XCTAssertNoThrow(try authorization.verifyAcknowledgement(record: owned))
+        XCTAssertTrue(authorization.ready)
+        XCTAssertFalse(authorization.lost)
+        XCTAssertThrowsError(try authorization.authorize(record: owned)) { error in
+            guard let recoveryError = error as? RecoveryError,
+                  case .invalidTransition = recoveryError else {
+                return XCTFail("owned record should fail only the control-phase check")
+            }
+        }
+    }
+
+    func testVerifyAcknowledgementRejectsUnreadyAndLostAuthorization() throws {
+        let contract = try handshake()
+        let record = try makeRecord()
+        var authorization = ProtectionAuthorization()
+
+        assertThrowsUnfinishedTransaction(try authorization.verifyAcknowledgement(record: record))
+
+        try authorization.acknowledge(receipt: contract, expected: contract)
+        authorization.markLost()
+        assertThrowsUnfinishedTransaction(try authorization.verifyAcknowledgement(record: record))
+        XCTAssertTrue(authorization.lost)
+        XCTAssertFalse(authorization.ready)
+    }
+
+    func testVerifyAcknowledgementRejectsMismatchedRecordBinding() throws {
+        let hardwareIdentity = InternalDisplayHardwareIdentity(bootSession: session, registryEntryID: 42)
+        let otherHardwareIdentity = InternalDisplayHardwareIdentity(bootSession: otherSession, registryEntryID: 43)
+
+        let contract = try handshake(
+            internalDisplayIdentity: firstDisplay,
+            internalDisplayHardwareIdentity: hardwareIdentity
+        )
+        var authorization = ProtectionAuthorization()
+        try authorization.acknowledge(receipt: contract, expected: contract)
+
+        assertThrowsIdentityConflict(try authorization.verifyAcknowledgement(record: makeRecord(
+            session: otherSession,
+            internalDisplayIdentity: firstDisplay,
+            internalDisplayHardwareIdentity: hardwareIdentity
+        )))
+        assertThrowsIdentityConflict(try authorization.verifyAcknowledgement(record: makeRecord(
+            internalDisplayIdentity: secondDisplay,
+            internalDisplayHardwareIdentity: hardwareIdentity
+        )))
+        assertThrowsIdentityConflict(try authorization.verifyAcknowledgement(record: makeRecord(
+            internalDisplayIdentity: firstDisplay,
+            internalDisplayHardwareIdentity: otherHardwareIdentity
+        )))
+        assertThrowsIdentityConflict(try authorization.verifyAcknowledgement(record: makeRecord()))
+
+        let newerGenerationContract = try handshake(generation: 2)
+        var newerGenerationAuthorization = ProtectionAuthorization()
+        try newerGenerationAuthorization.acknowledge(
+            receipt: newerGenerationContract,
+            expected: newerGenerationContract
+        )
+        assertThrowsIdentityConflict(try newerGenerationAuthorization.verifyAcknowledgement(record: makeRecord()))
+    }
+
     func testAcceptsNewerGenerationInPreparedAndApplyingPhases() throws {
         let contract = try handshake()
         var authorization = ProtectionAuthorization()
@@ -179,17 +256,23 @@ final class ProtectionHandshakeTests: XCTestCase {
 
     private func handshake(
         generation: UInt64 = 1,
-        internalDisplayIdentity: UUID? = nil
+        internalDisplayIdentity: UUID? = nil,
+        internalDisplayHardwareIdentity: InternalDisplayHardwareIdentity? = nil
     ) throws -> ProtectionHandshake {
         try ProtectionHandshake(
             session: session,
             generation: generation,
             parentPID: 42,
-            internalDisplayIdentity: internalDisplayIdentity
+            internalDisplayIdentity: internalDisplayIdentity,
+            internalDisplayHardwareIdentity: internalDisplayHardwareIdentity
         )
     }
 
-    private func makeRecord(session: UUID? = nil, internalDisplayIdentity: UUID? = nil) throws -> RecoveryRecord {
+    private func makeRecord(
+        session: UUID? = nil,
+        internalDisplayIdentity: UUID? = nil,
+        internalDisplayHardwareIdentity: InternalDisplayHardwareIdentity? = nil
+    ) throws -> RecoveryRecord {
         try RecoveryRecord(
             session: session ?? self.session,
             baseline: DisplayLayout(main: firstDisplay, origins: [
@@ -201,9 +284,40 @@ final class ProtectionHandshakeTests: XCTestCase {
                 secondDisplay: DisplayOrigin(x: 0, y: 0)
             ]),
             internalDisplay: internalDisplayIdentity.map {
-                InternalDisplayResponsibility(identity: $0, baseline: true, applied: false)
+                InternalDisplayResponsibility(
+                    identity: $0,
+                    baseline: true,
+                    applied: false,
+                    hardwareIdentity: internalDisplayHardwareIdentity
+                )
             }
         )
+    }
+
+    private func assertThrowsUnfinishedTransaction(
+        _ expression: @autoclosure () throws -> Void,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        XCTAssertThrowsError(try expression(), file: file, line: line) { error in
+            guard let recoveryError = error as? RecoveryError,
+                  case .unfinishedTransaction = recoveryError else {
+                return XCTFail("expected unfinishedTransaction", file: file, line: line)
+            }
+        }
+    }
+
+    private func assertThrowsIdentityConflict(
+        _ expression: @autoclosure () throws -> Void,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        XCTAssertThrowsError(try expression(), file: file, line: line) { error in
+            guard let recoveryError = error as? RecoveryError,
+                  case .identityConflict = recoveryError else {
+                return XCTFail("expected identityConflict", file: file, line: line)
+            }
+        }
     }
 
     private func changedLayout() throws -> DisplayLayout {

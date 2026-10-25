@@ -1,9 +1,28 @@
+import AppKit
 import Darwin
 import ExtilumeCore
 import Foundation
 
 enum ApplicationLaunchError: Error, Equatable {
     case invalidArguments
+    case anotherApplicationRunning
+}
+
+@MainActor
+func acquireApplicationControlLease(
+    directory: URL = FileManager.default.temporaryDirectory.appendingPathComponent("Extilume-application-owner", isDirectory: true),
+    hasOtherApplication: () -> Bool = {
+        NSWorkspace.shared.runningApplications.contains {
+            $0.processIdentifier != getpid()
+                && ["com.extilume.app", "com.extilume.development"].contains($0.bundleIdentifier ?? "")
+        }
+    }
+) throws -> RecoveryStore {
+    if mkdir(directory.path, mode_t(0o700)) != 0 && errno != EEXIST { throw RecoveryStoreError.ioFailure }
+    let lease = try RecoveryStore(directory: directory)
+    try lease.acquireExclusiveOwnership()
+    guard !hasOtherApplication() else { throw ApplicationLaunchError.anotherApplicationRunning }
+    return lease
 }
 
 func applicationStateDirectory(

@@ -8,6 +8,7 @@ private enum ConnectionObserverError: Error {
     case invalidTarget
     case setupFailed
     case alreadyStarted
+    case invalidReconfiguration
 }
 
 private enum MatchingKind: Equatable {
@@ -34,15 +35,23 @@ func connectionChangeInvalidationReason(
     return expected && flags == .disabledFlag ? nil : "cg-disabled"
 }
 
+func connectionDisplayScope(display: UInt32, expectedDisabledInternal: UInt32?) -> ConnectionDisplayScope {
+    guard display != 0 else { return .unknown }
+    guard let expectedDisabledInternal, expectedDisabledInternal != 0,
+          display == expectedDisabledInternal else { return .other }
+    return .expectedInternal
+}
+
 final class ConnectionObserver: @unchecked Sendable {
     private let service: io_service_t
     private let targetEntryID: UInt64
     private let targetEDIDUUID: UUID
-    private let onInvalidation: @Sendable (String) -> Void
+    private let onInvalidation: @Sendable (String, UInt64?) -> Void
     private let onReconfiguration: @Sendable () -> Void
     private let reportsEvents: Bool
     private let expectedDisabledInternal: UInt32?
     private let expectedInternalRegistryID: UInt64?
+    private let diagnosticRole: InternalLifecycleRole
     private let queue = DispatchQueue(label: "Extilume.connection-observer")
     private let queueKey = DispatchSpecificKey<Bool>()
 
@@ -53,10 +62,12 @@ final class ConnectionObserver: @unchecked Sendable {
     private var matchingIterators: [io_iterator_t: String] = [:]
     private var candidates = ConnectionCandidateState()
     private var candidateServices: [UInt64: (service: io_service_t, interest: io_object_t)] = [:]
+    private var candidateOrdinals: [UInt64: UInt64] = [:]
     private var candidateSetupFailed = false
     private var cgRegistered = false
     private var started = false
     private var resourcesReleased = false
+    private let reconfiguration: InternalLinkReconfigurationGate
 
     private var filtersEmbeddedTerminations: Bool {
         (expectedDisabledInternal ?? 0) != 0 && (expectedInternalRegistryID ?? 0) != 0
@@ -66,8 +77,9 @@ final class ConnectionObserver: @unchecked Sendable {
     init(service: io_service_t, reportsEvents: Bool = true,
          expectedDisabledInternal: UInt32? = nil,
          expectedInternalRegistryID: UInt64? = nil,
+         diagnosticRole: InternalLifecycleRole = .observer,
          onReconfiguration: @escaping @Sendable () -> Void = {},
-         onInvalidation: @escaping @Sendable (String) -> Void = { _ in }) throws {
+         onInvalidation: @escaping @Sendable (String, UInt64?) -> Void = { _, _ in }) throws {
         var ownsService = true
         defer { if ownsService { _ = IOObjectRelease(service) } }
 
@@ -85,14 +97,76 @@ final class ConnectionObserver: @unchecked Sendable {
         self.reportsEvents = reportsEvents
         self.expectedDisabledInternal = expectedDisabledInternal
         self.expectedInternalRegistryID = expectedInternalRegistryID
+        self.diagnosticRole = diagnosticRole
         self.onInvalidation = onInvalidation
         self.onReconfiguration = onReconfiguration
+        self.reconfiguration = InternalLinkReconfigurationGate { first in
+            onInvalidation("controlled-link-budget-expired", first)
+        }
         ownsService = false
         queue.setSpecific(key: queueKey, value: true)
     }
 
     deinit {
         stopObserving()
+    }
+
+    func performInternalDisableCommit(
+        validateBeforeCommit: () throws -> Void,
+        _ call: () -> CGError
+    ) throws -> CGError {
+        do {
+            try queue.sync {
+                guard started, !resourcesReleased, filtersEmbeddedTerminations,
+                      let fixed = candidates.reconfigurationCandidates(
+                        registered: Set(candidateServices.keys), internalDisplayID: expectedDisabledInternal
+                      ), reconfiguration.prepare(candidates: fixed) else {
+                    throw ConnectionObserverError.invalidReconfiguration
+                }
+            }
+            try validateBeforeCommit()
+            let completion = try reconfiguration.performNative(call)
+            // 只在已关闭原生窗口后输出，实际边界使用调用内时间戳。
+            traceInternalLifecycle(.linkReconfigurationStarted, role: diagnosticRole, observedAt: completion.startedAt)
+            traceInternalLifecycle(.linkReconfigurationCollected, role: diagnosticRole, observedAt: completion.returnedAt)
+            guard queue.sync(execute: {
+                !resourcesReleased && candidates.reconfigurationCandidates(
+                    registered: Set(candidateServices.keys), internalDisplayID: expectedDisabledInternal
+                ) != nil && reconfiguration.phase == .verifying
+            }) else { throw ConnectionObserverError.invalidReconfiguration }
+            return completion.result
+        } catch {
+            abortInternalReconfiguration()
+            throw error
+        }
+    }
+
+    // 调用方须先完成独立效果读回及责任／保护／电源复核。
+    func verifyInternalReconfiguration() throws {
+        let verified = queue.sync {
+            guard !resourcesReleased,
+                  candidates.reconfigurationCandidates(registered: Set(candidateServices.keys),
+                                                      internalDisplayID: expectedDisabledInternal) != nil,
+                  let now = try? ContinuousClock.nanoseconds() else { return false }
+            return reconfiguration.verify(at: now)
+        }
+        guard verified else {
+            abortInternalReconfiguration()
+            throw ConnectionObserverError.invalidReconfiguration
+        }
+        traceInternalLifecycle(.linkReconfigurationVerified, role: diagnosticRole)
+    }
+
+    func abortInternalReconfiguration() {
+        let pending = reconfiguration.fail()
+        if let pending {
+            onInvalidation("controlled-link-reconfiguration-failed", pending)
+            traceInternalLifecycle(.linkReconfigurationFailed, role: diagnosticRole, observedAt: pending)
+        }
+    }
+
+    private func signalInvalidation(_ reason: String, observedAt: UInt64?) {
+        onInvalidation(reason, reconfiguration.invalidate(observedAt: observedAt))
     }
 
     func stopObserving() {
@@ -219,17 +293,24 @@ final class ConnectionObserver: @unchecked Sendable {
             let observedAt = try? ContinuousClock.nanoseconds()
             var entryID: UInt64 = 0
             let identified = IORegistryEntryGetRegistryEntryID(candidate, &entryID) == KERN_SUCCESS
+            var terminationLocation: ConnectionObservedLocation?
             if kind == .terminated, identified, entryID != targetEntryID, filtersEmbeddedTerminations,
                candidates.isKnownEmbedded(entryID: entryID),
                let sourceClass = matchingIterators[iterator].flatMap(ExternalConnectionService.init(rawValue:)) {
-                if candidates.consumeEmbeddedTermination(entryID: entryID, service: sourceClass,
-                    location: property("Location", from: candidate) as? String) {
+                let location = property("Location", from: candidate) as? String
+                terminationLocation = ConnectionObservedLocation(location)
+                let registered = candidates.diagnosticCandidate(entryID: entryID)
+                if candidates.consumeEmbeddedTermination(entryID: entryID, service: sourceClass, location: location) {
+                    observe(.terminated, entryID: entryID, candidate: registered,
+                            observedAt: observedAt, location: terminationLocation,
+                            disposition: .controlledEmbeddedTermination)
                     continue
                 }
             }
             if kind == .terminated,
                invalidateCandidate(identified ? entryID : 0, terminated: true,
-                   event: "\(initial ? "initial-not-physical termination" : "termination") sourceClass=\(matchingIterators[iterator] ?? "unclassified")", observedAt: observedAt) {
+                   event: "\(initial ? "initial-not-physical termination" : "termination") sourceClass=\(matchingIterators[iterator] ?? "unclassified")",
+                   observedAt: observedAt, eventKind: .terminated, location: terminationLocation) {
                 releaseCandidate(entryID)
                 continue
             }
@@ -242,12 +323,21 @@ final class ConnectionObserver: @unchecked Sendable {
                     let wasInvalidated = candidates.invalidated
                     let accepted = candidates.matched(entryID: entryID, service: candidateClass, location: location)
                     if !wasInvalidated && candidates.invalidated {
-                        onInvalidation("io-role-conflict class=\(candidateClass.rawValue)")
+                        signalInvalidation("io-role-conflict class=\(candidateClass.rawValue)", observedAt: observedAt)
+                    }
+                    if accepted, location == "External", [.prepared, .collecting, .verifying].contains(reconfiguration.phase) {
+                        signalInvalidation("io-candidate-changed", observedAt: observedAt)
+                    }
+                    if accepted, candidateOrdinals[entryID] == nil {
+                        candidateOrdinals[entryID] = UInt64(candidateOrdinals.count) + 1
                     }
                     if accepted {
                         if location == "External" { watchCandidate(candidate, entryID: entryID) }
                         log("candidate \(initial ? "initial-not-physical" : "matched") class=\(candidateClass.rawValue) location=\(location == "Embedded" ? "Embedded" : "External") invalidated=\(candidates.invalidated)（不证明目标身份或可用）", observedAt: observedAt)
                     }
+                    observe(.matched, entryID: entryID, observedAt: observedAt,
+                            location: ConnectionObservedLocation(location), initial: initial,
+                            disposition: !wasInvalidated && candidates.invalidated ? .revoked : (accepted ? .registered : .unchanged))
                     continue
                 }
             }
@@ -260,7 +350,7 @@ final class ConnectionObserver: @unchecked Sendable {
     private func watchCandidate(_ candidate: io_service_t, entryID: UInt64) {
         guard IOObjectRetain(candidate) == KERN_SUCCESS else {
             candidateSetupFailed = true
-            _ = invalidateCandidate(entryID, terminated: true, event: "watch-failed", observedAt: nil)
+            _ = invalidateCandidate(entryID, terminated: true, event: "watch-failed", observedAt: nil, eventKind: .watchFailed)
             return
         }
         var interest: io_object_t = IO_OBJECT_NULL
@@ -270,23 +360,25 @@ final class ConnectionObserver: @unchecked Sendable {
             if interest != IO_OBJECT_NULL { _ = IOObjectRelease(interest) }
             _ = IOObjectRelease(candidate)
             candidateSetupFailed = true
-            _ = invalidateCandidate(entryID, terminated: true, event: "watch-failed", observedAt: nil)
+            _ = invalidateCandidate(entryID, terminated: true, event: "watch-failed", observedAt: nil, eventKind: .watchFailed)
             return
         }
         candidateServices[entryID] = (candidate, interest)
     }
 
-    private func invalidateCandidate(_ entryID: UInt64, terminated: Bool, event: String, observedAt: UInt64?) -> Bool {
+    private func invalidateCandidate(
+        _ entryID: UInt64, terminated: Bool, event: String, observedAt: UInt64?,
+        eventKind: ConnectionObservationEvent = .interest, messageType: UInt32? = nil,
+        messageArgument: ConnectionObservedArgument? = nil,
+        location: ConnectionObservedLocation? = nil
+    ) -> Bool {
+        let registered = candidates.diagnosticCandidate(entryID: entryID)
         let candidateClass = candidates.invalidate(entryID: entryID, terminated: terminated)
-        let scope: String
-        if entryID == 0 {
-            scope = "unknown"
-        } else if entryID == targetEntryID {
-            scope = entryID == expectedInternalRegistryID ? "identity-conflict" : "target"
-        } else {
-            scope = entryID == expectedInternalRegistryID ? "expected-internal" : "other"
-        }
-        onInvalidation("io-negative scope=\(scope) class=\(candidateClass?.rawValue ?? "unclassified") event=\(event)")
+        let scope = connectionRegistryScope(entryID: entryID, target: targetEntryID, internalProof: expectedInternalRegistryID)
+        signalInvalidation("io-negative scope=\(scope.rawValue) class=\(candidateClass?.rawValue ?? "unclassified") event=\(event)", observedAt: observedAt)
+        // Formatting and output happen only after authorization has been revoked.
+        observe(eventKind, entryID: entryID, candidate: registered, observedAt: observedAt,
+                messageType: messageType, messageArgument: messageArgument, location: location, disposition: .revoked)
         guard let candidateClass else { return false }
         log("candidate \(event) class=\(candidateClass.rawValue) invalidated=true（仅安全条件失效，非已确认拔线）", observedAt: observedAt)
         return true
@@ -313,15 +405,39 @@ final class ConnectionObserver: @unchecked Sendable {
         return transport["Downstream"] as? String == "HDMI"
     }
 
-    fileprivate func handleInterest(_ service: io_service_t, _ messageType: UInt32) {
+    fileprivate func handleInterest(
+        _ service: io_service_t, _ messageType: UInt32, _ messageArgument: ConnectionObservedArgument
+    ) {
         guard !resourcesReleased else { return }
         let observedAt = try? ContinuousClock.nanoseconds()
         var entryID: UInt64 = 0
         guard IORegistryEntryGetRegistryEntryID(service, &entryID) == KERN_SUCCESS else {
-            _ = invalidateCandidate(0, terminated: false, event: "unclassified interest", observedAt: observedAt)
+            _ = invalidateCandidate(0, terminated: false, event: "unclassified interest", observedAt: observedAt,
+                                    messageType: messageType, messageArgument: messageArgument)
             return
         }
-        if invalidateCandidate(entryID, terminated: false, event: "interest type=\(messageType)", observedAt: observedAt) {
+        // 保护协商信息不证明链路健康；只使用本轮有效登记，不能依赖诊断分类。
+        if candidates.permitsProtectionInformation(
+            entryID: entryID, messageType: messageType, messageArgument: messageArgument,
+            interestRegistered: candidateServices[entryID] != nil,
+            internalDisplayID: expectedDisabledInternal
+        ) {
+            observe(.interest, entryID: entryID, observedAt: observedAt,
+                    messageType: messageType, messageArgument: messageArgument,
+                    disposition: .informational)
+            return
+        }
+        if let observedAt, candidates.reconfigurationCandidates(
+            registered: Set(candidateServices.keys), internalDisplayID: expectedDisabledInternal
+        ) != nil, reconfiguration.consume(entryID: entryID, messageType: messageType,
+                                           argument: messageArgument, at: observedAt) {
+            observe(.interest, entryID: entryID, observedAt: observedAt,
+                    messageType: messageType, messageArgument: messageArgument,
+                    disposition: .pendingReconfiguration)
+            return
+        }
+        if invalidateCandidate(entryID, terminated: false, event: "interest type=\(messageType)", observedAt: observedAt,
+                               messageType: messageType, messageArgument: messageArgument) {
             return
         }
         guard entryID == targetEntryID else { return }
@@ -345,7 +461,15 @@ final class ConnectionObserver: @unchecked Sendable {
         // 撤权不能等在可能阻塞的显示快照之后。
         if let reason {
             let scope = display == 0 ? "unknown" : (display == expectedDisabledInternal ? "expected-internal" : "other")
-            onInvalidation("\(reason) scope=\(scope) flags=\(flags.rawValue)")
+            signalInvalidation("\(reason) scope=\(scope) flags=\(flags.rawValue)", observedAt: observedAt)
+        }
+        if (reportsEvents || expectedDisabledInternal != nil), let observedAt {
+            traceConnectionObservation(ConnectionDisplayObservation(
+                role: diagnosticRole, observerStartedAtNanoseconds: startedAt,
+                continuousNs: observedAt, flags: flags.rawValue,
+                scope: connectionDisplayScope(display: display, expectedDisabledInternal: expectedDisabledInternal),
+                invalidationReason: reason
+            ))
         }
         queue.async { [weak self] in
             guard let self, !self.resourcesReleased else { return }
@@ -365,8 +489,36 @@ final class ConnectionObserver: @unchecked Sendable {
         print("[\((now - startedAt) / 1_000_000)ms] \(event) continuousNs=\(now)")
     }
 
+    private func observe(
+        _ event: ConnectionObservationEvent, entryID: UInt64,
+        candidate: ConnectionCandidateDiagnostic? = nil, observedAt: UInt64?,
+        messageType: UInt32? = nil, messageArgument: ConnectionObservedArgument? = nil,
+        location: ConnectionObservedLocation? = nil, initial: Bool? = nil,
+        disposition: ConnectionObservationDisposition
+    ) {
+        guard reportsEvents || expectedDisabledInternal != nil else { return }
+        guard let timestamp = observedAt ?? (try? ContinuousClock.nanoseconds()) else { return }
+        let diagnosticCandidate = candidate ?? candidates.diagnosticCandidate(entryID: entryID)
+        let messageClassification = connectionMessageClassification(
+            event: event,
+            candidate: diagnosticCandidate,
+            messageType: messageType,
+            messageArgument: messageArgument
+        )
+        traceConnectionObservation(ConnectionObservation(
+            role: diagnosticRole, observerStartedAtNanoseconds: startedAt, continuousNs: timestamp,
+            event: event, candidateOrdinal: candidateOrdinals[entryID],
+            candidate: diagnosticCandidate,
+            registryScope: connectionRegistryScope(entryID: entryID, target: targetEntryID, internalProof: expectedInternalRegistryID),
+            messageType: messageType, messageArgument: messageArgument,
+            messageClassification: messageClassification, observedLocation: location, initial: initial,
+            disposition: disposition, invalidated: candidates.invalidated
+        ))
+    }
+
     private func releaseResourcesOnQueue() {
         guard !resourcesReleased else { return }
+        abortInternalReconfiguration()
         resourcesReleased = true
 
         if cgRegistered {
@@ -382,6 +534,7 @@ final class ConnectionObserver: @unchecked Sendable {
             interestNotification = IO_OBJECT_NULL
         }
         for entryID in Array(candidateServices.keys) { releaseCandidate(entryID) }
+        candidateOrdinals.removeAll()
         for iterator in matchingIterators.keys {
             _ = IOObjectRelease(iterator)
         }
@@ -416,7 +569,7 @@ private func connectionInterestCallback(
 ) {
     guard let refcon else { return }
     let observer = Unmanaged<ConnectionObserver>.fromOpaque(refcon).takeUnretainedValue()
-    observer.handleInterest(service, messageType)
+    observer.handleInterest(service, messageType, ConnectionObservedArgument(messageArgument))
 }
 
 private func connectionMatchedCallback(_ refcon: UnsafeMutableRawPointer?, _ iterator: io_iterator_t) {

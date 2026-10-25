@@ -6,6 +6,7 @@ public enum GuardChannelError: Error, Equatable {
     case systemCall(Int32)
     case timedOut
     case peerClosed
+    case truncatedMessage
     case invalidLength
     case invalidMessage
     case messageTooLarge
@@ -51,8 +52,18 @@ public final class GuardChannel: @unchecked Sendable {
         }
     }
 
-    public func send<T: Encodable>(_ value: T) throws {
-        let deadline = try makeDeadline()
+    public func send<T: Encodable>(
+        _ value: T,
+        deadlineNanoseconds: UInt64? = nil,
+        checkAccess: (() throws -> Void)? = nil
+    ) throws {
+        let deadline: UInt64
+        if let deadlineNanoseconds {
+            deadline = deadlineNanoseconds
+        } else {
+            deadline = try makeDeadline()
+        }
+        guard try ContinuousClock.nanoseconds() < deadline else { throw GuardChannelError.timedOut }
         let payload: Data
         do { payload = try JSONEncoder().encode(value) }
         catch { throw GuardChannelError.invalidMessage }
@@ -65,22 +76,32 @@ public final class GuardChannel: @unchecked Sendable {
 
         var bigEndianLength = UInt32(payload.count).bigEndian
         let header = withUnsafeBytes(of: &bigEndianLength) { Data($0) }
-        try writeAll(header, deadline: deadline)
-        try writeAll(payload, deadline: deadline)
+        try writeAll(header, deadline: deadline, checkAccess: checkAccess)
+        try writeAll(payload, deadline: deadline, checkAccess: checkAccess)
     }
 
-    public func receive<T: Decodable>(_ type: T.Type) throws -> T {
-        let deadline = try makeDeadline()
+    public func receive<T: Decodable>(
+        _ type: T.Type,
+        deadlineNanoseconds: UInt64? = nil,
+        checkAccess: (() throws -> Void)? = nil
+    ) throws -> T {
+        let deadline: UInt64
+        if let deadlineNanoseconds {
+            deadline = deadlineNanoseconds
+        } else {
+            deadline = try makeDeadline()
+        }
+        guard try ContinuousClock.nanoseconds() < deadline else { throw GuardChannelError.timedOut }
         receiveLock.lock()
         defer { receiveLock.unlock() }
 
         var header = Data(count: 4)
-        try header.withUnsafeMutableBytes { try readExactly($0, deadline: deadline) }
+        try header.withUnsafeMutableBytes { try readExactly($0, deadline: deadline, checkAccess: checkAccess) }
         let length = header.reduce(UInt32(0)) { ($0 << 8) | UInt32($1) }
         guard length > 0, length <= Self.maximumMessageSize else { throw GuardChannelError.invalidLength }
 
         var payload = Data(count: Int(length))
-        try payload.withUnsafeMutableBytes { try readExactly($0, deadline: deadline) }
+        try payload.withUnsafeMutableBytes { try readExactly($0, deadline: deadline, checkAccess: checkAccess, frameStarted: true) }
         do { return try JSONDecoder().decode(type, from: payload) }
         catch { throw GuardChannelError.invalidMessage }
     }
@@ -88,6 +109,13 @@ public final class GuardChannel: @unchecked Sendable {
     public func peerClosed() throws -> Bool {
         var byte: UInt8 = 0
         while true {
+            var state = pollfd(fd: descriptor, events: Int16(POLLIN), revents: 0)
+            if poll(&state, 1, 0) == -1 {
+                if errno == EINTR { continue }
+                throw GuardChannelError.systemCall(errno)
+            }
+            if state.revents & Int16(POLLNVAL) != 0 { throw GuardChannelError.invalidDescriptor }
+            if state.revents & Int16(POLLHUP | POLLERR) != 0 { return true }
             let count = Darwin.recv(descriptor, &byte, 1, MSG_PEEK | MSG_DONTWAIT)
             if count == 0 { return true }
             if count > 0 { return false }
@@ -126,13 +154,24 @@ public final class GuardChannel: @unchecked Sendable {
         return overflow ? UInt64.max : deadline
     }
 
-    private func wait(for events: Int16, until deadline: UInt64) throws {
+    private func wait(
+        for events: Int16,
+        until deadline: UInt64,
+        checkAccess: (() throws -> Void)?
+    ) throws {
         while true {
-            let now = try ContinuousClock.nanoseconds()
+            var now = try ContinuousClock.nanoseconds()
             guard now < deadline else { throw GuardChannelError.timedOut }
+            var maximumPollMilliseconds = UInt64(Int32.max)
+            if let checkAccess {
+                try checkAccess()
+                now = try ContinuousClock.nanoseconds()
+                guard now < deadline else { throw GuardChannelError.timedOut }
+                maximumPollMilliseconds = 50
+            }
             let remaining = deadline - now
             let milliseconds = remaining / 1_000_000 + (remaining % 1_000_000 == 0 ? 0 : 1)
-            let timeout = Int32(min(milliseconds, UInt64(Int32.max)))
+            let timeout = Int32(min(milliseconds, maximumPollMilliseconds))
             var pollDescriptor = pollfd(fd: descriptor, events: events, revents: 0)
             let result = Darwin.poll(&pollDescriptor, 1, timeout)
             if result == -1 {
@@ -143,17 +182,22 @@ public final class GuardChannel: @unchecked Sendable {
             if pollDescriptor.revents & Int16(POLLNVAL) != 0 { throw GuardChannelError.invalidDescriptor }
             if pollDescriptor.revents & (events | Int16(POLLERR) | Int16(POLLHUP)) != 0 {
                 guard try ContinuousClock.nanoseconds() < deadline else { throw GuardChannelError.timedOut }
+                if let checkAccess {
+                    try checkAccess()
+                    guard try ContinuousClock.nanoseconds() < deadline else { throw GuardChannelError.timedOut }
+                }
                 return
             }
         }
     }
 
-    private func writeAll(_ data: Data, deadline: UInt64) throws {
+    private func writeAll(_ data: Data, deadline: UInt64, checkAccess: (() throws -> Void)?) throws {
         try data.withUnsafeBytes { buffer in
             guard let baseAddress = buffer.baseAddress else { return }
             var offset = 0
             while offset < buffer.count {
-                try wait(for: Int16(POLLOUT), until: deadline)
+                try wait(for: Int16(POLLOUT), until: deadline, checkAccess: checkAccess)
+                guard try ContinuousClock.nanoseconds() < deadline else { throw GuardChannelError.timedOut }
                 let count = Darwin.send(
                     descriptor,
                     baseAddress.advanced(by: offset),
@@ -173,11 +217,17 @@ public final class GuardChannel: @unchecked Sendable {
         }
     }
 
-    private func readExactly(_ buffer: UnsafeMutableRawBufferPointer, deadline: UInt64) throws {
+    private func readExactly(
+        _ buffer: UnsafeMutableRawBufferPointer,
+        deadline: UInt64,
+        checkAccess: (() throws -> Void)?,
+        frameStarted: Bool = false
+    ) throws {
         guard let baseAddress = buffer.baseAddress else { return }
         var offset = 0
         while offset < buffer.count {
-            try wait(for: Int16(POLLIN), until: deadline)
+            try wait(for: Int16(POLLIN), until: deadline, checkAccess: checkAccess)
+            guard try ContinuousClock.nanoseconds() < deadline else { throw GuardChannelError.timedOut }
             let count = Darwin.recv(
                 descriptor,
                 baseAddress.advanced(by: offset),
@@ -187,7 +237,7 @@ public final class GuardChannel: @unchecked Sendable {
             if count > 0 {
                 offset += count
             } else if count == 0 {
-                throw GuardChannelError.peerClosed
+                throw frameStarted || offset > 0 ? GuardChannelError.truncatedMessage : GuardChannelError.peerClosed
             } else if errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK {
                 continue
             } else {

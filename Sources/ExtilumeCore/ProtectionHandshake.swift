@@ -102,9 +102,13 @@ public struct ProtectionAuthorization {
         acknowledgedHandshake = nil
     }
 
-    public func authorize(record: RecoveryRecord) throws {
+    public func verifyAcknowledgement(record: RecoveryRecord) throws {
         guard ready, !lost, let acknowledgedHandshake else { throw RecoveryError.unfinishedTransaction }
         guard acknowledgedHandshake.accepts(record: record) else { throw RecoveryError.identityConflict }
+    }
+
+    public func authorize(record: RecoveryRecord) throws {
+        try verifyAcknowledgement(record: record)
         guard record.phase == .prepared || record.phase == .applying else { throw RecoveryError.invalidTransition }
         guard !record.sourceUnresolved else { throw RecoveryError.unresolvedSource }
     }

@@ -12,14 +12,18 @@ final class InternalDisplayStateTests: XCTestCase {
         identityUUID: UUID? = nil,
         isBuiltIn: Bool = true,
         isOnline: Bool = true,
-        isActive: Bool = true
+        isActive: Bool = true,
+        hardwareIdentity: InternalDisplayHardwareIdentity? = nil,
+        reportedIdentityUUID: UUID? = nil
     ) -> InternalDisplayState {
         InternalDisplayState(
             id: id,
             identityUUID: identityUUID ?? identity,
             isBuiltIn: isBuiltIn,
             isOnline: isOnline,
-            isActive: isActive
+            isActive: isActive,
+            hardwareIdentity: hardwareIdentity,
+            reportedIdentityUUID: reportedIdentityUUID
         )
     }
 
@@ -47,6 +51,20 @@ final class InternalDisplayStateTests: XCTestCase {
 
         XCTAssertEqual(actual, expected)
         XCTAssertTrue(actual.isEnabled)
+    }
+
+    func testSuccessfulMatchDoesNotEmitDiagnostic() throws {
+        let expected = state(id: 7)
+        var failures: [InternalDisplayIdentityFailure] = []
+
+        let actual = try matchInternalDisplay(
+            identity: identity,
+            candidates: [7],
+            diagnostic: { failures.append($0) }
+        ) { _ in expected }
+
+        XCTAssertEqual(actual, expected)
+        XCTAssertTrue(failures.isEmpty)
     }
 
     func testMatchesRequiresNonzeroBuiltInDisplayWithSameIdentity() {
@@ -98,29 +116,135 @@ final class InternalDisplayStateTests: XCTestCase {
     }
 
     func testNumericIDMismatchIsConflicted() {
-        assertIdentityConflict(try matchInternalDisplay(identity: identity, candidates: [5]) { _ in
+        var failures: [InternalDisplayIdentityFailure] = []
+
+        assertIdentityConflict(try matchInternalDisplay(
+            identity: identity,
+            candidates: [5],
+            diagnostic: { failures.append($0) }
+        ) { _ in
             self.state(id: 6)
         })
+        XCTAssertEqual(failures, [.numericIDMismatch])
     }
 
     func testZeroCandidateIsRejectedBeforeAnyRead() {
         var readCount = 0
+        var failures: [InternalDisplayIdentityFailure] = []
 
-        assertIdentityConflict(try matchInternalDisplay(identity: identity, candidates: [5, 0]) { _ in
+        assertIdentityConflict(try matchInternalDisplay(
+            identity: identity,
+            candidates: [5, 0],
+            diagnostic: { failures.append($0) }
+        ) { _ in
             readCount += 1
             return nil
         })
         XCTAssertEqual(readCount, 0)
+        XCTAssertEqual(failures, [.invalidCandidate])
+    }
+
+    func testNoMatchAndAmbiguousMatchHaveDistinctDiagnostics() {
+        var noMatchFailures: [InternalDisplayIdentityFailure] = []
+        assertIdentityConflict(try matchInternalDisplay(
+            identity: identity,
+            candidates: [4],
+            diagnostic: { noMatchFailures.append($0) }
+        ) { _ in
+            self.state(id: 4, identityUUID: self.otherIdentity)
+        })
+        XCTAssertEqual(noMatchFailures, [.noMatch])
+
+        var ambiguousFailures: [InternalDisplayIdentityFailure] = []
+        assertIdentityConflict(try matchInternalDisplay(
+            identity: identity,
+            candidates: [4, 5],
+            diagnostic: { ambiguousFailures.append($0) }
+        ) { id in
+            self.state(id: id)
+        })
+        XCTAssertEqual(ambiguousFailures, [.ambiguousMatch])
+    }
+
+    func testDuplicateReportedIdentityHasDistinctDiagnostic() {
+        var failures: [InternalDisplayIdentityFailure] = []
+
+        assertIdentityConflict(try matchInternalDisplay(
+            identity: identity,
+            candidates: [4, 5],
+            diagnostic: { failures.append($0) }
+        ) { id in
+            self.state(
+                id: id,
+                identityUUID: id == 4 ? self.identity : self.otherIdentity,
+                reportedIdentityUUID: self.otherIdentity
+            )
+        })
+        XCTAssertEqual(failures, [.duplicateReportedIdentity])
+    }
+
+    func testNotBuiltInDisplayHasDistinctDiagnostic() {
+        var failures: [InternalDisplayIdentityFailure] = []
+
+        assertIdentityConflict(try matchInternalDisplay(
+            identity: identity,
+            candidates: [5],
+            diagnostic: { failures.append($0) }
+        ) { _ in
+            self.state(id: 5, isBuiltIn: false)
+        })
+        XCTAssertEqual(failures, [.notBuiltIn])
+    }
+
+    func testHardwareMismatchAndMissingReportedIdentityHaveDistinctDiagnostics() {
+        let proof = InternalDisplayHardwareIdentity(bootSession: identity, registryEntryID: 42)
+        let otherProof = InternalDisplayHardwareIdentity(bootSession: identity, registryEntryID: 43)
+        var mismatchFailures: [InternalDisplayIdentityFailure] = []
+
+        assertIdentityConflict(try matchInternalDisplay(
+            identity: identity,
+            hardwareIdentity: proof,
+            candidates: [5],
+            diagnostic: { mismatchFailures.append($0) }
+        ) { _ in
+            self.state(
+                id: 5,
+                hardwareIdentity: otherProof,
+                reportedIdentityUUID: self.identity
+            )
+        })
+        XCTAssertEqual(mismatchFailures, [.hardwareMismatch])
+
+        var missingReportedFailures: [InternalDisplayIdentityFailure] = []
+        assertIdentityConflict(try matchInternalDisplay(
+            identity: identity,
+            hardwareIdentity: proof,
+            candidates: [6],
+            diagnostic: { missingReportedFailures.append($0) }
+        ) { _ in
+            self.state(
+                id: 6,
+                identityUUID: self.otherIdentity,
+                hardwareIdentity: proof
+            )
+        })
+        XCTAssertEqual(missingReportedFailures, [.missingReportedIdentity])
     }
 
     func testReadErrorPropagates() {
         enum ReadError: Error, Equatable { case failed }
+        var failures: [InternalDisplayIdentityFailure] = []
 
-        XCTAssertThrowsError(try matchInternalDisplay(identity: identity, candidates: [5]) { _ in
+        XCTAssertThrowsError(try matchInternalDisplay(
+            identity: identity,
+            candidates: [5],
+            diagnostic: { failures.append($0) }
+        ) { _ in
             throw ReadError.failed
         }) {
             XCTAssertEqual($0 as? ReadError, .failed)
         }
+        XCTAssertTrue(failures.isEmpty)
     }
 
     func testCodableRoundTrip() throws {

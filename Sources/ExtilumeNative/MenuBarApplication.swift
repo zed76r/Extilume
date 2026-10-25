@@ -15,18 +15,19 @@ extension PrimaryController: PrimaryApplicationControlling {}
 
 @MainActor
 public func runMenuBarApplication() throws {
+    let applicationLease = try acquireApplicationControlLease()
     let directory = try applicationStateDirectory(arguments: Array(CommandLine.arguments.dropFirst())) {
         try FileManager.default.url(
             for: .applicationSupportDirectory, in: .userDomainMask,
             appropriateFor: nil, create: true
         )
     }
-    let controller = try PrimaryController(directory: directory)
+    let controller = try DisplayModeCoordinator(directory: directory)
     let application = NSApplication.shared
-    let delegate = MenuBarApplicationDelegate(controllerFactory: { controller })
+    let delegate = MenuBarApplicationDelegate(controllerFactory: { controller }, developmentBuild: true)
     application.delegate = delegate
     application.setActivationPolicy(.accessory)
-    withExtendedLifetime(delegate) { application.run() }
+    withExtendedLifetime((delegate, applicationLease)) { application.run() }
 }
 
 @MainActor
@@ -39,10 +40,14 @@ final class MenuBarApplicationDelegate: NSObject, NSApplicationDelegate {
     private var controller: (any PrimaryApplicationControlling)?
     private var statusItem: NSStatusItem?
     private var signals: [DispatchSourceSignal] = []
+    private let fixedModeItem = NSMenuItem(title: "模式：外屏主屏", action: nil, keyEquivalent: "")
+    private var modeItems: [NSMenuItem] = []
+    private var statusMode: DisplayApplicationMode?
     private let stateItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
     private let retryItem = NSMenuItem(title: "重试", action: nil, keyEquivalent: "")
     private let recoverItem = NSMenuItem(title: "重试恢复", action: nil, keyEquivalent: "")
-    private let confirmItem = NSMenuItem(title: "保留当前配置", action: nil, keyEquivalent: "")
+    private let restoreForConfigurationItem = NSMenuItem(title: "恢复双屏以调整排列", action: nil, keyEquivalent: "")
+    private let confirmItem = NSMenuItem(title: "设为恢复布局", action: nil, keyEquivalent: "")
     private let settingsItem = NSMenuItem(title: "打开显示设置", action: nil, keyEquivalent: "")
     private let quitItem = NSMenuItem(title: "退出并恢复", action: nil, keyEquivalent: "q")
     private var status: PrimarySessionStatus = .waiting
@@ -53,6 +58,7 @@ final class MenuBarApplicationDelegate: NSObject, NSApplicationDelegate {
 
     init(
         controllerFactory: @escaping () throws -> any PrimaryApplicationControlling,
+        developmentBuild: Bool = false,
         requestTermination: @escaping () -> Void = { NSApplication.shared.terminate(nil) },
         replyTermination: @escaping (Bool) -> Void = { NSApplication.shared.reply(toApplicationShouldTerminate: $0) },
         openSettings: @escaping (URL) -> Void = { NSWorkspace.shared.open($0) }
@@ -63,10 +69,14 @@ final class MenuBarApplicationDelegate: NSObject, NSApplicationDelegate {
         self.openSettings = openSettings
         super.init()
         menu.autoenablesItems = false
-        let mode = NSMenuItem(title: "模式：外屏主屏", action: nil, keyEquivalent: "")
-        mode.isEnabled = false
+        fixedModeItem.isEnabled = false
         stateItem.isEnabled = false
-        menu.addItem(mode)
+        if developmentBuild {
+            let developmentItem = NSMenuItem(title: "开发版 · 仅外屏尚未准入日用", action: nil, keyEquivalent: "")
+            developmentItem.isEnabled = false
+            menu.addItem(developmentItem)
+        }
+        menu.addItem(fixedModeItem)
         menu.addItem(stateItem)
         menu.addItem(.separator())
         retryItem.target = self
@@ -75,6 +85,8 @@ final class MenuBarApplicationDelegate: NSObject, NSApplicationDelegate {
         recoverItem.target = self
         recoverItem.action = #selector(retryRecovery)
         menu.addItem(recoverItem)
+        restoreForConfigurationItem.target = self
+        restoreForConfigurationItem.action = #selector(restoreForConfiguration)
         confirmItem.target = self
         confirmItem.action = #selector(confirmCurrentConfiguration)
         menu.addItem(confirmItem)
@@ -127,6 +139,21 @@ final class MenuBarApplicationDelegate: NSObject, NSApplicationDelegate {
         do {
             let controller = try controllerFactory()
             self.controller = controller
+            if let selector = controller as? any DisplayModeSelecting {
+                if modeItems.isEmpty {
+                    menu.removeItem(fixedModeItem)
+                    menu.insertItem(restoreForConfigurationItem, at: menu.index(of: confirmItem))
+                    for (index, mode) in DisplayApplicationMode.allCases.enumerated() {
+                        let item = NSMenuItem(title: mode.title, action: #selector(selectMode(_:)), keyEquivalent: "")
+                        item.target = self
+                        item.representedObject = mode.rawValue
+                        menu.insertItem(item, at: index)
+                        modeItems.append(item)
+                    }
+                }
+                selector.modeDidChange = { [weak self] in self?.render() }
+            }
+            render()
             controller.startApplication(registerEvents: true, recoveryOnly: recoveryOnly) { [weak self] status in
                 DispatchQueue.main.async { [weak self] in self?.receive(status) }
             }
@@ -142,6 +169,11 @@ final class MenuBarApplicationDelegate: NSObject, NSApplicationDelegate {
         print("会话状态：\(newStatus.text)")
         guard !terminationPending || newStatus == .quitWaitingForDisplays else { return }
         status = newStatus
+        statusMode = modeSelector?.selectedMode
+        if newStatus == .applying {
+            render()
+            return
+        }
         recoveryInProgress = false
         confirmationInProgress = false
         if quitAfterRecovery {
@@ -155,10 +187,55 @@ final class MenuBarApplicationDelegate: NSObject, NSApplicationDelegate {
         render()
     }
 
+    private var modeSelector: (any DisplayModeSelecting)? { controller as? any DisplayModeSelecting }
+
+    private var canSelectMode: Bool {
+        controller != nil && !recoveryInProgress && !confirmationInProgress && !terminationPending
+            && !status.needsRecovery && status != .applying && status != .restoringAndQuitting
+            && status != .manualConfigurationForQuit
+    }
+
+    private var canRestoreForConfiguration: Bool {
+        modeSelector?.selectedMode == .externalOnly && status == .applied
+            && statusMode == .externalOnly && modeSelector?.requiresExplicitActivation == false && canSelectMode
+    }
+
+    private var statusText: String {
+        guard let selector = modeSelector else { return status.text }
+        if status.needsRecovery || status == .restoringAndQuitting || status == .manualConfigurationForQuit {
+            return status.text
+        }
+        guard let mode = selector.selectedMode else { return "请选择显示模式" }
+        if selector.requiresExplicitActivation { return "已选择仅外屏，等待点击模式应用" }
+        if status == .applied && statusMode != mode { return "已选择模式，尚未应用" }
+        if mode == .externalOnly {
+            switch status {
+            case .applying: return "正在停用内屏…"
+            case .applied: return "仅外屏已生效"
+            case .manualConfiguration: return "双屏已恢复，可调整或确认排列"
+            default: break
+            }
+        }
+        return status.text
+    }
+
+    var accessibilityStatusLabel: String {
+        let mode = modeSelector.map { $0.selectedMode?.title ?? "未选择" } ?? "外屏主屏"
+        return "Extilume，模式：\(mode)，\(stateItem.title)"
+    }
+
     private func render() {
         let busy = recoveryInProgress || confirmationInProgress || terminationPending
-        let text = confirmationInProgress ? "正在保留当前配置…" : (recoveryInProgress ? "正在恢复…" : status.text)
+        let text = confirmationInProgress ? "正在确认排列…" : (recoveryInProgress ? "正在恢复…" : statusText)
         stateItem.title = text
+        let externalOnly = modeSelector?.selectedMode == .externalOnly
+        let modeIsApplied = status == .applied && statusMode == modeSelector?.selectedMode
+            && modeSelector?.requiresExplicitActivation == false && !busy
+        for item in modeItems {
+            item.state = modeIsApplied && item.representedObject as? String == statusMode?.rawValue ? .on : .off
+            item.isEnabled = canSelectMode
+        }
+        retryItem.title = status == .manualConfiguration ? (externalOnly ? "应用仅外屏" : "设为外屏主屏") : "重试"
         retryItem.isHidden = !status.canRetryApplication
         retryItem.isEnabled = status.canRetryApplication && !busy
         recoverItem.isHidden = !status.canRetryRecovery
@@ -167,15 +244,42 @@ final class MenuBarApplicationDelegate: NSObject, NSApplicationDelegate {
             ? "请打开笔记本上盖或接回原外接显示器，再点“重试恢复”以恢复并退出。" : nil
         stateItem.toolTip = recoveryHint
         recoverItem.toolTip = recoveryHint
-        confirmItem.isHidden = !status.canConfirmConfiguration
-        confirmItem.isEnabled = status.canConfirmConfiguration && controller != nil && !busy
+        restoreForConfigurationItem.isHidden = !canRestoreForConfiguration
+        restoreForConfigurationItem.isEnabled = canRestoreForConfiguration
+        restoreForConfigurationItem.toolTip = "先恢复双屏，再调整排列并设为恢复布局；不会自动重新停用内屏。"
+        let canConfirm = (status.canConfirmConfiguration && !(externalOnly && status == .quitFailed))
+            || (externalOnly && status == .manualConfiguration)
+        confirmItem.isHidden = !canConfirm
+        confirmItem.isEnabled = canConfirm && controller != nil && !busy
         confirmItem.toolTip = status == .quitFailed
-            ? "仅保存当前配置作为恢复目标；不会恢复自动接管，请再次退出并恢复。"
-            : "仅保存当前配置作为恢复目标；下一次连接或唤醒时才重新应用外屏主屏。若已请求退出，则不再自动接管。"
+            ? "将当前排列设为退出时的恢复目标，不切换主屏；保存后请再次点“退出并恢复”。"
+            : "将当前排列设为退出时的恢复目标，不会立即切换主屏。保存后可点“设为外屏主屏”，也可等待下一次连接或唤醒。若已请求退出，则不再自动接管。"
+        if externalOnly {
+            confirmItem.toolTip = status == .quitFailed
+                ? "将当前排列设为退出时的恢复目标，不停用内屏；保存后请再次点“退出并恢复”。"
+                : "将当前排列设为退出时的恢复目标，不会立即停用内屏。保存后请点“应用仅外屏”或再次点击已选模式。"
+        }
         settingsItem.isEnabled = !confirmationInProgress
         quitItem.isEnabled = status.canQuit && !busy
-        statusItem?.button?.setAccessibilityLabel("Extilume，模式：外屏主屏，\(text)")
+        statusItem?.button?.setAccessibilityLabel(accessibilityStatusLabel)
         statusItem?.button?.toolTip = "Extilume：\(text)"
+    }
+
+    @objc private func selectMode(_ sender: NSMenuItem) {
+        guard canSelectMode, let selector = modeSelector,
+              let rawValue = sender.representedObject as? String,
+              let mode = DisplayApplicationMode(rawValue: rawValue) else { return }
+        status = .applying
+        render()
+        selector.selectMode(mode)
+        render()
+    }
+
+    @objc private func restoreForConfiguration() {
+        guard canRestoreForConfiguration, let selector = modeSelector else { return }
+        recoveryInProgress = true
+        render()
+        selector.restoreForConfiguration()
     }
 
     @objc private func retryApplication() {
@@ -210,7 +314,10 @@ final class MenuBarApplicationDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func confirmCurrentConfiguration() {
-        guard status.canConfirmConfiguration, !recoveryInProgress, !confirmationInProgress,
+        let canConfirm = (status.canConfirmConfiguration
+            && !(modeSelector?.selectedMode == .externalOnly && status == .quitFailed))
+            || (modeSelector?.selectedMode == .externalOnly && status == .manualConfiguration)
+        guard canConfirm, !recoveryInProgress, !confirmationInProgress,
               !terminationPending, let controller else { return }
         confirmationInProgress = true
         render()

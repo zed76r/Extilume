@@ -1,6 +1,6 @@
 import Foundation
 
-public struct DisplayOrigin: Codable, Equatable {
+public struct DisplayOrigin: Codable, Equatable, Sendable {
     public let x: Int32
     public let y: Int32
 
@@ -10,7 +10,7 @@ public struct DisplayOrigin: Codable, Equatable {
     }
 }
 
-public struct DisplayLayout: Codable, Equatable {
+public struct DisplayLayout: Codable, Equatable, Sendable {
     public let main: UUID
     public let origins: [UUID: DisplayOrigin]
 
@@ -36,7 +36,7 @@ public enum ConfigurationSource: Equatable {
     case unknown
 }
 
-public enum TransactionPhase: String, Codable {
+public enum TransactionPhase: String, Codable, Sendable {
     case prepared
     case applying
     case owned
@@ -44,7 +44,7 @@ public enum TransactionPhase: String, Codable {
     case restored
 }
 
-public struct InternalDisplayHardwareIdentity: Codable, Equatable {
+public struct InternalDisplayHardwareIdentity: Codable, Equatable, Sendable {
     public let bootSession: UUID
     public let registryEntryID: UInt64
 
@@ -61,7 +61,7 @@ public struct InternalDisplayHardwareIdentity: Codable, Equatable {
     }
 }
 
-public struct InternalDisplayResponsibility: Codable, Equatable {
+public struct InternalDisplayResponsibility: Codable, Equatable, Sendable {
     public let identity: UUID
     public fileprivate(set) var baseline: Bool
     public private(set) var applied: Bool
@@ -100,7 +100,7 @@ public struct LayoutRestorePlan: Equatable {
     public let missing: Set<UUID>
 }
 
-public struct RecoveryRecord: Codable, Equatable {
+public struct RecoveryRecord: Codable, Equatable, Sendable {
     public let version: Int
     public let session: UUID
     public private(set) var generation: UInt64
@@ -111,6 +111,7 @@ public struct RecoveryRecord: Codable, Equatable {
     public private(set) var layoutPending: Bool
     public private(set) var internalDisplay: InternalDisplayResponsibility?
     public private(set) var sourceUnresolved: Bool
+    public private(set) var independentGuardVerified: Bool?
 
     public var requiresRecovery: Bool { layoutPending || internalDisplay?.pending == true }
     public var canClear: Bool { phase == .restored && !requiresRecovery && !sourceUnresolved }
@@ -131,6 +132,7 @@ public struct RecoveryRecord: Codable, Equatable {
         self.layoutPending = baseline != target
         self.internalDisplay = internalDisplay
         self.sourceUnresolved = false
+        self.independentGuardVerified = nil
         try validate()
     }
 
@@ -176,12 +178,16 @@ public struct RecoveryRecord: Codable, Equatable {
         let layoutFormatValid = version == 1
             ? preDisableLayout == nil && fullLayout
             : preDisableLayout == nil ? fullLayout : validSubset
+        let independentGuardVerificationValid = independentGuardVerified.map {
+            $0 && canClear && internalDisplay != nil
+        } ?? true
         guard (version == 1 || version == 2 || version == 3), hardwareIdentityValid, generation > 0,
               internalDisplay?.numericIDHint != 0,
               baseline.origins[baseline.main] == DisplayOrigin(x: 0, y: 0),
               applied.origins[applied.main] == DisplayOrigin(x: 0, y: 0),
               layoutFormatValid,
               internalDisplay.map({ baseline.origins[$0.identity] != nil }) ?? true,
+              independentGuardVerificationValid,
               phase != .restored || (!requiresRecovery && !sourceUnresolved),
               (phase != .prepared && phase != .applying) || layoutPending == (baseline != applied),
               (phase != .prepared && phase != .applying) || internalDisplay.map({ $0.pending == ($0.baseline != $0.applied) }) ?? true else { throw RecoveryError.invalidRecord }
@@ -261,6 +267,10 @@ public struct RecoveryRecord: Codable, Equatable {
         }
         let present = Set(actual.origins.keys)
         let recorded = Set(baseline.origins.keys)
+        if source == .reconnect, actual == applied {
+            layoutPending = baseline != applied
+            return
+        }
         if present != recorded {
             guard source != .confirmedUser, present.isSubset(of: recorded) else {
                 sourceUnresolved = true
@@ -320,11 +330,20 @@ public struct RecoveryRecord: Codable, Equatable {
             responsibility.pending = responsibility.baseline != responsibility.applied
             internalDisplay = responsibility
         }
+        independentGuardVerified = nil
         phase = .prepared
     }
 
     public mutating func beginRestoration() {
+        independentGuardVerified = nil
         phase = .restoring
+    }
+
+    public mutating func confirmIndependentGuardVerification() throws {
+        try validate()
+        guard canClear, internalDisplay != nil else { throw RecoveryError.invalidTransition }
+        independentGuardVerified = true
+        try validate()
     }
 
     public func layoutRestorePlan(connected: [ConnectedDisplay], current: DisplayLayout) throws -> LayoutRestorePlan {
@@ -401,6 +420,7 @@ public struct RecoveryRecord: Codable, Equatable {
         guard current == baseline, internalEnabled else { throw RecoveryError.unresolvedSource }
 
         var resumed = self
+        resumed.independentGuardVerified = nil
         resumed.phase = .owned
         try resumed.validate()
         self = resumed

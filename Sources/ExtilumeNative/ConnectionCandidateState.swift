@@ -1,7 +1,20 @@
-enum ExternalConnectionService: String, CaseIterable {
+enum ExternalConnectionService: String, CaseIterable, Encodable, Sendable {
     case device = "DCPAVDeviceProxy"
     case service = "DCPAVServiceProxy"
     case videoInterface = "DCPAVVideoInterfaceProxy"
+}
+
+enum ConnectionCandidateRole: String, Encodable, Sendable {
+    case unidentified
+    case unregistered
+    case registeredExternal
+    case registeredEmbedded
+    case retiredEmbedded
+}
+
+struct ConnectionCandidateDiagnostic: Encodable, Equatable, Sendable {
+    let role: ConnectionCandidateRole
+    let service: ExternalConnectionService?
 }
 
 struct ConnectionCandidateState {
@@ -11,6 +24,43 @@ struct ConnectionCandidateState {
     private var retiredEmbedded: Set<UInt64> = []
 
     var hasCandidates: Bool { !services.isEmpty }
+
+    func reconfigurationCandidates(registered: Set<UInt64>, internalDisplayID: UInt32?) -> [UInt64: ExternalConnectionService]? {
+        guard let internalDisplayID, internalDisplayID != 0, !invalidated,
+              services.count == ExternalConnectionService.allCases.count,
+              Set(services.values) == Set(ExternalConnectionService.allCases),
+              Set(services.keys).isSubset(of: registered) else { return nil }
+        return services
+    }
+
+    func permitsProtectionInformation(
+        entryID: UInt64, messageType: UInt32, messageArgument: ConnectionObservedArgument,
+        interestRegistered: Bool, internalDisplayID: UInt32?
+    ) -> Bool {
+        guard let internalDisplayID, internalDisplayID != 0, interestRegistered,
+              !invalidated, entryID != 0, services[entryID] != nil,
+              messageType == 0xe0115006 else { return false }
+        switch messageArgument {
+        case .zero, .one, .two: return true
+        case .other: return false
+        }
+    }
+
+    func diagnosticCandidate(entryID: UInt64) -> ConnectionCandidateDiagnostic {
+        guard entryID > 0 else {
+            return ConnectionCandidateDiagnostic(role: .unidentified, service: nil)
+        }
+        if retiredEmbedded.contains(entryID) {
+            return ConnectionCandidateDiagnostic(role: .retiredEmbedded, service: embeddedServices[entryID])
+        }
+        if let service = services[entryID] {
+            return ConnectionCandidateDiagnostic(role: .registeredExternal, service: service)
+        }
+        if let service = embeddedServices[entryID] {
+            return ConnectionCandidateDiagnostic(role: .registeredEmbedded, service: service)
+        }
+        return ConnectionCandidateDiagnostic(role: .unregistered, service: nil)
+    }
 
     mutating func matched(
         entryID: UInt64,

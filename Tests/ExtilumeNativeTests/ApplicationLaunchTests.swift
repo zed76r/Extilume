@@ -110,6 +110,21 @@ final class ApplicationLaunchTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: missingSupport.appendingPathComponent("Extilume").path))
     }
 
+    @MainActor
+    func testApplicationLeaseBlocksSeparateProfilesAndReleasesAfterLegacyConflict() throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let lock = root.appendingPathComponent("owner", isDirectory: true)
+        var first: RecoveryStore? = try acquireApplicationControlLease(directory: lock, hasOtherApplication: { false })
+        XCTAssertThrowsError(try acquireApplicationControlLease(directory: lock, hasOtherApplication: { false }))
+        XCTAssertNotNil(first)
+        first = nil
+        XCTAssertThrowsError(try acquireApplicationControlLease(directory: lock, hasOtherApplication: { true })) { error in
+            XCTAssertEqual(error as? ApplicationLaunchError, .anotherApplicationRunning)
+        }
+        XCTAssertNoThrow(try acquireApplicationControlLease(directory: lock, hasOtherApplication: { false }))
+    }
+
     private func makeTemporaryDirectory() throws -> URL {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("ExtilumeApplicationLaunch-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])

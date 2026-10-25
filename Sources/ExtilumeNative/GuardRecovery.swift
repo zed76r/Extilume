@@ -2,6 +2,7 @@ import CoreGraphics
 import Darwin
 import ExtilumeCore
 import Foundation
+import Dispatch
 
 extension Snapshot {
     func canonicalizingInternalDisplay(
@@ -45,14 +46,16 @@ extension Snapshot {
 }
 
 func freshGuardSnapshot(
-    responsibility: InternalDisplayResponsibility?, numericIDHint: UInt32?
+    responsibility: InternalDisplayResponsibility?, numericIDHint: UInt32?,
+    diagnosticRole: InternalLifecycleRole = .controller
 ) throws -> Snapshot {
     let snapshot = try freshSnapshot()
     guard let responsibility, let hardware = responsibility.hardwareIdentity else { return snapshot }
     guard let id = snapshot.displays.first(where: { $0.identity == .builtIn })?.id ?? numericIDHint else {
         throw RecoveryError.identityConflict
     }
-    let state = try freshInternalDisplay(identity: responsibility.identity, numericIDHint: id, hardwareIdentity: hardware)
+    let state = try freshInternalDisplay(identity: responsibility.identity, numericIDHint: id,
+                                        hardwareIdentity: hardware, diagnosticRole: diagnosticRole)
     return try snapshot.canonicalizingInternalDisplay(identity: responsibility.identity, hardwareIdentity: hardware, state: state)
 }
 
@@ -63,32 +66,65 @@ func recoverInternalRecord(directory: URL) throws {
     guard let record = try store.load(), let responsibility = record.internalDisplay, responsibility.baseline else {
         throw RecoveryError.invalidRecord
     }
-    let hint: UInt32
-    if let saved = responsibility.numericIDHint {
-        hint = saved
-    } else {
-        let snapshot = try freshActiveSnapshot()
-        hint = try snapshot.builtInDisplay(identity: responsibility.identity).id
-    }
+    let powerGate = InternalPowerGate()
+    let wake = DispatchSemaphore(value: 0)
+    let observer = InternalSystemPowerObserver(
+        prepareForSleep: { powerGate.willSleep() },
+        didPrepareForSleep: { accepted, acknowledged in
+            if accepted { powerGate.didAcknowledgeSleep(acknowledged) }
+            wake.signal()
+        },
+        didWake: { powerGate.didWake(); wake.signal() },
+        onFailure: { powerGate.invalidate(); wake.signal() }
+    )
+    try observer.start()
+    defer { observer.stop() }
+    powerGate.didRegister()
     let contract = try ProtectionHandshake(
         session: record.session, generation: record.generation, parentPID: getpid(),
         internalDisplayIdentity: responsibility.identity, internalDisplayHardwareIdentity: responsibility.hardwareIdentity
     )
     let transaction = try DisplayEnableTransaction()
-    _ = try recoverGuardRecord(
-        store: store, contract: contract,
-        snapshotReader: { try freshGuardSnapshot(responsibility: responsibility, numericIDHint: hint) },
-        internalReader: { try freshInternalDisplay(identity: $0, numericIDHint: hint, hardwareIdentity: responsibility.hardwareIdentity) },
-        enableInternal: { restoring in
-            try transaction.enableInternalForRecovery(
-                record: restoring, loadRecord: { try store.load() },
-                trace: { traceInternalLifecycle($0, role: .recoveryEntry, cgError: $1) },
-                internalReader: { try freshInternalDisplay(identity: $0, numericIDHint: hint, hardwareIdentity: responsibility.hardwareIdentity) }
+    while true {
+        do {
+            try powerGate.check()
+            let hint: UInt32
+            if let saved = responsibility.numericIDHint {
+                hint = saved
+            } else {
+                hint = try freshActiveSnapshot().builtInDisplay(identity: responsibility.identity).id
+            }
+            _ = try recoverGuardRecord(
+                store: store, contract: contract,
+                snapshotReader: { try freshGuardSnapshot(responsibility: responsibility, numericIDHint: hint,
+                                                        diagnosticRole: .recoveryEntry) },
+                internalReader: { try freshInternalDisplay(identity: $0, numericIDHint: hint,
+                                                          hardwareIdentity: responsibility.hardwareIdentity,
+                                                          diagnosticRole: .recoveryEntry) },
+                enableInternal: { restoring in
+                    try transaction.enableInternalForRecovery(
+                        record: restoring, loadRecord: { try store.load() },
+                        trace: { traceInternalLifecycle($0, role: .recoveryEntry, cgError: $1) },
+                        nativeCall: { try powerGate.perform($0) },
+                        internalReader: {
+                            try powerGate.check()
+                            return try freshInternalDisplay(identity: $0, numericIDHint: hint,
+                                                            hardwareIdentity: responsibility.hardwareIdentity,
+                                                            diagnosticRole: .recoveryEntry)
+                        }
+                    )
+                },
+                originWriter: { _, origins in try configureOrigins(origins, option: .forSession, nativeCall: { try powerGate.perform($0) }) },
+                layoutRejected: { traceInternalLifecycle(.layoutRestoreRejected, role: .recoveryEntry, succeeded: false, recoveryLayout: $0) },
+                trace: { traceInternalLifecycle($0, role: .recoveryEntry) },
+                checkAccess: { try powerGate.check() }
             )
-        },
-        originWriter: { try configureOrigins($0, option: .forSession) },
-        trace: { traceInternalLifecycle($0, role: .recoveryEntry) }
-    )
+            if powerGate.beginExitAfterRecovery() { return }
+        } catch InternalPowerGateError.suspended {
+            // 责任和独占归属跨休眠保留；电源队列继续及时确认。
+        }
+        wake.wait()
+    }
 }
 
 // 调用者须持有目录独占锁；成功仅保存已恢复责任，不清除记录。
@@ -98,19 +134,26 @@ func recoverGuardRecord(
     snapshotReader: () throws -> Snapshot,
     internalReader: (UUID) throws -> InternalDisplayState,
     enableInternal: (RecoveryRecord) throws -> Void,
-    originWriter: ([UInt32: DisplayOrigin]) throws -> Void,
-    trace: (InternalLifecycleStage) -> Void = { _ in }
+    originWriter: (RecoveryRecord, [UInt32: DisplayOrigin]) throws -> Void,
+    layoutRejected: (InternalRecoveryLayoutContext) -> Void = { _ in },
+    trace: (InternalLifecycleStage) -> Void = { _ in },
+    checkAccess: () throws -> Void = {}
 ) throws -> RecoveryRecord {
+    try checkAccess()
     trace(.restorationStarted)
     func readInternal(_ identity: UUID) throws -> InternalDisplayState {
+        try checkAccess()
         trace(.internalReadStarted)
         let state = try internalReader(identity)
+        try checkAccess()
         trace(.internalReadFinished)
         return state
     }
     func readSnapshot() throws -> Snapshot {
+        try checkAccess()
         trace(.layoutReadStarted)
         let snapshot = try snapshotReader()
+        try checkAccess()
         trace(.layoutReadFinished)
         return snapshot
     }
@@ -123,8 +166,38 @@ func recoverGuardRecord(
         guard record.baseline == record.applied else { throw RecoveryError.invalidRecord }
     }
 
+    var observedLayout: Snapshot?
+    if record.phase == .owned, !record.sourceUnresolved, !record.layoutPending,
+       let responsibility = record.internalDisplay, !responsibility.pending,
+       responsibility.baseline, !responsibility.applied,
+       record.applied.origins[responsibility.identity] == nil,
+       let hardware = responsibility.hardwareIdentity {
+        let before = try readSnapshot()
+        observedLayout = before
+        let current = try before.layout()
+        if current == record.applied {
+            let internalState = try readInternal(responsibility.identity)
+            let candidate = try before.builtInDisplay(identity: responsibility.identity)
+            guard internalState.matches(identity: responsibility.identity, hardwareIdentity: hardware),
+                  candidate.id == internalState.id,
+                  candidate.isOnline == internalState.isOnline,
+                  candidate.isActive == internalState.isActive,
+                  !internalState.isEnabled else { throw RecoveryError.identityConflict }
+            var reappeared = record
+            try reappeared.observe(current, source: .reconnect)
+            try reappeared.observeInternalEnabled(false, source: .reconnect)
+            try checkAccess()
+            guard try store.load() == record else { throw RecoveryError.unfinishedTransaction }
+            try store.save(reappeared)
+            record = reappeared
+            observedLayout = nil
+        }
+    }
+
     if !record.canClear {
         if record.phase != .restoring {
+            try checkAccess()
+            guard try store.load() == record else { throw RecoveryError.unfinishedTransaction }
             record.beginRestoration()
             try store.save(record)
         }
@@ -142,11 +215,16 @@ func recoverGuardRecord(
                 throw RecoveryError.unfinishedTransaction
             }
         }
-        let before = try readSnapshot()
+        let before = try observedLayout ?? readSnapshot()
         let current = try before.layout()
         let connected = try before.connected()
         if !record.sourceUnresolved || current != record.baseline {
-            let plan = try record.layoutRestorePlan(connected: connected, current: current)
+            let plan: LayoutRestorePlan
+            do { plan = try record.layoutRestorePlan(connected: connected, current: current) }
+            catch {
+                layoutRejected(InternalRecoveryLayoutContext(record: record, current: current))
+                throw error
+            }
             if !plan.origins.isEmpty {
                 let fresh = try readSnapshot()
                 guard try fresh.layout() == current,
@@ -154,7 +232,7 @@ func recoverGuardRecord(
                       try fresh.connected().allSatisfy({ connected.contains($0) }),
                       try store.load() == record else { throw RecoveryError.unfinishedTransaction }
                 trace(.originsStarted)
-                try originWriter(plan.origins)
+                try originWriter(record, plan.origins)
                 trace(.originsFinished)
             }
             guard plan.missing.isEmpty else { throw RecoveryError.unfinishedTransaction }
@@ -168,6 +246,7 @@ func recoverGuardRecord(
         guard display.matches(identity: $0.identity, hardwareIdentity: $0.hardwareIdentity) else { throw RecoveryError.identityConflict }
         return display.isEnabled
     }
+    try checkAccess()
     guard try store.load() == record else { throw RecoveryError.unfinishedTransaction }
     if record.canClear {
         guard layout == record.baseline,

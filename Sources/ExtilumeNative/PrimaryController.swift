@@ -5,7 +5,7 @@ import ExtilumeCore
 import Foundation
 
 private enum PrimaryError: Error {
-    case unsupported, unstable, transactionFailed, readbackMismatch, superseded
+    case unsupported, unstable, transactionFailed, readbackMismatch, superseded, previousConfigurationChanged
 }
 
 extension Snapshot {
@@ -44,22 +44,23 @@ func stableSnapshot(activeOnly: Bool = false) throws -> Snapshot {
 }
 
 func configureOrigins(_ origins: [UInt32: DisplayOrigin], option: CGConfigureOption,
+                      nativeCall: DisplayEnableTransaction.NativeCall = { $0() },
                       validateBeforeCommit: () throws -> Void = {}) throws {
     guard !origins.isEmpty else { return }
     try validateBeforeCommit()
     var configuration: CGDisplayConfigRef?
-    guard CGBeginDisplayConfiguration(&configuration) == .success, let configuration else {
+    guard try nativeCall({ CGBeginDisplayConfiguration(&configuration) }) == .success, let configuration else {
         throw PrimaryError.transactionFailed
     }
     var completed = false
     defer { if !completed { CGCancelDisplayConfiguration(configuration) } }
     for (id, origin) in origins.sorted(by: { $0.key < $1.key }) {
-        guard CGConfigureDisplayOrigin(configuration, id, origin.x, origin.y) == .success else {
+        guard try nativeCall({ CGConfigureDisplayOrigin(configuration, id, origin.x, origin.y) }) == .success else {
             throw PrimaryError.transactionFailed
         }
     }
     try validateBeforeCommit()
-    let completion = CGCompleteDisplayConfiguration(configuration, option)
+    let completion = try nativeCall { CGCompleteDisplayConfiguration(configuration, option) }
     completed = true // SDK 规定 Complete 返回后句柄无效，包括失败返回。
     guard completion == .success else {
         throw PrimaryError.transactionFailed
@@ -99,6 +100,7 @@ final class PrimaryController: @unchecked Sendable {
 
     init(
         directory: URL,
+        recoveryStore: RecoveryStore? = nil,
         snapshotReader: @escaping @Sendable () throws -> Snapshot = { try freshSnapshot() },
         originWriter: @escaping @Sendable ([UInt32: DisplayOrigin], CGConfigureOption) throws -> Void = { try configureOrigins($0, option: $1) },
         lidReader: @escaping @Sendable () -> String = { clamshellState() }
@@ -107,7 +109,7 @@ final class PrimaryController: @unchecked Sendable {
         self.originWriter = originWriter
         self.lidReader = lidReader
         reapplication = PrimaryReapplicationScheduler(ownerQueue: queue)
-        store = try RecoveryStore(directory: directory)
+        store = try recoveryStore ?? RecoveryStore(directory: directory)
         try store.acquireExclusiveOwnership()
     }
 
@@ -208,8 +210,12 @@ final class PrimaryController: @unchecked Sendable {
                 self.reapplication.cancel()
                 return
             }
-            if self.statusHandler != nil, self.applicationStatus.needsRecovery, !self.priorResponsibility {
+            if self.statusHandler != nil, self.applicationStatus.needsRecovery {
                 self.reapplication.cancel()
+                if self.priorResponsibility, !sleeping, lid == "开盖",
+                   !disconnected && (connected || self.applicationResumePending) {
+                    self.scheduleReapplication()
+                }
                 return
             }
             if self.applicationResumePending, !sleeping, lid == "开盖" {
@@ -294,6 +300,9 @@ final class PrimaryController: @unchecked Sendable {
                     do {
                         try self.reconcilePreviousApplication()
                         self.publish(.waiting)
+                    } catch PrimaryError.previousConfigurationChanged {
+                        self.publish(.unconfirmed)
+                        return
                     } catch { self.publish(.recoveryIncomplete); return }
                 }
                 self.performApplication(isCurrent: isCurrent)
@@ -353,6 +362,8 @@ final class PrimaryController: @unchecked Sendable {
                 try reconcilePreviousApplication()
                 if recoveryOnly { publish(.applicationFailedRestored) }
                 else { performApplication() }
+            } catch PrimaryError.previousConfigurationChanged {
+                publish(.unconfirmed)
             } catch {
                 publish(.recoveryIncomplete)
             }
@@ -396,7 +407,9 @@ final class PrimaryController: @unchecked Sendable {
                 publish(.applicationFailedRestored)
             } catch {
                 if stopping { publish(quitRecoveryFailureStatus()) }
-                else if !priorResponsibility, record?.phase == .owned, record?.sourceUnresolved == true {
+                else if case PrimaryError.previousConfigurationChanged = error {
+                    publish(.unconfirmed)
+                } else if !priorResponsibility, record?.phase == .owned, record?.sourceUnresolved == true {
                     publish(.unconfirmed)
                 } else { publish(.recoveryIncomplete) }
             }
@@ -411,9 +424,9 @@ final class PrimaryController: @unchecked Sendable {
             activeApplicationRequestIdentifier = request
             defer { activeApplicationRequestIdentifier = nil; endApplicationRequest(request) }
             reapplication.cancel()
-            guard applicationStatus.canConfirmConfiguration, !priorResponsibility,
-                  let original = record, original.phase == .owned,
-                  original.internalDisplay == nil, original.sourceUnresolved else {
+            guard applicationStatus.canConfirmConfiguration,
+                  let original = record, original.internalDisplay == nil,
+                  priorResponsibility ? original.canClear : (original.phase == .owned && original.sourceUnresolved) else {
                 publish(.confirmationFailed)
                 return
             }
@@ -429,8 +442,15 @@ final class PrimaryController: @unchecked Sendable {
                 guard applicationRequestLock.withLock({ configurationEpoch == epoch && !applicationSleepRequested }) else {
                     throw PrimaryError.superseded
                 }
-                var candidate = original
-                try candidate.observe(layout, source: .confirmedUser)
+                var candidate: RecoveryRecord
+                if priorResponsibility {
+                    // 显式选择 D 替代旧目标；原子保存，不把旧 C 追认为退出终验通过。
+                    candidate = try RecoveryRecord(baseline: layout, target: layout)
+                    try candidate.confirmApplied(layout)
+                } else {
+                    candidate = original
+                    try candidate.observe(layout, source: .confirmedUser)
+                }
                 guard candidate.baseline == layout, !candidate.sourceUnresolved, !candidate.layoutPending,
                       try snapshotReader() == snapshot,
                       lidReader() == "开盖" else { throw PrimaryError.unstable }
@@ -439,9 +459,10 @@ final class PrimaryController: @unchecked Sendable {
                     // 最后核对后一次提交；提交后的事件按新变化处理，不回滚已确认的 C。
                     try store.save(candidate)
                     record = candidate
+                    priorResponsibility = false
                 }
                 endApplicationRequest(request)
-                publish(.manualConfiguration)
+                publish(stopping ? .manualConfigurationForQuit : .manualConfiguration)
             } catch {
                 record = original
                 publish((try? store.load()) == original ? .confirmationFailed : .recoveryIncomplete)
@@ -529,8 +550,12 @@ final class PrimaryController: @unchecked Sendable {
             try store.save(pending)
             record = pending
         } else if !pending.canClear { try restore() }
-        guard let restored = record, restored.canClear, restored.internalDisplay == nil,
-              try snapshotReader().layout() == restored.baseline else { throw RecoveryError.unfinishedTransaction }
+        guard let restored = record, restored.canClear, restored.internalDisplay == nil else {
+            throw RecoveryError.unfinishedTransaction
+        }
+        guard try snapshotReader().layout() == restored.baseline else {
+            throw PrimaryError.previousConfigurationChanged
+        }
         try store.clear()
         record = nil
         priorResponsibility = false

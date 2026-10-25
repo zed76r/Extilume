@@ -15,6 +15,7 @@ enum DisplayEnableTransactionError: Error, Equatable {
 // 私有 ABI 参考 displayplacer/src/Header.h；符号存在不表示本机启停已经验收。
 final class DisplayEnableTransaction {
     typealias Trace = (InternalLifecycleStage, CGError?) -> Void
+    typealias NativeCall = (() -> CGError) throws -> CGError
     typealias Begin = (UnsafeMutablePointer<CGDisplayConfigRef?>) -> CGError
     typealias Configure = (CGDisplayConfigRef, CGDirectDisplayID, Bool) -> CGError
     typealias Complete = (CGDisplayConfigRef, CGConfigureOption) -> CGError
@@ -63,6 +64,9 @@ final class DisplayEnableTransaction {
         snapshotReader: () throws -> Snapshot,
         lidIsOpen: () -> Bool,
         checkProtection: (RecoveryRecord) throws -> Void,
+        trace: @escaping Trace = { _, _ in },
+        nativeCall: NativeCall = { $0() },
+        completionCall: NativeCall? = nil,
         internalReader: (UUID) throws -> InternalDisplayState = { _ in throw RecoveryError.identityConflict }
     ) throws {
         try record.validate()
@@ -87,7 +91,7 @@ final class DisplayEnableTransaction {
         }
         let initialConnections = try initial.connected()
         let display = try initial.builtInDisplay(identity: responsibility.identity).id
-        try setEnabled(display: display, enabled: false) {
+        try setEnabled(display: display, enabled: false, trace: trace, nativeCall: nativeCall, completionCall: completionCall) {
             try checkProtection(record)
             guard try loadRecord() == record else { throw RecoveryError.unfinishedTransaction }
             let (snapshot, state) = try observe()
@@ -112,7 +116,8 @@ final class DisplayEnableTransaction {
     func enableInternalForRecovery(
         record: RecoveryRecord,
         loadRecord: () throws -> RecoveryRecord?,
-        trace: Trace = { _, _ in },
+        trace: @escaping Trace = { _, _ in },
+        nativeCall: NativeCall = { $0() },
         internalReader: (UUID) throws -> InternalDisplayState
     ) throws {
         try record.validate()
@@ -127,7 +132,7 @@ final class DisplayEnableTransaction {
         let initial = try readInternal()
         guard initial.matches(identity: responsibility.identity, hardwareIdentity: responsibility.hardwareIdentity) else { throw RecoveryError.identityConflict }
         let display = initial.id
-        try setEnabled(display: display, enabled: true, trace: trace) {
+        try setEnabled(display: display, enabled: true, trace: trace, nativeCall: nativeCall) {
             guard try loadRecord() == record else { throw RecoveryError.unfinishedTransaction }
             let actual = try readInternal()
             guard actual.matches(identity: responsibility.identity, hardwareIdentity: responsibility.hardwareIdentity),
@@ -141,7 +146,8 @@ final class DisplayEnableTransaction {
     // 仅由持锁控制／恢复入口调用；调用方须校验落盘责任、身份和适用保护。
     func setEnabled(
         display: CGDirectDisplayID, enabled: Bool,
-        trace: Trace = { _, _ in }, validate: () throws -> Void
+        trace: @escaping Trace = { _, _ in }, nativeCall: NativeCall = { $0() },
+        completionCall: NativeCall? = nil, validate: () throws -> Void
     ) throws {
         guard display != kCGNullDirectDisplay else { throw DisplayEnableTransactionError.invalidDisplay }
         guard let configure else { throw DisplayEnableTransactionError.symbolUnavailable }
@@ -149,8 +155,10 @@ final class DisplayEnableTransaction {
         try validate()
         trace(.enablePreValidationFinished, nil)
         var configuration: CGDisplayConfigRef?
-        trace(.enableBeginStarted, nil)
-        let beginResult = begin(&configuration)
+        let beginResult = try nativeCall {
+            trace(.enableBeginStarted, nil)
+            return begin(&configuration)
+        }
         trace(.enableBeginFinished, beginResult)
         guard beginResult == .success, let configuration else {
             throw DisplayEnableTransactionError.beginFailed
@@ -163,8 +171,10 @@ final class DisplayEnableTransaction {
                 trace(.enableCancelFinished, cancelResult)
             }
         }
-        trace(.enableConfigureStarted, nil)
-        let configureResult = configure(configuration, display, enabled)
+        let configureResult = try nativeCall {
+            trace(.enableConfigureStarted, nil)
+            return configure(configuration, display, enabled)
+        }
         trace(.enableConfigureFinished, configureResult)
         guard configureResult == .success else {
             throw DisplayEnableTransactionError.configurationFailed
@@ -172,9 +182,16 @@ final class DisplayEnableTransaction {
         trace(.enablePostValidationStarted, nil)
         try validate()
         trace(.enablePostValidationFinished, nil)
+        func invokeCompletion() -> CGError {
+            let result = complete(configuration, enabled ? .forSession : .forAppOnly)
+            // 外层门禁在 Complete 返回后仍可能失败；已消费句柄不能再取消。
+            consumed = true
+            return result
+        }
         trace(.enableCompleteStarted, nil)
-        let result = complete(configuration, enabled ? .forSession : .forAppOnly)
-        consumed = true // Complete 返回后句柄已失效，包括失败返回。
+        let result: CGError
+        if let completionCall { result = try completionCall(invokeCompletion) }
+        else { result = try nativeCall(invokeCompletion) }
         trace(.enableCompleteFinished, result)
         guard result == .success else { throw DisplayEnableTransactionError.commitFailed }
     }

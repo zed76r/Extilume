@@ -49,7 +49,8 @@ func performProtectedInternalDisable(
     disable: (RecoveryRecord) throws -> Void,
     activeSnapshotReader: () throws -> Snapshot,
     internalReader: (UUID) throws -> InternalDisplayState,
-    checkProtection: (RecoveryRecord) throws -> Void
+    checkProtection: (RecoveryRecord) throws -> Void,
+    verifyLinkReconfiguration: () throws -> Void = {}
 ) throws -> (layout: DisplayLayout, internalEnabled: Bool?) {
     try record.validate()
     guard record.phase == .applying, !record.sourceUnresolved,
@@ -74,6 +75,8 @@ func performProtectedInternalDisable(
     let layout = try actual.layout()
     print("内屏停用阶段：独立效果读回完成，待保护复核。")
     guard try loadRecord() == record else { throw RecoveryError.unfinishedTransaction }
+    try checkProtection(record)
+    try verifyLinkReconfiguration()
     try checkProtection(record)
     return (layout, false)
 }

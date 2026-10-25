@@ -4,9 +4,13 @@ import XCTest
 @testable import ExtilumeCore
 
 final class GuardChannelTests: XCTestCase {
-    private struct Message: Codable, Equatable {
+    private struct Message: Codable, Equatable, Sendable {
         let sequence: Int
         let text: String
+    }
+
+    private enum AccessError: Error, Equatable {
+        case cancelled
     }
 
     func testPairCarriesMessagesInBothDirectionsAndHasRequiredSocketFlags() throws {
@@ -57,6 +61,86 @@ final class GuardChannelTests: XCTestCase {
         }
     }
 
+    func testReceiveUsesAbsoluteDeadlineBeyondShortDefaultTimeout() throws {
+        let (receiver, sender) = try makePair(timeoutNanoseconds: 25_000_000)
+        let message = Message(sequence: 3, text: "late reply")
+        let deadline = try ContinuousClock.nanoseconds() + 180_000_000
+
+        DispatchQueue.global().asyncAfter(deadline: .now() + .milliseconds(60)) {
+            try? sender.send(message)
+        }
+
+        XCTAssertEqual(
+            try receiver.receive(Message.self, deadlineNanoseconds: deadline),
+            message
+        )
+    }
+
+    func testExpiredDeadlineDoesNotConsumeBufferedMessage() throws {
+        let (receiver, sender) = try makePair(timeoutNanoseconds: 100_000_000)
+        let message = Message(sequence: 4, text: "buffered")
+        try sender.send(message)
+
+        let expiredDeadline = try ContinuousClock.nanoseconds() - 1
+        XCTAssertThrowsError(
+            try receiver.receive(Message.self, deadlineNanoseconds: expiredDeadline)
+        ) { error in
+            XCTAssertEqual(error as? GuardChannelError, .timedOut)
+        }
+        XCTAssertEqual(try receiver.receive(Message.self), message)
+    }
+
+    func testReceiveTimesOutAtAbsoluteDeadlineWhenNoMessageArrives() throws {
+        let (receiver, peer) = try makePair(timeoutNanoseconds: 200_000_000)
+        let startedAt = try ContinuousClock.nanoseconds()
+        let deadline = startedAt + 50_000_000
+
+        try withExtendedLifetime(peer) {
+            XCTAssertThrowsError(
+                try receiver.receive(Message.self, deadlineNanoseconds: deadline)
+            ) { error in
+                XCTAssertEqual(error as? GuardChannelError, .timedOut)
+            }
+        }
+
+        XCTAssertLessThan(try ContinuousClock.nanoseconds() - startedAt, 150_000_000)
+    }
+
+    func testReceivePropagatesAccessCancellationWithinOneBoundedPoll() throws {
+        let (receiver, peer) = try makePair(timeoutNanoseconds: 200_000_000)
+        let startedAt = try ContinuousClock.nanoseconds()
+        var accessChecks = 0
+
+        try withExtendedLifetime(peer) {
+            XCTAssertThrowsError(try receiver.receive(Message.self, checkAccess: {
+                accessChecks += 1
+                if accessChecks == 2 { throw AccessError.cancelled }
+            })) { error in
+                XCTAssertEqual(error as? AccessError, .cancelled)
+            }
+        }
+
+        XCTAssertEqual(accessChecks, 2)
+        XCTAssertLessThan(try ContinuousClock.nanoseconds() - startedAt, 150_000_000)
+    }
+
+    func testSendPropagatesReadyAccessCancellationWithoutWritingBytes() throws {
+        let (sender, peer) = try makePair(timeoutNanoseconds: 100_000_000)
+        var accessChecks = 0
+
+        XCTAssertThrowsError(try sender.send(Message(sequence: 5, text: "cancelled"), checkAccess: {
+            accessChecks += 1
+            if accessChecks == 2 { throw AccessError.cancelled }
+        })) { error in
+            XCTAssertEqual(error as? AccessError, .cancelled)
+        }
+
+        XCTAssertEqual(accessChecks, 2)
+        var byte: UInt8 = 0
+        XCTAssertEqual(Darwin.recv(peer.descriptor, &byte, 1, MSG_PEEK | MSG_DONTWAIT), -1)
+        XCTAssertTrue(errno == EAGAIN || errno == EWOULDBLOCK)
+    }
+
     func testPeerEOFIsReportedWithoutConsumingData() throws {
         let (channel, peerDescriptor) = try makeChannel(timeoutNanoseconds: 100_000_000)
         var peerOpen = true
@@ -69,6 +153,24 @@ final class GuardChannelTests: XCTestCase {
         XCTAssertThrowsError(try channel.receive(Message.self)) { error in
             XCTAssertEqual(error as? GuardChannelError, .peerClosed)
         }
+    }
+
+    func testPartialFrameEOFIsNotAnOrderlyEndOfStream() throws {
+        for bytes: [UInt8] in [[0x00], [0x00, 0x00, 0x00, 0x04], [0x00, 0x00, 0x00, 0x04, 0x7b]] {
+            let (channel, peer) = try makeChannel(timeoutNanoseconds: 100_000_000)
+            try write(bytes, to: peer)
+            Darwin.close(peer)
+            XCTAssertThrowsError(try channel.receive(Message.self)) { error in
+                XCTAssertEqual(error as? GuardChannelError, .truncatedMessage)
+            }
+        }
+    }
+
+    func testClosedPeerIsDetectedEvenWithBufferedControlBytes() throws {
+        let (channel, peer) = try makeChannel(timeoutNanoseconds: 100_000_000)
+        try write([0x00, 0x00, 0x00, 0x04, 0x7b], to: peer)
+        Darwin.close(peer)
+        XCTAssertTrue(try channel.peerClosed())
     }
 
     func testRejectsOutOfRangeFrameLengthAndMalformedJSON() throws {

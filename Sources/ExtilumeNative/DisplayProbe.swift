@@ -197,6 +197,7 @@ func snapshotWitnessFailureCode(_ error: Error) -> String {
         case .processFailed: return "witness-exit"
         case .cleanupFailed: return "witness-cleanup"
         case .internalStateChanged: return "internal-state-changed"
+        case .internalInformationUnavailable: return "internal-information-unavailable"
         }
     }
     return "unclassified"
@@ -232,24 +233,88 @@ private func readInternalHardwareIdentity(_ info: [String: Any]) -> InternalDisp
     return InternalDisplayHardwareIdentity(bootSession: bootSession, registryEntryID: entryID)
 }
 
+func internalDisplayReportedIdentity(
+    in info: [String: Any]?, numericID: UInt32,
+    diagnostic: (InternalDisplayCandidateFailure) -> Void
+) -> UUID? {
+    guard let info else { diagnostic(.informationUnavailable); return nil }
+    guard (info["kCGDisplayID"] as? NSNumber)?.uint32Value == numericID else {
+        diagnostic(.numericIDMismatch); return nil
+    }
+    guard let text = (info["DisplayUUID"] as? String) ?? (info["kCGDisplayUUID"] as? String) else {
+        diagnostic(.missingUUID); return nil
+    }
+    guard let uuid = UUID(uuidString: text) else { diagnostic(.malformedUUID); return nil }
+    return uuid
+}
+
 func readInternalDisplay(
     identity: UUID, numericIDHint: UInt32,
     hardwareIdentity: InternalDisplayHardwareIdentity? = nil
 ) throws -> InternalDisplayState {
     try hardwareIdentity?.validate()
+    let bootSession: UUID?
+    if hardwareIdentity != nil { bootSession = try currentBootSession() }
+    else { bootSession = nil }
+    traceInternalLifecycle(.internalOnlineReadStarted, role: .witness)
     let online = try displayList("在线", read: CGGetOnlineDisplayList)
+    traceInternalLifecycle(.internalOnlineReadFinished, role: .witness)
+    traceInternalLifecycle(.internalActiveReadStarted, role: .witness)
     let active = try displayList("活动", read: CGGetActiveDisplayList)
-    return try matchInternalDisplay(identity: identity, hardwareIdentity: hardwareIdentity, candidates: online + active + [numericIDHint]) { id in
-        guard let info = coreDisplayCreateInfo?(id)?.takeRetainedValue() as? [String: Any],
-              (info["kCGDisplayID"] as? NSNumber)?.uint32Value == id,
-              let text = (info["DisplayUUID"] as? String) ?? (info["kCGDisplayUUID"] as? String),
-              let uuid = UUID(uuidString: text) else { return nil }
-        return InternalDisplayState(
-            id: id, identityUUID: uuid, isBuiltIn: CGDisplayIsBuiltin(id) != 0,
-            isOnline: CGDisplayIsOnline(id) != 0,
-            isActive: CGDisplayIsActive(id) != 0,
-            hardwareIdentity: readInternalHardwareIdentity(info), reportedIdentityUUID: uuid
-        )
+    traceInternalLifecycle(.internalActiveReadFinished, role: .witness)
+    var identityFailure: InternalDisplayIdentityFailure?
+    var numericHintFailure: InternalDisplayCandidateFailure?
+    var otherCandidateFailure = false
+    var builtInConflict = false
+    var reportedIdentities = Set<UUID>()
+    do {
+        return try matchInternalDisplay(
+            identity: identity, hardwareIdentity: hardwareIdentity, candidates: online + active + [numericIDHint],
+            diagnostic: {
+                identityFailure = $0
+                traceInternalLifecycle(.internalIdentityRejected, role: .witness,
+                                       succeeded: false, identityFailure: $0)
+            }
+        ) { id in
+            traceInternalLifecycle(.internalCandidateReadStarted, role: .witness, isNumericHint: id == numericIDHint)
+            let info = coreDisplayCreateInfo?(id)?.takeRetainedValue() as? [String: Any]
+            traceInternalLifecycle(.internalCandidateReadFinished, role: .witness, isNumericHint: id == numericIDHint)
+            var candidateFailure: InternalDisplayCandidateFailure?
+            let uuid = internalDisplayReportedIdentity(in: info, numericID: id, diagnostic: { failure in
+                candidateFailure = failure
+                traceInternalLifecycle(.internalCandidateUnavailable, role: .witness,
+                                       succeeded: false, candidateFailure: failure, isNumericHint: id == numericIDHint)
+            })
+            guard let uuid, let info else {
+                if id == numericIDHint { numericHintFailure = candidateFailure }
+                else if candidateFailure != nil { otherCandidateFailure = true }
+                return nil
+            }
+            if !reportedIdentities.insert(uuid).inserted { otherCandidateFailure = true }
+            let candidateHardware = readInternalHardwareIdentity(info)
+            let isBuiltIn = CGDisplayIsBuiltin(id) != 0
+            if isBuiltIn && uuid != identity && candidateHardware != hardwareIdentity {
+                builtInConflict = true
+            }
+            return InternalDisplayState(
+                id: id, identityUUID: uuid, isBuiltIn: isBuiltIn,
+                isOnline: CGDisplayIsOnline(id) != 0,
+                isActive: CGDisplayIsActive(id) != 0,
+                hardwareIdentity: candidateHardware, reportedIdentityUUID: uuid
+            )
+        }
+    } catch {
+        if canReportInternalInformationUnavailable(
+            identityFailure: identityFailure,
+            numericHintFailure: numericHintFailure,
+            otherCandidateFailure: otherCandidateFailure,
+            builtInConflict: builtInConflict,
+            hardwareIdentity: hardwareIdentity,
+            currentBootSession: bootSession
+        ) {
+            throw SnapshotWitnessError.internalInformationUnavailable
+        }
+        throw error
     }
 }
 
@@ -397,7 +462,7 @@ private func displayEventApplication() throws -> NSApplication {
 @MainActor
 private func recordConnectionTiming() throws -> Bool {
     let application = NSApplication.shared
-    guard application.setActivationPolicy(.accessory) else { throw ProbeError.eventLoopUnavailable }
+    guard application.activationPolicy() == .accessory || application.setActivationPolicy(.accessory) else { throw ProbeError.eventLoopUnavailable }
     func writeLine(_ line: String) throws {
         guard fputs(line + "\n", stdout) >= 0, fflush(stdout) == 0 else {
             throw ProbeError.eventLoopUnavailable
@@ -421,6 +486,19 @@ private func recordConnectionTiming() throws -> Bool {
 }
 
 @MainActor
+private func recordRecoveryConfirmation(to path: String) throws -> Bool {
+    let application = NSApplication.shared
+    guard application.activationPolicy() == .accessory || application.setActivationPolicy(.accessory) else { throw ProbeError.eventLoopUnavailable }
+    let controller = RecoveryConfirmationWindowController(record: {
+        try captureRecoveryClock(to: path)
+    }, finish: { application.stop(nil) })
+    controller.showWindow(nil)
+    application.activate(ignoringOtherApps: true)
+    withExtendedLifetime(controller) { application.run() }
+    return controller.recorded
+}
+
+@MainActor
 public func runDisplayProbe() {
     setlinebuf(stdout) // 辅助进程共享管道时，逐行证据须及时可见。
     if CommandLine.arguments.dropFirst().contains(where: { $0 == "--help" || $0 == "-h" }) {
@@ -436,14 +514,52 @@ public func runDisplayProbe() {
         受保护内屏停用验证（需先开盖且外屏为主屏）：extilume-probe --verify-internal-disable <0700 状态目录>
         只读物理事件观察：extilume-probe --watch-connection（mark / stop）
         离线计时检查：extilume-probe --check-recovery-timing <故障最早ns> <故障最晚ns> <通知ns> <恢复核验ns>
+        同启动会话计时：extilume-probe --check-recovery-timing --clock-samples <故障前样本> <故障后样本> <通知样本> <恢复样本> [--suspension-evidence <休眠证据>]
+        休眠证据评估：只有四个采集样本同启动会话时才允许扣除，裸数字入口只作算术检查
+        只读时钟采样：extilume-probe --sample-recovery-clock <受限目录中的新文件>
+        只读休眠证据采集：extilume-probe --record-suspension-evidence <受限目录中的新文件>（stop结束）
+        人工恢复确认：extilume-probe --record-recovery-confirmation <受限目录中的新样本文件>
         人工动作计时窗口：extilume-probe --record-connection-timing（JSON 行输出；不读写显示状态）
         验证命令：status、confirm-user（仅在你已手动修改布局后）、reapply、stop。
-        内屏停用验证命令：status、stop。效果及故障恢复时限尚未实机验收。
+        内屏停用验证命令：status、restore、confirm-user、reapply、stop。睡眠及完整故障恢复尚未实机验收。
         """)
+    } else if CommandLine.arguments.dropFirst().first == "--record-suspension-evidence" {
+        do {
+            guard CommandLine.arguments.count == 3 else { throw RecoveryError.invalidRecord }
+            try recordRecoverySuspensionEvidence(to: CommandLine.arguments[2])
+            print("电源与配对时钟证据已受限保存；未操作睡眠或显示状态。")
+        } catch {
+            fputs("只读休眠证据采集未完成；不能据此宣称验收通过。未修改显示状态。\n", stderr)
+            exit(EXIT_FAILURE)
+        }
+    } else if CommandLine.arguments.dropFirst().first == "--sample-recovery-clock" {
+        do {
+            guard CommandLine.arguments.count == 3 else { throw RecoveryError.invalidRecord }
+            try captureRecoveryClock(to: CommandLine.arguments[2])
+            print("连续／暂停时钟样本已受限保存；未读取或修改显示状态。")
+        } catch {
+            fputs("时钟采样未完成；须提供受限目录内不存在的文件路径。未读取或修改显示状态。\n", stderr)
+            exit(EXIT_FAILURE)
+        }
     } else if CommandLine.arguments.dropFirst().first == "--check-recovery-timing" {
         do { print(try recoveryTimingReport(arguments: Array(CommandLine.arguments.dropFirst(2)))) }
         catch {
-            fputs("计时输入无效；须提供四个同一连续时基的 UInt64 纳秒值，并满足故障区间及通知／核验顺序。未读取或修改显示状态。\n", stderr)
+            fputs("计时输入无效；须提供四个有序 UInt64 纳秒值，或四个同启动会话的采集样本。未读取或修改显示状态。\n", stderr)
+            exit(EXIT_FAILURE)
+        }
+    } else if CommandLine.arguments.dropFirst().first == "--record-recovery-confirmation" {
+        guard CommandLine.arguments.count == 3, !CommandLine.arguments[2].isEmpty else {
+            fputs("人工恢复确认须提供受限目录中的新样本文件；未读取或修改显示状态。\n", stderr)
+            exit(EXIT_FAILURE)
+        }
+        do {
+            guard try recordRecoveryConfirmation(to: CommandLine.arguments[2]) else {
+                fputs("人工恢复确认未完成，不构成验收；已有文件不覆盖。\n", stderr)
+                exit(EXIT_FAILURE)
+            }
+            print("人工恢复确认的时钟样本已受限保存；仍需同轮故障计时与独立配置核验。")
+        } catch {
+            fputs("人工恢复确认未完成；未读取或修改显示状态。\n", stderr)
             exit(EXIT_FAILURE)
         }
     } else if CommandLine.arguments.dropFirst().first == "--record-connection-timing" {

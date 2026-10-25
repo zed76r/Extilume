@@ -49,6 +49,156 @@ final class ProtectedInternalApplicationTests: XCTestCase {
         case unfinishedTransaction
     }
 
+    func testGuardReadinessAcceptsConfirmedCBeforeExternalPrimaryTranslation() throws {
+        let state = InternalDisplayState(
+            id: 80, identityUUID: internalID, isBuiltIn: true, isOnline: true, isActive: true,
+            hardwareIdentity: internalHardwareIdentity, reportedIdentityUUID: internalID
+        )
+        for c in [try baselineLayout(), try targetLayout(), try userLayout()] {
+            var record = try makeProtectedRecord(baseline: c, target: layoutByMakingMain(c, target: externalID))
+            try record.markApplying()
+            XCTAssertNoThrow(try validateInternalGuardReadiness(
+                snapshot: dualSnapshot(c, internalActive: true), record: record,
+                internalState: state, lidOpen: true
+            ))
+        }
+    }
+
+    func testGuardReadinessRejectsTargetAppearingBeforeProtectionIsReady() throws {
+        var record = try makeProtectedRecord(baseline: baselineLayout(), target: targetLayout())
+        try record.markApplying()
+        let state = InternalDisplayState(
+            id: 80, identityUUID: internalID, isBuiltIn: true, isOnline: true, isActive: true,
+            hardwareIdentity: internalHardwareIdentity, reportedIdentityUUID: internalID
+        )
+        XCTAssertThrowsError(try validateInternalGuardReadiness(
+            snapshot: dualSnapshot(try targetLayout(), internalActive: true), record: record,
+            internalState: state, lidOpen: true
+        ))
+    }
+
+    func testGuardReadinessStillRejectsWrongTargetIdentityLidAndInactiveDisplay() throws {
+        let c = try targetLayout()
+        var record = try makeProtectedRecord(baseline: c, target: c)
+        try record.markApplying()
+        let state = InternalDisplayState(
+            id: 80, identityUUID: internalID, isBuiltIn: true, isOnline: true, isActive: true,
+            hardwareIdentity: internalHardwareIdentity, reportedIdentityUUID: internalID
+        )
+        let wrongHardware = InternalDisplayState(
+            id: state.id, identityUUID: state.identityUUID, isBuiltIn: true, isOnline: true, isActive: true,
+            hardwareIdentity: InternalDisplayHardwareIdentity(bootSession: sessionID, registryEntryID: 88),
+            reportedIdentityUUID: internalID
+        )
+        XCTAssertThrowsError(try validateInternalGuardReadiness(
+            snapshot: dualSnapshot(c, internalActive: true), record: record, internalState: wrongHardware, lidOpen: true
+        ))
+        XCTAssertThrowsError(try validateInternalGuardReadiness(
+            snapshot: dualSnapshot(c, internalActive: true), record: record, internalState: state, lidOpen: false
+        ))
+        XCTAssertThrowsError(try validateInternalGuardReadiness(
+            snapshot: dualSnapshot(c, internalActive: false), record: record, internalState: state, lidOpen: true
+        ))
+        var wrongTarget = try makeProtectedRecord(baseline: c, target: baselineLayout())
+        try wrongTarget.markApplying()
+        XCTAssertThrowsError(try validateInternalGuardReadiness(
+            snapshot: dualSnapshot(c, internalActive: true), record: wrongTarget, internalState: state, lidOpen: true
+        ))
+    }
+
+    func testInternalPrimaryDirectApplicationProtectsBeforeTranslationAndRestoresOriginalC() throws {
+        let c = try userLayout()
+        let target = try internalApplicationTargetLayout(for: c, externalIdentity: externalID)
+        let prepared = try RecoveryRecord(
+            baseline: c, target: target,
+            internalDisplay: InternalDisplayResponsibility(
+                identity: internalID, baseline: true, applied: false,
+                hardwareIdentity: internalHardwareIdentity, numericIDHint: 80
+            )
+        )
+        var current = dualSnapshot(c, internalActive: true)
+        var enabled = true
+        var events: [String] = []
+        var authorization = ProtectionAuthorization()
+        func readInternal(_ identity: UUID) -> InternalDisplayState {
+            InternalDisplayState(
+                id: 80, identityUUID: identity, isBuiltIn: true, isOnline: true, isActive: enabled,
+                hardwareIdentity: internalHardwareIdentity, reportedIdentityUUID: identity
+            )
+        }
+
+        try withStore { store, _ in
+            let owned = try XCTUnwrap(applyProtectedInternalRecord(
+                store: store, prepared: prepared,
+                operation: { durable in
+                    XCTAssertFalse(authorization.ready)
+                    XCTAssertEqual(try InternalApplicationExpectation(record: durable).baseline, c)
+                    try validateInternalGuardReadiness(
+                        snapshot: current, record: durable, internalState: readInternal(self.internalID), lidOpen: true
+                    )
+                    let handshake = try ProtectionHandshake(
+                        session: durable.session, generation: durable.generation, parentPID: 42,
+                        internalDisplayIdentity: self.internalID,
+                        internalDisplayHardwareIdentity: self.internalHardwareIdentity
+                    )
+                    try authorization.acknowledge(receipt: handshake, expected: handshake)
+                    events.append("guard-ready")
+                    try translateProtectedInternalLayout(
+                        record: durable, loadRecord: { try store.load() }, snapshotReader: { current },
+                        originWriter: { origins, gate in
+                            try gate()
+                            XCTAssertTrue(authorization.ready)
+                            XCTAssertEqual(try current.layout(), c)
+                            XCTAssertEqual(origins, [80: target.origins[self.internalID]!, 40: target.origins[self.externalID]!])
+                            current = self.dualSnapshot(target, internalActive: true)
+                            events.append("external-primary")
+                        },
+                        checkProtection: { try authorization.authorize(record: $0) }
+                    )
+                    return try performProtectedInternalDisable(
+                        record: durable, loadRecord: { try store.load() },
+                        disable: { _ in
+                            XCTAssertEqual(events, ["guard-ready", "external-primary"])
+                            XCTAssertEqual(try current.layout(), target)
+                            enabled = false
+                            current = self.singleExternalSnapshot(try self.externalOnlyLayout())
+                            events.append("disable")
+                        },
+                        activeSnapshotReader: { current }, internalReader: { readInternal($0) },
+                        checkProtection: { try authorization.authorize(record: $0) }
+                    )
+                },
+                recoverOnFailure: { _, _ in XCTFail("supported internal-primary C must reach the protected application") }
+            ))
+            XCTAssertEqual(owned.baseline, c)
+            XCTAssertEqual(owned.preDisableLayout, target)
+            XCTAssertEqual(owned.applied, try externalOnlyLayout())
+            let restored = try recoverGuardRecord(
+                store: store,
+                contract: ProtectionHandshake(
+                    session: owned.session, generation: owned.generation, parentPID: 42,
+                    internalDisplayIdentity: internalID, internalDisplayHardwareIdentity: internalHardwareIdentity
+                ),
+                snapshotReader: { current }, internalReader: { readInternal($0) },
+                enableInternal: { _ in
+                    enabled = true
+                    current = self.dualSnapshot(target, internalActive: true)
+                    events.append("enable")
+                },
+                originWriter: { _, origins in
+                    XCTAssertEqual(origins, [80: c.origins[self.internalID]!, 40: c.origins[self.externalID]!])
+                    current = self.dualSnapshot(c, internalActive: true)
+                    events.append("restore-C")
+                }
+            )
+            XCTAssertEqual(events, ["guard-ready", "external-primary", "disable", "enable", "restore-C"])
+            XCTAssertEqual(try current.layout(), c)
+            XCTAssertEqual(restored.baseline, c)
+            XCTAssertTrue(restored.canClear)
+            XCTAssertNil(restored.independentGuardVerified)
+        }
+    }
+
     func testStoreApplyPersistsApplyingBeforeProtectedDisableAndConfirmsSingleExternalLayout() throws {
         let baseline = try baselineLayout()
         let target = try targetLayout()
@@ -594,7 +744,7 @@ final class ProtectedInternalApplicationTests: XCTestCase {
                         enableCalls += 1
                         enabled = true
                     },
-                    originWriter: { origins in
+                    originWriter: { _, origins in
                         XCTAssertEqual(origins, [80: c.origins[self.internalID]!, 40: c.origins[self.externalID]!])
                         current = c
                     }
@@ -752,6 +902,39 @@ final class ProtectedInternalApplicationTests: XCTestCase {
         }
     }
 
+    func testLinkVerificationFollowsIndependentReadbackAndFinalProtectionChecks() throws {
+        let target = try targetLayout()
+        let record = try makeApplyingRecord()
+        var events: [String] = []
+        _ = try performProtectedInternalDisable(
+            record: record, loadRecord: { events.append("record"); return record },
+            disable: { _ in events.append("disable") },
+            activeSnapshotReader: { events.append("active"); return self.singleExternalSnapshot(target) },
+            internalReader: { _ in events.append("internal"); return self.internalState(isActive: false) },
+            checkProtection: { _ in events.append("protection") },
+            verifyLinkReconfiguration: { events.append("link") }
+        )
+        XCTAssertEqual(events, ["protection", "record", "disable", "active", "internal", "record", "protection", "link", "protection"])
+    }
+
+    func testFailedReadbackNeverVerifiesAndFailureAfterVerificationCannotReturnOwned() throws {
+        let record = try makeApplyingRecord()
+        for readbackFails in [true, false] {
+            var verified = false
+            XCTAssertThrowsError(try performProtectedInternalDisable(
+                record: record, loadRecord: { record }, disable: { _ in },
+                activeSnapshotReader: {
+                    if readbackFails { throw FixtureError.snapshotFailure }
+                    return self.singleExternalSnapshot(try self.targetLayout())
+                },
+                internalReader: { _ in self.internalState(isActive: false) },
+                checkProtection: { _ in if verified { throw FixtureError.protectionRevoked } },
+                verifyLinkReconfiguration: { verified = true }
+            ))
+            XCTAssertEqual(verified, !readbackFails)
+        }
+    }
+
     private func makePreparedRecord(
         baseline: DisplayLayout? = nil,
         target: DisplayLayout? = nil,
@@ -901,7 +1084,7 @@ final class ProtectedInternalApplicationTests: XCTestCase {
                 }
                 fixture.internalEnabled = true
             },
-            originWriter: { origins in
+            originWriter: { _, origins in
                 fixture.originWrites += 1
                 XCTAssertEqual(origins, [
                     80: DisplayOrigin(x: 0, y: 0),

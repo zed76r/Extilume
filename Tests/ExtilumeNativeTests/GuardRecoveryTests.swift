@@ -14,6 +14,67 @@ final class GuardRecoveryTests: XCTestCase {
 
     private enum FixtureError: Error { case injected }
 
+    func testSleepingRecoveryLeavesResponsibilityAndDoesNotReadOrWriteDisplays() throws {
+        let record = try applyingRecord()
+        let gate = InternalPowerGate()
+        gate.didRegister()
+        gate.willSleep()
+        gate.didAcknowledgeSleep(true)
+        try withStore { store, _ in
+            try store.save(record)
+            XCTAssertThrowsError(try recoverGuardRecord(
+                store: store, contract: contract(for: record),
+                snapshotReader: { XCTFail("sleep cannot query displays"); throw FixtureError.injected },
+                internalReader: { _ in XCTFail("sleep cannot query internal"); throw FixtureError.injected },
+                enableInternal: { _ in XCTFail("sleep cannot enable") },
+                originWriter: { _, _ in XCTFail("sleep cannot change layout") },
+                checkAccess: { try gate.check() }
+            ))
+            XCTAssertEqual(try store.load(), record)
+            XCTAssertFalse(record.canClear)
+        }
+    }
+
+    func testSleepDuringEnableKeepsPendingRecordAndWakeRestoresOriginalC() throws {
+        let baseline = try layout()
+        let target = try layout(mainExternal: true)
+        let record = try applyingRecord(baseline: baseline, target: target)
+        let gate = InternalPowerGate()
+        gate.didRegister()
+        var enabled = false
+        var actual = target
+        var events: [String] = []
+        try withStore { store, _ in
+            try store.save(record)
+            func recover() throws -> RecoveryRecord {
+                try recoverGuardRecord(
+                    store: store, contract: contract(for: record),
+                    snapshotReader: { self.snapshot(actual, internalActive: enabled) },
+                    internalReader: { identity in try self.snapshot(actual, internalActive: enabled).internalDisplayState(identity: identity) },
+                    enableInternal: { _ in
+                        events.append("enable")
+                        enabled = true
+                        gate.willSleep()
+                    },
+                    originWriter: { _, _ in events.append("origins"); actual = baseline },
+                    checkAccess: { try gate.check() }
+                )
+            }
+            XCTAssertThrowsError(try recover())
+            XCTAssertEqual(events, ["enable"])
+            XCTAssertEqual(try store.load()?.phase, .restoring)
+            XCTAssertEqual(try store.load()?.baseline, baseline)
+            XCTAssertFalse(try XCTUnwrap(store.load()).canClear)
+            gate.didAcknowledgeSleep(true)
+            gate.didWake()
+            let restored = try recover()
+            XCTAssertEqual(events, ["enable", "origins"])
+            XCTAssertEqual(restored.phase, .restored)
+            XCTAssertEqual(restored.baseline, baseline)
+            XCTAssertEqual(actual, baseline)
+        }
+    }
+
     func testFailedLayoutReadLeavesStageOpenAndRecoveryResponsibilityPending() throws {
         let baseline = try layout()
         let target = try layout(mainExternal: true)
@@ -29,7 +90,7 @@ final class GuardRecoveryTests: XCTestCase {
                     try self.snapshot(target, internalActive: enabled).internalDisplayState(identity: identity)
                 },
                 enableInternal: { _ in enabled = true },
-                originWriter: { _ in XCTFail("failed snapshot cannot authorize origins") },
+                originWriter: { _, _ in XCTFail("failed snapshot cannot authorize origins") },
                 trace: { stages.append($0) }
             ))
             XCTAssertTrue(stages.contains(.enableFinished))
@@ -63,7 +124,7 @@ final class GuardRecoveryTests: XCTestCase {
                 snapshotReader: { self.snapshot(baseline) },
                 internalReader: { _ in throw FixtureError.injected },
                 enableInternal: { _ in XCTFail("unexpected internal enable") },
-                originWriter: { _ in writes += 1 }
+                originWriter: { _, _ in writes += 1 }
             )
 
             XCTAssertEqual(writes, 0)
@@ -89,7 +150,7 @@ final class GuardRecoveryTests: XCTestCase {
                     try self.snapshot(baseline, internalActive: true).internalDisplayState(identity: identity)
                 },
                 enableInternal: { _ in enables += 1 },
-                originWriter: { _ in writes += 1 }
+                originWriter: { _, _ in writes += 1 }
             )
 
             XCTAssertEqual(enables, 0)
@@ -97,6 +158,171 @@ final class GuardRecoveryTests: XCTestCase {
             XCTAssertEqual(restored.phase, .restored)
             XCTAssertFalse(try XCTUnwrap(restored.internalDisplay).pending)
             XCTAssertEqual(try store.load(), restored)
+        }
+    }
+
+    func testExactKnownBReappearingAfterConfirmedCRearmsBeforeEnablingAndRestoresC() throws {
+        let record = try confirmedCRecord()
+        let c = record.baseline
+        var current = snapshot(try externalOnlyLayout(), internalActive: false)
+        var events: [String] = []
+        try withStore { store, _ in
+            try store.save(record)
+            let restored = try recoverGuardRecord(
+                store: store, contract: contract(for: record),
+                snapshotReader: { current },
+                internalReader: { _ in self.provenInternal(record, active: current.displays[0].isActive) },
+                enableInternal: { restoring in
+                    XCTAssertEqual(try store.load(), restoring)
+                    XCTAssertTrue(restoring.layoutPending)
+                    XCTAssertTrue(try XCTUnwrap(restoring.internalDisplay).pending)
+                    XCTAssertEqual(restoring.baseline, c)
+                    events.append("enable")
+                    current = self.snapshot(try XCTUnwrap(record.preDisableLayout))
+                },
+                originWriter: { restoring, origins in
+                    XCTAssertEqual(try store.load(), restoring)
+                    XCTAssertTrue(restoring.internalDisplay?.pending == true)
+                    XCTAssertEqual(origins, [80: DisplayOrigin(x: 0, y: 0), 40: DisplayOrigin(x: 1728, y: 0)])
+                    events.append("origins")
+                    current = self.snapshot(c)
+                }
+            )
+            XCTAssertEqual(events, ["enable", "origins"])
+            XCTAssertEqual(restored.baseline, c)
+            XCTAssertEqual(restored.session, record.session)
+            XCTAssertEqual(restored.generation, record.generation)
+            XCTAssertTrue(restored.canClear)
+            XCTAssertEqual(try store.load(), restored)
+        }
+    }
+
+    func testConfirmedCDoesNotRearmForUnprovenOrUnknownReappearance() throws {
+        for scenario in ["unknown", "pre-disable", "no-hardware", "wrong-hardware", "enabled", "restored", "unresolved"] {
+            var record = try confirmedCRecord(hardware: scenario != "no-hardware")
+            if scenario == "restored" {
+                record.beginRestoration()
+                try record.confirmRestored(actual: record.baseline, internalEnabled: true)
+            }
+            if scenario == "unresolved" {
+                XCTAssertThrowsError(try record.observe(layout(mainExternal: true, internalX: -1900), source: .unknown))
+            }
+            let actual = scenario == "unknown" ? try layout(mainExternal: true, internalX: -1900)
+                : scenario == "pre-disable" ? try XCTUnwrap(record.preDisableLayout) : try externalOnlyLayout()
+            var rejected: [InternalRecoveryLayoutContext] = []
+            try withStore { store, _ in
+                try store.save(record)
+                XCTAssertThrowsError(try recoverGuardRecord(
+                    store: store, contract: contract(for: record),
+                    snapshotReader: { self.snapshot(actual, internalActive: actual.origins[self.internalID] != nil) },
+                    internalReader: { _ in
+                        if scenario == "wrong-hardware" {
+                            return InternalDisplayState(
+                                id: 80, identityUUID: self.internalID, isBuiltIn: true, isOnline: true, isActive: false,
+                                hardwareIdentity: InternalDisplayHardwareIdentity(bootSession: self.session, registryEntryID: 8),
+                                reportedIdentityUUID: self.internalID
+                            )
+                        }
+                        return self.provenInternal(record, active: scenario == "enabled")
+                    },
+                    enableInternal: { _ in XCTFail("unproven reappearance must not enable: \(scenario)") },
+                    originWriter: { _, _ in XCTFail("unproven reappearance must not write layout: \(scenario)") },
+                    layoutRejected: { rejected.append($0) }
+                ), scenario)
+                let retained = try XCTUnwrap(store.load())
+                XCTAssertEqual(retained.baseline, record.baseline)
+                XCTAssertEqual(retained.generation, record.generation)
+                XCTAssertEqual(retained.layoutPending, record.layoutPending)
+                XCTAssertEqual(retained.internalDisplay?.pending, record.internalDisplay?.pending)
+                XCTAssertEqual(retained.sourceUnresolved, record.sourceUnresolved)
+                if scenario == "pre-disable" {
+                    XCTAssertEqual(rejected.count, 1)
+                    XCTAssertTrue(try XCTUnwrap(rejected.first).matchesPreDisable)
+                    XCTAssertFalse(try XCTUnwrap(rejected.first).matchesApplied)
+                }
+                if scenario == "unknown" {
+                    XCTAssertEqual(rejected.count, 1)
+                    XCTAssertFalse(try XCTUnwrap(rejected.first).matchesBaseline)
+                    XCTAssertFalse(try XCTUnwrap(rejected.first).matchesApplied)
+                    XCTAssertFalse(try XCTUnwrap(rejected.first).matchesPreDisable)
+                }
+            }
+        }
+    }
+
+    func testKnownBReappearanceCannotSaveResponsibilityAfterSleepOrRecordReplacement() throws {
+        for replaced in [false, true] {
+            let record = try confirmedCRecord()
+            var newer = record
+            try newer.prepareReapplication(current: record.baseline, target: layout(mainExternal: true))
+            let gate = InternalPowerGate()
+            gate.didRegister()
+            try withStore { store, _ in
+                try store.save(record)
+                XCTAssertThrowsError(try recoverGuardRecord(
+                    store: store, contract: contract(for: record),
+                    snapshotReader: { self.snapshot(try self.externalOnlyLayout(), internalActive: false) },
+                    internalReader: { _ in
+                        if replaced { try store.save(newer) } else { gate.willSleep() }
+                        return self.provenInternal(record, active: false)
+                    },
+                    enableInternal: { _ in XCTFail("preempted reappearance must not enable") },
+                    originWriter: { _, _ in XCTFail("preempted reappearance must not write layout") },
+                    checkAccess: { try gate.check() }
+                ))
+                XCTAssertEqual(try store.load(), replaced ? newer : record)
+            }
+        }
+    }
+
+    func testConfirmedCSnapshotReadCannotOverwriteReplacedResponsibility() throws {
+        let record = try confirmedCRecord()
+        var newC = record
+        try newC.observe(layout(mainExternal: true, internalX: -1900), source: .confirmedUser)
+        var unresolved = record
+        XCTAssertThrowsError(try unresolved.observe(layout(mainExternal: true, internalX: -1900), source: .unknown))
+        for replacement in [newC, unresolved] {
+            XCTAssertEqual(replacement.generation, record.generation)
+            for actual in [record.baseline, try XCTUnwrap(record.preDisableLayout)] {
+                try withStore { store, _ in
+                    try store.save(record)
+                    var reads = 0
+                    XCTAssertThrowsError(try recoverGuardRecord(
+                        store: store, contract: contract(for: record),
+                        snapshotReader: {
+                            reads += 1
+                            if reads == 1 { try store.save(replacement) }
+                            return self.snapshot(actual)
+                        },
+                        internalReader: { _ in XCTFail("non-B must not rearm internal responsibility"); throw FixtureError.injected },
+                        enableInternal: { _ in XCTFail("replaced record must not enable") },
+                        originWriter: { _, _ in XCTFail("replaced record must not write layout") }
+                    ))
+                    XCTAssertEqual(try store.load(), replacement)
+                }
+            }
+        }
+    }
+
+    func testFullLayoutWithoutSuccessfulDisableDoesNotRearmResponsibility() throws {
+        let initial = try layout(mainExternal: true)
+        let hardware = InternalDisplayHardwareIdentity(bootSession: session, registryEntryID: 7)
+        var record = try RecoveryRecord(session: session, baseline: initial, target: initial,
+            internalDisplay: InternalDisplayResponsibility(identity: internalID, baseline: true, applied: false, hardwareIdentity: hardware))
+        try record.markApplying()
+        record.beginRestoration()
+        try record.confirmRestored(actual: initial, internalEnabled: true)
+        try record.resumeInternalObservation(current: initial, internalEnabled: true)
+        try withStore { store, _ in
+            try store.save(record)
+            let restored = try recoverGuardRecord(
+                store: store, contract: contract(for: record), snapshotReader: { self.snapshot(initial) },
+                internalReader: { _ in self.provenInternal(record, active: true) },
+                enableInternal: { _ in XCTFail("no disable to recover") },
+                originWriter: { _, _ in XCTFail("layout already restored") }
+            )
+            XCTAssertTrue(restored.canClear)
+            XCTAssertEqual(restored.baseline, initial)
         }
     }
 
@@ -127,7 +353,7 @@ final class GuardRecoveryTests: XCTestCase {
                     events.append("enable")
                     current = self.snapshot(target, internalActive: true)
                 },
-                originWriter: { origins in
+                originWriter: { restoring, origins in
                     XCTAssertEqual(try store.load()?.phase, .restoring)
                     events.append("origins")
                     XCTAssertEqual(origins, [
@@ -180,7 +406,7 @@ final class GuardRecoveryTests: XCTestCase {
                     internalEnabled = true
                     events.append("enable-complete")
                 },
-                originWriter: { origins in
+                originWriter: { restoring, origins in
                     events.append("origins")
                     XCTAssertEqual(origins, [
                         80: DisplayOrigin(x: 0, y: 0),
@@ -222,7 +448,7 @@ final class GuardRecoveryTests: XCTestCase {
                     snapshotReader: { snapshots += 1; return self.snapshot(target, internalActive: false) },
                     internalReader: { _ in invalidState },
                     enableInternal: { _ in enables += 1 },
-                    originWriter: { _ in writes += 1 }
+                    originWriter: { _, _ in writes += 1 }
                 )) { error in
                     guard let recoveryError = error as? RecoveryError,
                           case .identityConflict = recoveryError else {
@@ -265,7 +491,7 @@ final class GuardRecoveryTests: XCTestCase {
                             XCTAssertEqual(try store.load()?.phase, .restoring)
                             if shouldThrow { throw FixtureError.injected }
                         },
-                        originWriter: { _ in writes += 1 }
+                        originWriter: { _, _ in writes += 1 }
                     )
                     XCTFail("recovery should remain pending")
                 } catch {
@@ -308,7 +534,7 @@ final class GuardRecoveryTests: XCTestCase {
                         },
                         internalReader: { identity in try self.snapshot(baseline).internalDisplayState(identity: identity) },
                         enableInternal: { _ in XCTFail("already enabled") },
-                        originWriter: { _ in XCTFail("unresolved source must not write origins") }
+                        originWriter: { _, _ in XCTFail("unresolved source must not write origins") }
                     )
                 }
                 if finalMatches {
@@ -349,7 +575,7 @@ final class GuardRecoveryTests: XCTestCase {
                     XCTAssertEqual(try store.load()?.phase, .restoring)
                     current = self.snapshot(target, internalActive: true)
                 },
-                originWriter: { _ in writes += 1 }
+                originWriter: { _, _ in writes += 1 }
             ))
 
             let retained = try XCTUnwrap(store.load())
@@ -388,7 +614,7 @@ final class GuardRecoveryTests: XCTestCase {
                         return try self.snapshot(baseline).internalDisplayState(identity: identity)
                     },
                     enableInternal: { _ in callbacks += 1 },
-                    originWriter: { _ in callbacks += 1 }
+                    originWriter: { _, _ in callbacks += 1 }
                 ))
                 XCTAssertEqual(try Data(contentsOf: recordURL), originalBytes)
             }
@@ -417,7 +643,7 @@ final class GuardRecoveryTests: XCTestCase {
                     return try self.snapshot(baseline).internalDisplayState(identity: identity)
                 },
                 enableInternal: { _ in callbacks += 1 },
-                originWriter: { _ in callbacks += 1 }
+                originWriter: { _, _ in callbacks += 1 }
             ))
             XCTAssertEqual(callbacks, 0)
             XCTAssertEqual(try Data(contentsOf: recordURL), originalBytes)
@@ -443,7 +669,7 @@ final class GuardRecoveryTests: XCTestCase {
                     XCTAssertEqual(restoring.phase, .restoring)
                     current = self.snapshot(baseline, includeExternal: false)
                 },
-                originWriter: { origins in
+                originWriter: { restoring, origins in
                     events.append("origins")
                     XCTAssertEqual(origins, [80: DisplayOrigin(x: 0, y: 0)])
                 }
@@ -488,7 +714,7 @@ final class GuardRecoveryTests: XCTestCase {
                     current = self.snapshot(target, internalActive: true)
                     try store.save(newer)
                 },
-                originWriter: { _ in writes += 1 }
+                originWriter: { _, _ in writes += 1 }
             ))
 
             XCTAssertEqual(writes, 0)
@@ -533,6 +759,29 @@ final class GuardRecoveryTests: XCTestCase {
         return record
     }
 
+    private func confirmedCRecord(hardware: Bool = true) throws -> RecoveryRecord {
+        let initial = try layout(mainExternal: true)
+        var record = try RecoveryRecord(
+            session: session, baseline: initial, target: initial,
+            internalDisplay: InternalDisplayResponsibility(
+                identity: internalID, baseline: true, applied: false,
+                hardwareIdentity: hardware ? InternalDisplayHardwareIdentity(bootSession: session, registryEntryID: 7) : nil
+            )
+        )
+        try record.markApplying()
+        try record.confirmApplied(externalOnlyLayout(), internalEnabled: false)
+        try record.observe(layout(), source: .confirmedUser)
+        try record.observeInternalEnabled(true, source: .confirmedUser)
+        return record
+    }
+
+    private func provenInternal(_ record: RecoveryRecord, active: Bool) -> InternalDisplayState {
+        InternalDisplayState(
+            id: 80, identityUUID: internalID, isBuiltIn: true, isOnline: true, isActive: active,
+            hardwareIdentity: record.internalDisplay?.hardwareIdentity, reportedIdentityUUID: internalID
+        )
+    }
+
     private func externalOnlyLayout() throws -> DisplayLayout {
         try DisplayLayout(main: externalID, origins: [externalID: DisplayOrigin(x: 0, y: 0)])
     }
@@ -542,7 +791,8 @@ final class GuardRecoveryTests: XCTestCase {
             session: record.session,
             generation: record.generation,
             parentPID: 42,
-            internalDisplayIdentity: record.internalDisplay?.identity
+            internalDisplayIdentity: record.internalDisplay?.identity,
+            internalDisplayHardwareIdentity: record.internalDisplay?.hardwareIdentity
         )
     }
 
