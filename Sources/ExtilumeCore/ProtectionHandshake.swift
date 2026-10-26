@@ -48,7 +48,7 @@ public struct ProtectionHandshake: Codable, Equatable {
     }
 
     public func accepts(record: RecoveryRecord) -> Bool {
-        session == record.session && record.generation >= generation &&
+        record.externalDisplay == nil && session == record.session && record.generation >= generation &&
             internalDisplayIdentity == record.internalDisplay?.identity &&
             internalDisplayHardwareIdentity == record.internalDisplay?.hardwareIdentity
     }

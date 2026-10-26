@@ -58,6 +58,27 @@ public final class RecoveryStore {
         beforeOperation: () throws -> Void = {},
         operation: () throws -> (layout: DisplayLayout, internalEnabled: Bool?)
     ) throws -> RecoveryRecord {
+        guard prepared.externalDisplay == nil else { throw RecoveryError.invalidRecord }
+        return try applyPrepared(prepared, beforeOperation: beforeOperation) {
+            let result = try operation()
+            return (result.layout, result.internalEnabled, nil)
+        }
+    }
+
+    public func applyExternal(
+        _ prepared: RecoveryRecord,
+        beforeOperation: () throws -> Void = {},
+        operation: () throws -> (layout: DisplayLayout, internalEnabled: Bool?, externalEnabled: Bool?)
+    ) throws -> RecoveryRecord {
+        guard prepared.externalDisplay != nil else { throw RecoveryError.invalidRecord }
+        return try applyPrepared(prepared, beforeOperation: beforeOperation, operation: operation)
+    }
+
+    private func applyPrepared(
+        _ prepared: RecoveryRecord,
+        beforeOperation: () throws -> Void,
+        operation: () throws -> (layout: DisplayLayout, internalEnabled: Bool?, externalEnabled: Bool?)
+    ) throws -> RecoveryRecord {
         guard ownsExclusiveLock else { throw RecoveryStoreError.ownershipUnavailable }
         guard prepared.phase == .prepared, !prepared.sourceUnresolved else {
             throw RecoveryError.unfinishedTransaction
@@ -83,7 +104,13 @@ public final class RecoveryStore {
         // 控制回调只能在责任记录已原子落盘后运行；失败保留 applying 责任。
         let applyingRecord = record
         let actual = try operation()
-        do { try record.confirmApplied(actual.layout, internalEnabled: actual.internalEnabled) }
+        do {
+            try record.confirmApplied(
+                actual.layout,
+                internalEnabled: actual.internalEnabled,
+                externalEnabled: actual.externalEnabled
+            )
+        }
         catch {
             let confirmationError = error
             if record.sourceUnresolved, (try? load()) == applyingRecord {

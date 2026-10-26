@@ -6,6 +6,8 @@ Extilume 是一个 macOS 菜单栏显示器工具，提供“外屏主屏”和�
 
 仓库包含[双模式App说明](docs/internal-display-app.md)、[图标资产](assets/branding/)、[OpenSpec规格](openspec/specs/)和[默认只读的本机验证入口](docs/local-display-verification.md)。开发过程日志和逐次实验记录保留在本地，不纳入Git。
 
+“仅内屏（外屏给 PC）”已有离线候选实现，**尚未通过硬件验收，普通启动不显示此入口**。候选仅面向开盖、一台已确认物理 HDMI 外屏，显示器 PC/Mac 输入由用户手动切换；自动输入能力默认不可用。操作与恢复边界见[菜单候选说明](docs/menu-bar-primary.md#仅内屏交接离线候选)。此状态不代表发布或实机可用。
+
 ## License
 
 本项目采用 [MIT License](LICENSE)，版权署名为 `Zed`。

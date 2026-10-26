@@ -85,6 +85,22 @@ public struct InternalDisplayResponsibility: Codable, Equatable, Sendable {
     }
 }
 
+public struct ExternalDisplayResponsibility: Codable, Equatable, Sendable {
+    public let identity: ExternalDisplayIdentity
+    public let numericIDHint: UInt32
+    public internal(set) var baseline: Bool
+    public internal(set) var applied: Bool
+    public internal(set) var pending: Bool
+
+    public init(identity: ExternalDisplayIdentity, numericIDHint: UInt32, baseline: Bool, applied: Bool) {
+        self.identity = identity
+        self.numericIDHint = numericIDHint
+        self.baseline = baseline
+        self.applied = applied
+        self.pending = baseline != applied
+    }
+}
+
 public struct ConnectedDisplay: Equatable {
     public let identity: UUID
     public let numericID: UInt32
@@ -110,19 +126,21 @@ public struct RecoveryRecord: Codable, Equatable, Sendable {
     public private(set) var preDisableLayout: DisplayLayout?
     public private(set) var layoutPending: Bool
     public private(set) var internalDisplay: InternalDisplayResponsibility?
+    public private(set) var externalDisplay: ExternalDisplayResponsibility?
     public private(set) var sourceUnresolved: Bool
     public private(set) var independentGuardVerified: Bool?
 
-    public var requiresRecovery: Bool { layoutPending || internalDisplay?.pending == true }
+    public var requiresRecovery: Bool { layoutPending || internalDisplay?.pending == true || externalDisplay?.pending == true }
     public var canClear: Bool { phase == .restored && !requiresRecovery && !sourceUnresolved }
 
     public init(
         session: UUID = UUID(),
         baseline: DisplayLayout,
         target: DisplayLayout,
-        internalDisplay: InternalDisplayResponsibility? = nil
+        internalDisplay: InternalDisplayResponsibility? = nil,
+        externalDisplay: ExternalDisplayResponsibility? = nil
     ) throws {
-        self.version = internalDisplay?.hardwareIdentity == nil ? 2 : 3
+        self.version = externalDisplay != nil ? 4 : (internalDisplay?.hardwareIdentity == nil ? 2 : 3)
         self.session = session
         self.generation = 1
         self.phase = .prepared
@@ -131,6 +149,7 @@ public struct RecoveryRecord: Codable, Equatable, Sendable {
         self.preDisableLayout = nil
         self.layoutPending = baseline != target
         self.internalDisplay = internalDisplay
+        self.externalDisplay = externalDisplay
         self.sourceUnresolved = false
         self.independentGuardVerified = nil
         try validate()
@@ -155,6 +174,17 @@ public struct RecoveryRecord: Codable, Equatable, Sendable {
             } else {
                 hardwareIdentityValid = false
             }
+        case 4:
+            if let hardwareIdentity = internalDisplay?.hardwareIdentity {
+                do {
+                    try hardwareIdentity.validate()
+                    hardwareIdentityValid = true
+                } catch {
+                    hardwareIdentityValid = false
+                }
+            } else {
+                hardwareIdentityValid = true
+            }
         default:
             hardwareIdentityValid = false
         }
@@ -175,13 +205,56 @@ public struct RecoveryRecord: Codable, Equatable, Sendable {
                 && Set(baselineKeys).subtracting(appliedKeys) == [responsibility.identity]
                 && appliedKeys.isSubset(of: baselineKeys)
         }()
+        let validExternalSubset: Bool = {
+            guard version == 4,
+                  phase == .owned || phase == .restoring || phase == .restored,
+                  let responsibility = externalDisplay,
+                  responsibility.baseline, !responsibility.applied,
+                  baselineKeys.count == 2,
+                  let preDisableLayout,
+                  Set(preDisableLayout.origins.keys) == baselineKeys,
+                  preDisableLayout.origins[preDisableLayout.main] == DisplayOrigin(x: 0, y: 0),
+                  preDisableLayout.main == applied.main,
+                  preDisableLayout.main != responsibility.identity.uuid,
+                  preDisableLayout.origins[preDisableLayout.main] == applied.origins[applied.main] else { return false }
+            let expectedKeys = baselineKeys.subtracting([responsibility.identity.uuid])
+            return appliedKeys == expectedKeys
+                && appliedKeys.count == 1
+                && applied.origins.allSatisfy({ preDisableLayout.origins[$0.key] == $0.value })
+                && Set(baselineKeys).subtracting(appliedKeys) == [responsibility.identity.uuid]
+                && appliedKeys.isSubset(of: baselineKeys)
+        }()
         let layoutFormatValid = version == 1
             ? preDisableLayout == nil && fullLayout
-            : preDisableLayout == nil ? fullLayout : validSubset
+            : preDisableLayout == nil ? fullLayout : (validSubset || validExternalSubset)
+        let externalIdentityValid: Bool = {
+            switch version {
+            case 1, 2, 3:
+                return externalDisplay == nil
+            case 4:
+                guard let responsibility = externalDisplay,
+                      responsibility.numericIDHint > 0,
+                      baseline.origins[responsibility.identity.uuid] != nil,
+                      internalDisplay?.identity != responsibility.identity.uuid else { return false }
+                do {
+                    try responsibility.identity.validate()
+                    return true
+                } catch {
+                    return false
+                }
+            default:
+                return false
+            }
+        }()
+        let mutuallyExclusiveDisableResponsibilities = !(
+            internalDisplay.map { $0.pending && !$0.applied } == true
+                && externalDisplay.map { $0.pending && !$0.applied } == true
+        )
         let independentGuardVerificationValid = independentGuardVerified.map {
             $0 && canClear && internalDisplay != nil
         } ?? true
-        guard (version == 1 || version == 2 || version == 3), hardwareIdentityValid, generation > 0,
+        guard (version == 1 || version == 2 || version == 3 || version == 4), hardwareIdentityValid,
+              externalIdentityValid, mutuallyExclusiveDisableResponsibilities, generation > 0,
               internalDisplay?.numericIDHint != 0,
               baseline.origins[baseline.main] == DisplayOrigin(x: 0, y: 0),
               applied.origins[applied.main] == DisplayOrigin(x: 0, y: 0),
@@ -190,7 +263,8 @@ public struct RecoveryRecord: Codable, Equatable, Sendable {
               independentGuardVerificationValid,
               phase != .restored || (!requiresRecovery && !sourceUnresolved),
               (phase != .prepared && phase != .applying) || layoutPending == (baseline != applied),
-              (phase != .prepared && phase != .applying) || internalDisplay.map({ $0.pending == ($0.baseline != $0.applied) }) ?? true else { throw RecoveryError.invalidRecord }
+              (phase != .prepared && phase != .applying) || internalDisplay.map({ $0.pending == ($0.baseline != $0.applied) }) ?? true,
+              (phase != .prepared && phase != .applying) || externalDisplay.map({ $0.pending == ($0.baseline != $0.applied) }) ?? true else { throw RecoveryError.invalidRecord }
     }
 
     public mutating func markApplying() throws {
@@ -219,13 +293,47 @@ public struct RecoveryRecord: Codable, Equatable, Sendable {
                     hardwareIdentity: responsibility.hardwareIdentity, numericIDHint: responsibility.numericIDHint
                 )
             }
+            if var responsibility = externalDisplay {
+                responsibility.applied = responsibility.baseline
+                responsibility.pending = false
+                externalDisplay = responsibility
+            }
         }
         phase = .owned
         try validate()
     }
 
-    public mutating func confirmApplied(_ actual: DisplayLayout, internalEnabled: Bool? = nil) throws {
+    public mutating func confirmApplied(
+        _ actual: DisplayLayout,
+        internalEnabled: Bool? = nil,
+        externalEnabled: Bool? = nil
+    ) throws {
         guard phase == .applying || phase == .prepared else { throw RecoveryError.invalidTransition }
+        if let responsibility = externalDisplay,
+           responsibility.baseline, !responsibility.applied, responsibility.pending {
+            guard phase == .applying, version == 4, !sourceUnresolved,
+                  internalEnabled == true,
+                  externalEnabled == false,
+                  actual.main == applied.main,
+                  actual.main != responsibility.identity.uuid,
+                  Set(actual.origins.keys) == Set(applied.origins.keys).subtracting([responsibility.identity.uuid]),
+                  actual.origins.allSatisfy({ applied.origins[$0.key] == $0.value }) else {
+                sourceUnresolved = true
+                throw RecoveryError.unresolvedSource
+            }
+            var confirmed = self
+            confirmed.preDisableLayout = applied
+            confirmed.applied = actual
+            confirmed.layoutPending = baseline != actual
+            confirmed.phase = .owned
+            do { try confirmed.validate() }
+            catch {
+                sourceUnresolved = true
+                throw RecoveryError.unresolvedSource
+            }
+            self = confirmed
+            return
+        }
         if let responsibility = internalDisplay,
            responsibility.baseline, !responsibility.applied, responsibility.pending {
             guard phase == .applying, version == 2 || version == 3,
@@ -252,7 +360,8 @@ public struct RecoveryRecord: Codable, Equatable, Sendable {
             return
         }
         guard actual == applied,
-              internalDisplay.map({ internalEnabled == $0.applied }) ?? true else {
+              internalDisplay.map({ internalEnabled == $0.applied }) ?? true,
+              externalDisplay.map({ externalEnabled == $0.applied }) ?? true else {
             sourceUnresolved = true
             throw RecoveryError.unresolvedSource
         }
@@ -276,11 +385,19 @@ public struct RecoveryRecord: Codable, Equatable, Sendable {
                 sourceUnresolved = true
                 throw RecoveryError.unresolvedSource
             }
+            if externalDisplay != nil, source == .unknown {
+                sourceUnresolved = true
+                throw RecoveryError.unresolvedSource
+            }
             return
         }
         if actual == applied {
             layoutPending = baseline != applied
             return
+        }
+        if actual == preDisableLayout, actual != baseline {
+            sourceUnresolved = true
+            throw RecoveryError.unresolvedSource
         }
         if !layoutPending && actual == baseline && source != .confirmedUser { return }
         if actual == baseline, source == .reconnect, !sourceUnresolved {
@@ -317,10 +434,54 @@ public struct RecoveryRecord: Codable, Equatable, Sendable {
         internalDisplay = responsibility
     }
 
+    public mutating func confirmExternalUserLayout(
+        _ actual: DisplayLayout, internalEnabled: Bool, externalEnabled: Bool
+    ) throws {
+        try validate()
+        guard let responsibility = externalDisplay, internalDisplay == nil,
+              phase == .owned || phase == .restoring || (phase == .restored && canClear),
+              internalEnabled, externalEnabled,
+              Set(actual.origins.keys) == Set(baseline.origins.keys),
+              actual != preDisableLayout || actual == baseline else { throw RecoveryError.unresolvedSource }
+        var confirmed = self
+        confirmed.baseline = actual
+        confirmed.layoutPending = false
+        confirmed.externalDisplay = ExternalDisplayResponsibility(
+            identity: responsibility.identity, numericIDHint: responsibility.numericIDHint,
+            baseline: true, applied: responsibility.applied
+        )
+        confirmed.externalDisplay?.pending = false
+        confirmed.sourceUnresolved = false
+        confirmed.phase = .owned
+        try confirmed.validate()
+        self = confirmed
+    }
+
+    public mutating func observeExternalEnabled(_ actual: Bool, source: ConfigurationSource) throws {
+        guard var responsibility = externalDisplay else { return }
+        if actual == responsibility.applied {
+            if phase == .owned {
+                responsibility.pending = responsibility.baseline != responsibility.applied
+                externalDisplay = responsibility
+            }
+            return
+        }
+        if !responsibility.pending && actual == responsibility.baseline { return }
+        guard phase == .owned, source == .confirmedUser else {
+            sourceUnresolved = true
+            throw RecoveryError.unresolvedSource
+        }
+        responsibility.baseline = actual
+        responsibility.pending = false
+        externalDisplay = responsibility
+    }
+
     public mutating func prepareReapplication(current: DisplayLayout, target: DisplayLayout) throws {
         guard phase == .owned, !sourceUnresolved else { throw RecoveryError.unfinishedTransaction }
-        guard current == applied || (!layoutPending && current == baseline),
+        guard current == applied || (!layoutPending && current == baseline)
+                || (externalDisplay != nil && current == preDisableLayout),
               Set(target.origins.keys) == Set(baseline.origins.keys),
+              externalDisplay.map({ target.main != $0.identity.uuid }) ?? true,
               generation < UInt64.max else { throw RecoveryError.unresolvedSource }
         generation += 1
         applied = target
@@ -329,6 +490,10 @@ public struct RecoveryRecord: Codable, Equatable, Sendable {
         if var responsibility = internalDisplay {
             responsibility.pending = responsibility.baseline != responsibility.applied
             internalDisplay = responsibility
+        }
+        if var responsibility = externalDisplay {
+            responsibility.pending = responsibility.baseline != responsibility.applied
+            externalDisplay = responsibility
         }
         independentGuardVerified = nil
         phase = .prepared
@@ -341,7 +506,7 @@ public struct RecoveryRecord: Codable, Equatable, Sendable {
 
     public mutating func confirmIndependentGuardVerification() throws {
         try validate()
-        guard canClear, internalDisplay != nil else { throw RecoveryError.invalidTransition }
+        guard canClear, internalDisplay != nil, externalDisplay == nil else { throw RecoveryError.invalidTransition }
         independentGuardVerified = true
         try validate()
     }
@@ -395,16 +560,33 @@ public struct RecoveryRecord: Codable, Equatable, Sendable {
         return (display.numericID, responsibility.baseline)
     }
 
-    public mutating func confirmRestored(actual: DisplayLayout, internalEnabled: Bool? = nil) throws {
+    public func externalRestorePlan(connected: [ConnectedDisplay]) throws -> (id: UInt32, enabled: Bool)? {
+        guard let responsibility = externalDisplay, responsibility.pending else { return nil }
+        guard Set(connected.map(\.identity)).count == connected.count,
+              Set(connected.map(\.numericID)).count == connected.count,
+              connected.allSatisfy({ $0.numericID != 0 }) else { throw RecoveryError.identityConflict }
+        guard let display = connected.first(where: { $0.identity == responsibility.identity.uuid }) else { return nil }
+        return (display.numericID, responsibility.baseline)
+    }
+
+    public mutating func confirmRestored(
+        actual: DisplayLayout,
+        internalEnabled: Bool? = nil,
+        externalEnabled: Bool? = nil
+    ) throws {
         guard phase == .restoring else { throw RecoveryError.invalidTransition }
         guard actual == baseline else { throw RecoveryError.unfinishedTransaction }
-        if layoutPending {
-            layoutPending = false
-        }
+        layoutPending = false
         if var responsibility = internalDisplay {
             guard internalEnabled == responsibility.baseline else { throw RecoveryError.unfinishedTransaction }
             responsibility.pending = false
             internalDisplay = responsibility
+        }
+        if var responsibility = externalDisplay {
+            guard internalEnabled == true,
+                  externalEnabled == responsibility.baseline else { throw RecoveryError.unfinishedTransaction }
+            responsibility.pending = false
+            externalDisplay = responsibility
         }
         guard !sourceUnresolved || actual == baseline else { throw RecoveryError.unresolvedSource }
         phase = .restored
@@ -414,6 +596,7 @@ public struct RecoveryRecord: Codable, Equatable, Sendable {
     public mutating func resumeInternalObservation(current: DisplayLayout, internalEnabled: Bool) throws {
         try validate()
         guard canClear,
+              externalDisplay == nil,
               let responsibility = internalDisplay,
               responsibility.baseline, !responsibility.applied,
               responsibility.hardwareIdentity != nil else { throw RecoveryError.invalidTransition }

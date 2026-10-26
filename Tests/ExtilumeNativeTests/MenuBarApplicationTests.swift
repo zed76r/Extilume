@@ -36,8 +36,9 @@ final class MenuBarApplicationTests: XCTestCase {
         delegate.startSession()
 
         XCTAssertEqual(delegate.menu.items.filter { !$0.isSeparatorItem }.map(\.title), [
-            "模式：外屏主屏", "等待外屏连接", "重试", "重试恢复", "设为恢复布局", "打开显示设置", "退出并恢复"
+            "模式：外屏主屏", "等待外屏连接", "重试", "重试恢复", "设为恢复布局", "自动切到 PC", "", "打开显示设置", "退出并恢复"
         ])
+        XCTAssertTrue(try item("自动切到 PC", in: delegate).isHidden)
         XCTAssertFalse(delegate.menu.autoenablesItems)
         XCTAssertFalse(try item("模式：外屏主屏", in: delegate).isEnabled)
         XCTAssertTrue(try item("重试", in: delegate).isHidden)
@@ -625,7 +626,7 @@ final class MenuBarApplicationTests: XCTestCase {
     }
 
     func testModeCheckmarksRequireAppliedStatusForBothModes() async throws {
-        for selected in DisplayApplicationMode.allCases {
+        for selected in [DisplayApplicationMode.externalPrimary, .externalOnly] {
             let session = ModeSession()
             session.selectedMode = selected
             let delegate = MenuBarApplicationDelegate(controllerFactory: { session }, replyTermination: { _ in })
@@ -650,8 +651,186 @@ final class MenuBarApplicationTests: XCTestCase {
         }
     }
 
+    func testHandoffAvailabilityIsExplicitAndRejectsUnavailableAction() throws {
+        let session = ModeSession()
+        let delegate = MenuBarApplicationDelegate(controllerFactory: { session })
+        delegate.startSession()
+        XCTAssertNil(delegate.menu.item(withTitle: "仅内屏（外屏给 PC）"))
+        let existing = try item("外屏主屏", in: delegate)
+        let unavailable = NSMenuItem(title: "仅内屏（外屏给 PC）", action: existing.action, keyEquivalent: "")
+        unavailable.target = existing.target
+        unavailable.representedObject = DisplayApplicationMode.internalOnly.rawValue
+        try dispatch(unavailable)
+        XCTAssertTrue(session.selections.isEmpty)
+    }
+
+    func testHandoffStatusRestoreAndExplicitReactivation() async throws {
+        let session = ModeSession()
+        session.availableModes.append(.internalOnly)
+        let delegate = MenuBarApplicationDelegate(controllerFactory: { session })
+        delegate.startSession()
+        let handoff = try item("仅内屏（外屏给 PC）", in: delegate)
+        try dispatch(handoff)
+        XCTAssertEqual(session.selections, [.internalOnly])
+        XCTAssertEqual(handoff.state, .off)
+        XCTAssertEqual(delegate.accessibilityStatusLabel, "Extilume，模式：仅内屏（外屏给 PC），正在停用外接屏…")
+        XCTAssertFalse(handoff.isEnabled)
+        session.emit(.applied)
+        await drainMainQueue()
+        XCTAssertEqual(handoff.state, .on)
+        XCTAssertEqual(delegate.accessibilityStatusLabel, "Extilume，模式：仅内屏（外屏给 PC），外接屏已停用，请切换显示器到 PC")
+        let restore = try item("恢复外接屏", in: delegate)
+        XCTAssertFalse(restore.isHidden)
+        XCTAssertTrue(restore.isEnabled)
+        XCTAssertTrue(try XCTUnwrap(restore.toolTip).contains("不会自动重新停用外接屏"))
+        try dispatch(restore)
+        try dispatch(restore)
+        try dispatch(handoff)
+        XCTAssertEqual(session.configurationRestores, 1)
+        XCTAssertEqual(session.selections, [.internalOnly])
+        XCTAssertEqual(handoff.state, .off)
+        XCTAssertFalse(restore.isEnabled)
+        XCTAssertFalse(try item("退出并恢复", in: delegate).isEnabled)
+        XCTAssertTrue(delegate.accessibilityStatusLabel.contains("正在恢复…"))
+        session.emit(.manualConfiguration)
+        await drainMainQueue()
+        XCTAssertTrue(delegate.accessibilityStatusLabel.contains("外接屏已恢复，请切换显示器到 Mac"))
+        XCTAssertTrue(restore.isHidden)
+        XCTAssertEqual(handoff.state, .off)
+        XCTAssertEqual(session.selections, [.internalOnly])
+        XCTAssertEqual(session.retries, 0)
+        XCTAssertTrue(try item("设为恢复布局", in: delegate).isHidden)
+        try dispatch(try item("应用仅内屏", in: delegate))
+        XCTAssertEqual(session.retries, 1)
+        XCTAssertTrue(delegate.accessibilityStatusLabel.contains("正在停用外接屏…"))
+    }
+
+    func testHandoffErrorsAndBusyStatesKeepModesExclusive() async throws {
+        let session = ModeSession()
+        session.availableModes.append(.internalOnly)
+        session.selectedMode = .internalOnly
+        let delegate = MenuBarApplicationDelegate(controllerFactory: { session }, replyTermination: { _ in })
+        delegate.startSession()
+        let modes = try session.availableModes.map { try item($0.title, in: delegate) }
+        for status in [PrimarySessionStatus.applying, .recoveryIncomplete, .quitFailed,
+                       .unconfirmed, .restoringAndQuitting, .quitWaitingForDisplays] {
+            session.emit(status)
+            await drainMainQueue()
+            XCTAssertTrue(modes.allSatisfy { !$0.isEnabled && $0.state == .off })
+            for mode in modes { try dispatch(mode) }
+            XCTAssertTrue(session.selections.isEmpty)
+            let restore = try item("恢复外接屏", in: delegate)
+            XCTAssertTrue(restore.isHidden)
+            XCTAssertFalse(restore.isEnabled)
+            if status != .applying {
+                XCTAssertTrue(delegate.accessibilityStatusLabel.contains(status.text))
+            }
+        }
+    }
+
+    func testInputSettingsAreHiddenUntilCandidateOrRecoveryIsVisible() throws {
+        let session = ModeSession()
+        let delegate = MenuBarApplicationDelegate(controllerFactory: { session })
+        delegate.startSession()
+        let settings = try item("自动切到 PC", in: delegate)
+        XCTAssertTrue(settings.isHidden)
+        session.selectedMode = .internalOnly
+        session.modeDidChange?()
+        XCTAssertFalse(settings.isHidden)
+        let submenu = try XCTUnwrap(settings.submenu)
+        XCTAssertFalse(try XCTUnwrap(submenu.item(withTitle: "当前连接尚未验收自动输入源切换")).isEnabled)
+        let toggle = try XCTUnwrap(submenu.item(withTitle: "启用自动切到 PC"))
+        XCTAssertEqual(toggle.state, .off)
+        XCTAssertFalse(toggle.isEnabled)
+        try dispatch(toggle)
+        XCTAssertTrue(session.inputSelections.isEmpty)
+        XCTAssertTrue(session.automaticChanges.isEmpty)
+    }
+
+    func testVerifiedInputSettingsRequireExplicitPortAndToggleAndPreserveSeparateResult() async throws {
+        let session = ModeSession()
+        session.availableModes.append(.internalOnly)
+        session.inputUnavailableReason = nil
+        session.inputOptions = [0x11, 0x12]
+        let delegate = MenuBarApplicationDelegate(controllerFactory: { session })
+        delegate.startSession()
+        let settings = try item("自动切到 PC", in: delegate)
+        func option(_ title: String) throws -> NSMenuItem {
+            try XCTUnwrap(settings.submenu?.item(withTitle: title))
+        }
+        XCTAssertFalse(try option("启用自动切到 PC").isEnabled)
+        XCTAssertTrue(session.inputSelections.isEmpty)
+        try dispatch(try option("PC 输入 0x12（请确认端口）"))
+        XCTAssertEqual(session.inputSelections, [0x12])
+        XCTAssertEqual(try option("PC 输入 0x12（请确认端口）").state, .on)
+        XCTAssertEqual(try option("PC 输入 0x11（请确认端口）").state, .off)
+        XCTAssertTrue(try option("启用自动切到 PC").isEnabled)
+        XCTAssertTrue(session.automaticChanges.isEmpty)
+        try dispatch(try option("启用自动切到 PC"))
+        XCTAssertEqual(session.automaticChanges, [true])
+        XCTAssertEqual(try option("启用自动切到 PC").state, .on)
+        session.inputResultText = "输入源未确认，请手动检查显示器"
+        session.inputSettingsDidChange?()
+        let result = try item("输入源未确认，请手动检查显示器", in: delegate)
+        XCTAssertFalse(result.isEnabled)
+        XCTAssertFalse(result.isHidden)
+        XCTAssertEqual(session.inputSelections, [0x12])
+        XCTAssertEqual(session.automaticChanges, [true])
+        for status in [PrimarySessionStatus.applying, .recoveryIncomplete, .restoringAndQuitting] {
+            session.emit(status)
+            await drainMainQueue()
+            let port = try option("PC 输入 0x11（请确认端口）")
+            let toggle = try option("启用自动切到 PC")
+            XCTAssertFalse(port.isEnabled)
+            XCTAssertFalse(toggle.isEnabled)
+            try dispatch(port)
+            try dispatch(toggle)
+        }
+        XCTAssertEqual(session.inputSelections, [0x12])
+        XCTAssertEqual(session.automaticChanges, [true])
+    }
+
+    func testInputSettingsRejectUnverifiedPortEvenThroughForgedAction() throws {
+        let session = ModeSession()
+        session.availableModes.append(.internalOnly)
+        session.inputUnavailableReason = nil
+        session.inputOptions = [0x11]
+        let delegate = MenuBarApplicationDelegate(controllerFactory: { session })
+        delegate.startSession()
+        let submenu = try XCTUnwrap(try item("自动切到 PC", in: delegate).submenu)
+        let port = try XCTUnwrap(submenu.item(withTitle: "PC 输入 0x11（请确认端口）"))
+        port.representedObject = NSNumber(value: 0x12)
+        try dispatch(port)
+        XCTAssertTrue(session.inputSelections.isEmpty)
+        session.selectedPCInput = 0x12
+        session.inputSettingsDidChange?()
+        let toggle = try XCTUnwrap(try item("自动切到 PC", in: delegate).submenu?.item(withTitle: "启用自动切到 PC"))
+        XCTAssertFalse(toggle.isEnabled)
+        try dispatch(toggle)
+        XCTAssertTrue(session.automaticChanges.isEmpty)
+    }
+
     @MainActor
-    private final class ModeSession: FakeSession, DisplayModeSelecting {
+    private final class ModeSession: FakeSession, DisplayModeSelecting, ExternalDisplayInputSettingsSelecting {
+        var inputOptions: [UInt16] = []
+        var selectedPCInput: UInt16?
+        var automaticInputEnabled = false
+        var inputUnavailableReason: String? = "当前连接尚未验收自动输入源切换"
+        var inputResultText: String?
+        var inputSettingsDidChange: (@MainActor () -> Void)?
+        var inputSelections: [UInt16] = []
+        var automaticChanges: [Bool] = []
+        func selectPCInput(_ input: UInt16) {
+            inputSelections.append(input)
+            selectedPCInput = input
+            inputSettingsDidChange?()
+        }
+        func setAutomaticInput(_ enabled: Bool) {
+            automaticChanges.append(enabled)
+            automaticInputEnabled = enabled
+            inputSettingsDidChange?()
+        }
+        var availableModes: [DisplayApplicationMode] = [.externalPrimary, .externalOnly]
         var selectedMode: DisplayApplicationMode?
         var requiresExplicitActivation = false
         var modeDidChange: (@MainActor () -> Void)?
