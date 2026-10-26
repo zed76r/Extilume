@@ -198,6 +198,7 @@ func snapshotWitnessFailureCode(_ error: Error) -> String {
         case .cleanupFailed: return "witness-cleanup"
         case .internalStateChanged: return "internal-state-changed"
         case .internalInformationUnavailable: return "internal-information-unavailable"
+        case .externalStateChanged: return "external-state-changed"
         }
     }
     return "unclassified"
@@ -316,6 +317,63 @@ func readInternalDisplay(
         }
         throw error
     }
+}
+
+func readExternalDisplayState(_ id: UInt32) throws -> ExternalDisplayState? {
+    guard id != 0,
+          CGDisplayIsBuiltin(id) == 0,
+          let info = coreDisplayCreateInfo?(id)?.takeRetainedValue() as? [String: Any],
+          (info["kCGDisplayID"] as? NSNumber)?.uint32Value == id,
+          let location = info["IODisplayLocation"] as? String, !location.isEmpty,
+          let displayUUIDText = (info["DisplayUUID"] as? String) ?? (info["kCGDisplayUUID"] as? String),
+          let displayUUID = UUID(uuidString: displayUUIDText) else { return nil }
+
+    let evidence = registryEvidence()
+    guard matchPhysicalHDMIDisplayUUID(
+        location: location, displayUUID: displayUUIDText, candidates: evidence
+    ) == displayUUID else { return nil }
+    let pathMatches = evidence.filter { $0.registryPath == location }
+    guard pathMatches.count == 1,
+          let registry = pathMatches.first,
+          registry.downstream == "HDMI",
+          let edidUUID = registry.edidUUID, !edidUUID.isEmpty else { return nil }
+
+    let service = IORegistryEntryFromPath(kIOMainPortDefault, location)
+    guard service != IO_OBJECT_NULL else { return nil }
+    defer { IOObjectRelease(service) }
+    var registryEntryID: UInt64 = 0
+    guard IOObjectConformsTo(service, "IOMobileFramebufferShim") != 0,
+          IORegistryEntryGetRegistryEntryID(service, &registryEntryID) == KERN_SUCCESS,
+          registryEntryID != 0 else { return nil }
+
+    let identity = ExternalDisplayIdentity(
+        uuid: displayUUID,
+        registryPath: location,
+        edidUUID: edidUUID,
+        bootSession: try currentBootSession(),
+        registryEntryID: registryEntryID
+    )
+    try identity.validate()
+    return ExternalDisplayState(
+        id: id,
+        identity: identity,
+        isOnline: CGDisplayIsOnline(id) != 0,
+        isActive: CGDisplayIsActive(id) != 0
+    )
+}
+
+func readExternalDisplay(
+    identity: ExternalDisplayIdentity,
+    numericIDHint: UInt32
+) throws -> ExternalDisplayState {
+    try matchExternalDisplay(
+        identity: identity,
+        numericIDHint: numericIDHint,
+        candidates: try displayList("在线", read: CGGetOnlineDisplayList)
+            + displayList("活动", read: CGGetActiveDisplayList),
+        currentBootSession: try currentBootSession(),
+        read: readExternalDisplayState
+    )
 }
 
 func readSnapshot(activeOnly: Bool = false) throws -> Snapshot {
@@ -500,10 +558,15 @@ private func recordRecoveryConfirmation(to path: String) throws -> Bool {
 
 @MainActor
 public func runDisplayProbe() {
+    do { if try runExternalDisplayInputProbeIfRequested() { return } }
+    catch { exit(EXIT_FAILURE) }
     setlinebuf(stdout) // 辅助进程共享管道时，逐行证据须及时可见。
     if CommandLine.arguments.dropFirst().contains(where: { $0 == "--help" || $0 == "-h" }) {
         print("""
         只读：extilume-probe
+        外屏责任只读：extilume-probe --external-status <0700 状态目录>
+        外屏停用原型（需当轮授权）：extilume-probe --verify-external-disable --allow-display-write <0700 独立状态目录>
+        外屏恢复原型（需当轮授权）：extilume-probe --recover-external --allow-display-write <同一状态目录>
         主屏验证：extilume-probe --verify-primary <0700 状态目录>
         补偿恢复：extilume-probe --recover-primary <同一状态目录>
         退出后独立核对并清除：extilume-probe --finalize-primary <同一状态目录>
@@ -523,6 +586,20 @@ public func runDisplayProbe() {
         验证命令：status、confirm-user（仅在你已手动修改布局后）、reapply、stop。
         内屏停用验证命令：status、restore、confirm-user、reapply、stop。睡眠及完整故障恢复尚未实机验收。
         """)
+    } else if ["--external-status", "--verify-external-disable", "--recover-external"].contains(CommandLine.arguments.dropFirst().first ?? "") {
+        do {
+            guard let command = try ExternalVerificationCommand(arguments: Array(CommandLine.arguments.dropFirst())) else {
+                throw ApplicationLaunchError.invalidArguments
+            }
+            try runExternalVerification(command)
+        } catch {
+            fputs("外屏验证未完成，类别=\(snapshotWitnessFailureCode(error))；保留责任，请只读核对后使用外屏恢复入口。\n", stderr)
+            exit(EXIT_FAILURE)
+        }
+    } else if CommandLine.arguments.count == 3, CommandLine.arguments[1] == "--external-display-snapshot",
+              let descriptor = Int32(CommandLine.arguments[2]), descriptor >= 3 {
+        do { try serveExternalDisplay(descriptor: descriptor) }
+        catch { exit(EXIT_FAILURE) }
     } else if CommandLine.arguments.dropFirst().first == "--record-suspension-evidence" {
         do {
             guard CommandLine.arguments.count == 3 else { throw RecoveryError.invalidRecord }
