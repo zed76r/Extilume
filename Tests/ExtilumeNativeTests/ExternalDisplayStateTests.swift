@@ -87,6 +87,66 @@ final class ExternalDisplayStateTests: XCTestCase {
         XCTAssertFalse(actual.isEnabled)
     }
 
+    func testChangedInactiveTargetCanBeFoundOnlyInPrivateSlots() throws {
+        let expected = state(id: 42, isOnline: false, isActive: false)
+        var reads: [UInt32] = []
+        let actual = try matchExternalDisplay(
+            identity: identity, numericIDHint: 7, candidates: [1],
+            privateCandidates: [1, 42, 7, 42], currentBootSession: bootSession
+        ) { id in
+            reads.append(id)
+            return id == 42 ? expected : nil
+        }
+        XCTAssertEqual(actual, expected)
+        XCTAssertEqual(reads, [1, 42, 7])
+        XCTAssertFalse(actual.isEnabled)
+    }
+
+    func testPrivateSlotMembershipDoesNotAuthorizeAnUnidentifiedTarget() {
+        assertIdentityConflict(try matchExternalDisplay(
+            identity: identity, numericIDHint: 7, candidates: [],
+            privateCandidates: [7], currentBootSession: bootSession
+        ) { _ in nil })
+
+        let zeroIdentity = ExternalDisplayIdentity(
+            uuid: UUID(uuidString: "00000000-0000-0000-0000-000000000000")!,
+            registryPath: identity.registryPath, edidUUID: identity.edidUUID,
+            bootSession: bootSession, registryEntryID: identity.registryEntryID
+        )
+        assertIdentityConflict(try matchExternalDisplay(
+            identity: identity, numericIDHint: 7, candidates: [],
+            privateCandidates: [7], currentBootSession: bootSession
+        ) { id in self.state(id: id, identity: zeroIdentity, isOnline: false, isActive: false) })
+    }
+
+    func testAmbiguousPrivateSlotsRemainRejected() {
+        assertIdentityConflict(try matchExternalDisplay(
+            identity: identity, numericIDHint: 7, candidates: [],
+            privateCandidates: [42, 43], currentBootSession: bootSession
+        ) { id in id == 7 ? nil : self.state(id: id, isOnline: false, isActive: false) })
+    }
+
+    func testPrivateSlotsCannotBypassRegistryOrBootBinding() {
+        let differentEntry = ExternalDisplayIdentity(
+            uuid: uuid, registryPath: identity.registryPath, edidUUID: identity.edidUUID,
+            bootSession: bootSession, registryEntryID: identity.registryEntryID + 1
+        )
+        assertIdentityConflict(try matchExternalDisplay(
+            identity: identity, numericIDHint: 7, candidates: [],
+            privateCandidates: [42], currentBootSession: bootSession
+        ) { id in id == 42 ? self.state(id: id, identity: differentEntry) : nil })
+
+        var read = false
+        assertIdentityConflict(try matchExternalDisplay(
+            identity: identity, numericIDHint: 7, candidates: [],
+            privateCandidates: [42], currentBootSession: otherBootSession
+        ) { _ in
+            read = true
+            return self.state(id: 42)
+        })
+        XCTAssertFalse(read)
+    }
+
     func testReusedNumericIDCannotMatchAnotherDisplay() {
         let reused = state(id: 7, identity: ExternalDisplayIdentity(
             uuid: otherUUID,

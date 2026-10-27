@@ -8,6 +8,7 @@ final class ExternalDisplayVerification {
     private let snapshot: () throws -> Snapshot
     private let topology: () throws -> Snapshot
     private let external: (ExternalDisplayIdentity, UInt32) throws -> ExternalDisplayState
+    private let recoveryObservation: (ExternalDisplayIdentity, UInt32) throws -> ExternalRecoveryObservation
     private let capture: (UInt32) throws -> ExternalDisplayState
     private let lidIsOpen: () -> Bool
     private let transaction: () throws -> DisplayEnableTransaction
@@ -18,9 +19,8 @@ final class ExternalDisplayVerification {
     init(directory: URL, recoveryStore: RecoveryStore? = nil,
          snapshot: @escaping () throws -> Snapshot = { try freshActiveSnapshot() },
          topology: @escaping () throws -> Snapshot = { try freshSnapshot() },
-         external: @escaping (ExternalDisplayIdentity, UInt32) throws -> ExternalDisplayState = {
-             try freshExternalDisplay(identity: $0, numericIDHint: $1)
-         },
+         external: ((ExternalDisplayIdentity, UInt32) throws -> ExternalDisplayState)? = nil,
+         recoveryObservation: ((ExternalDisplayIdentity, UInt32) throws -> ExternalRecoveryObservation)? = nil,
          capture: @escaping (UInt32) throws -> ExternalDisplayState = {
              guard let state = try readExternalDisplayState($0) else { throw RecoveryError.identityConflict }
              return state
@@ -35,7 +35,11 @@ final class ExternalDisplayVerification {
         store = try recoveryStore ?? RecoveryStore(directory: directory)
         self.snapshot = snapshot
         self.topology = topology
-        self.external = external
+        let strictReader = external ?? { try freshExternalDisplay(identity: $0, numericIDHint: $1, checkAccess: checkAccess) }
+        self.external = strictReader
+        if let recoveryObservation { self.recoveryObservation = recoveryObservation }
+        else if external != nil { self.recoveryObservation = { .identified(try strictReader($0, $1)) } }
+        else { self.recoveryObservation = { try freshExternalRecoveryObservation(identity: $0, numericIDHint: $1, checkAccess: checkAccess) } }
         self.capture = capture
         self.lidIsOpen = lidIsOpen
         self.transaction = transaction
@@ -48,10 +52,11 @@ final class ExternalDisplayVerification {
         guard let record = try store.load(), let responsibility = record.externalDisplay else {
             return "没有外屏责任；未写显示配置。"
         }
-        let actual = try external(responsibility.identity, responsibility.numericIDHint)
+        let actual = try observe(responsibility)
         let current = try snapshot()
         let internalActive = current.displays.filter { $0.identity == .builtIn && $0.isOnline && $0.isActive }.count == 1
-        return "外屏目标已重认；外屏活动=\(actual.isEnabled)，内屏活动=\(internalActive)，待恢复=\(record.requiresRecovery)。未写显示配置；PC 画面须人工确认。"
+        let identityText = actual.identifiedState == nil ? "原停用连接已核对；恢复需确认连接未变" : "外屏目标已重认"
+        return "\(identityText)；外屏活动=\(actual.isEnabled)，内屏活动=\(internalActive)，待恢复=\(record.requiresRecovery)。未写显示配置；PC 画面须人工确认。"
     }
 
     func disable(beforeDisable: (ExternalDisplayIdentity) -> Void = { _ in }) throws {
@@ -101,12 +106,12 @@ final class ExternalDisplayVerification {
                                            snapshotReader: self.topology,
                                            externalReader: { try self.external(target.identity, target.id) },
                                            lidIsOpen: self.lidIsOpen, checkAccess: self.checkAccess, nativeCall: self.nativeCall)
-                let observed = try self.external(target.identity, target.id)
+                let observed = try self.observe(applying.externalDisplay!)
                 let actual = try self.snapshot()
                 guard actual.displays.count == 1, actual.displays.first?.identity == .builtIn,
                       actual.displays.first?.isOnline == true, actual.displays.first?.isActive == true,
                       actual.displays.first?.identityUUID == internalID,
-                      !observed.isActive else { throw RecoveryError.unresolvedSource }
+                      observed.isDisabled else { throw RecoveryError.unresolvedSource }
                 return (layout: try actual.layout(), internalEnabled: true as Bool?, externalEnabled: false as Bool?)
             }
         } catch {
@@ -122,7 +127,7 @@ final class ExternalDisplayVerification {
         guard var record = try store.load(), let responsibility = record.externalDisplay,
               record.internalDisplay == nil else { throw RecoveryError.invalidRecord }
         try checkAccess()
-        let target = try external(responsibility.identity, responsibility.numericIDHint)
+        let target = try observe(responsibility)
         let actual = try snapshot()
         let internals = actual.displays.filter { $0.identity == .builtIn && $0.isOnline && $0.isActive }
         guard internals.count == 1, lidIsOpen() else {
@@ -133,7 +138,7 @@ final class ExternalDisplayVerification {
             try restoreLocked()
             return .manualConfiguration
         }
-        if !target.isActive {
+        if target.isDisabled {
             guard actual.displays.count == 1, try actual.layout() == record.applied,
                   !record.sourceUnresolved else {
                 if record.phase == .applying, !record.sourceUnresolved {
@@ -147,6 +152,7 @@ final class ExternalDisplayVerification {
             guard record.phase == .owned else { throw RecoveryError.unfinishedTransaction }
             return .applied
         }
+        guard target.identifiedState != nil else { throw RecoveryError.identityConflict }
         guard record.phase == .owned, !record.sourceUnresolved else { throw RecoveryError.unfinishedTransaction }
         if allowReapplication {
             try checkAccess()
@@ -165,6 +171,55 @@ final class ExternalDisplayVerification {
     func hasRecord() throws -> Bool { try store.load() != nil }
     func targetIdentity() throws -> ExternalDisplayIdentity? { try store.load()?.externalDisplay?.identity }
 
+    func hasCompleteIdentityForInput() throws -> Bool {
+        guard let responsibility = try store.load()?.externalDisplay else { return false }
+        return try observe(responsibility).identifiedState != nil
+    }
+
+    private func observe(_ responsibility: ExternalDisplayResponsibility) throws -> ExternalRecoveryObservation {
+        let observation = try recoveryObservation(responsibility.identity, responsibility.numericIDHint)
+        guard observation.matches(identity: responsibility.identity, numericIDHint: responsibility.numericIDHint) else {
+            throw RecoveryError.identityConflict
+        }
+        return observation
+    }
+
+    func prepareConnectionRecovery() throws -> ExternalConnectionRecoveryConfirmation? {
+        try store.acquireExclusiveOwnership()
+        guard let record = try store.load(), let responsibility = record.externalDisplay,
+              record.internalDisplay == nil else { throw RecoveryError.invalidRecord }
+        try checkAccess()
+        let observation = try observe(responsibility)
+        try checkAccess()
+        guard try store.load() == record else { throw RecoveryError.unfinishedTransaction }
+        guard case .connection(let evidence) = observation else { return nil }
+        guard !record.canClear, responsibility.pending, evidence.isDisabled else {
+            throw RecoveryError.unfinishedTransaction
+        }
+        try validateConnectionRecovery(record)
+        try checkAccess()
+        guard try store.load() == record else { throw RecoveryError.unfinishedTransaction }
+        return ExternalConnectionRecoveryConfirmation(record: record)
+    }
+
+    // 此例外只启用本次停用连接；内屏仍须可操作，不能扩大到其他槽或屏。
+    private func validateConnectionRecovery(_ record: RecoveryRecord) throws {
+        guard let responsibility = record.externalDisplay,
+              let internalID = record.baseline.origins.keys.first(where: { $0 != responsibility.identity.uuid }),
+              record.baseline.origins.count == 2, lidIsOpen() else {
+            throw DisplayEnableTransactionError.unsafeTopology
+        }
+        let current = try topology()
+        let builtIns = current.displays.filter { $0.identity == .builtIn }
+        guard builtIns.count == 1, let builtIn = builtIns.first,
+              builtIn.identityUUID == internalID, builtIn.isOnline, builtIn.isActive, builtIn.isMain,
+              (1...2).contains(current.displays.count),
+              current.displays.allSatisfy({ !$0.isMirrored && ($0.id == builtIn.id ||
+                  ($0.id == responsibility.numericIDHint && $0.identity != .builtIn)) }) else {
+            throw DisplayEnableTransactionError.unsafeTopology
+        }
+    }
+
     func confirmUserLayout() throws {
         guard var record = try store.load(), record.externalDisplay != nil else { throw RecoveryError.invalidRecord }
         let current = try topology()
@@ -180,18 +235,28 @@ final class ExternalDisplayVerification {
         try store.save(record)
     }
 
-    func restore() throws {
+    func restore(confirmation: ExternalConnectionRecoveryConfirmation? = nil,
+                 connectionEnabled: () -> Void = {}) throws {
         try store.acquireExclusiveOwnership()
-        try restoreLocked()
+        try restoreLocked(confirmation: confirmation, connectionEnabled: connectionEnabled)
     }
 
-    private func restoreLocked() throws {
+    private func restoreLocked(confirmation: ExternalConnectionRecoveryConfirmation? = nil,
+                               connectionEnabled: () -> Void = {}) throws {
         guard var record = try store.load(), let responsibility = record.externalDisplay,
               record.internalDisplay == nil else { throw RecoveryError.invalidRecord }
         try checkAccess()
-        let target = try external(responsibility.identity, responsibility.numericIDHint)
+        if let confirmation, !confirmation.consume(for: record) { throw RecoveryError.invalidTransition }
+        let observation = try observe(responsibility)
+        if case .connection(let evidence) = observation {
+            guard !record.canClear, responsibility.pending, evidence.isDisabled else {
+                throw RecoveryError.unfinishedTransaction
+            }
+            guard confirmation != nil else { throw ExternalConnectionRecoveryError.confirmationRequired }
+            try validateConnectionRecovery(record)
+        }
         if record.canClear {
-            guard target.isEnabled else { throw RecoveryError.unfinishedTransaction }
+            guard observation.identifiedState?.isEnabled == true else { throw RecoveryError.unfinishedTransaction }
             let current = try topology()
             guard current.assessment.isSupported, current.displays.count == 2,
                   current.displays.filter({ $0.identity == .builtIn && $0.isOnline && $0.isActive }).count == 1,
@@ -205,14 +270,30 @@ final class ExternalDisplayVerification {
             guard actual == record.baseline else { throw RecoveryError.unresolvedSource }
             return
         }
+        try checkAccess()
+        guard try store.load() == record else { throw RecoveryError.unfinishedTransaction }
         record.beginRestoration()
         try store.save(record)
-        if !target.isEnabled {
-            try transaction().enableExternalForRecovery(
-                record: record, loadRecord: store.load,
-                externalReader: { try self.external(responsibility.identity, responsibility.numericIDHint) },
-                checkAccess: checkAccess, nativeCall: nativeCall
-            )
+        if !observation.isEnabled {
+            if case .connection = observation {
+                let durable = record
+                try transaction().enableExternalConnectionForRecovery(
+                    record: durable, loadRecord: store.load,
+                    observationReader: { try self.observe(responsibility) },
+                    checkAccess: {
+                        try self.checkAccess()
+                        try self.validateConnectionRecovery(durable)
+                    }, nativeCall: nativeCall
+                )
+                connectionEnabled()
+                try checkAccess()
+            } else {
+                try transaction().enableExternalForRecovery(
+                    record: record, loadRecord: store.load,
+                    externalReader: { try self.external(responsibility.identity, responsibility.numericIDHint) },
+                    checkAccess: checkAccess, nativeCall: nativeCall
+                )
+            }
         }
         guard try external(responsibility.identity, responsibility.numericIDHint).isEnabled else {
             throw RecoveryError.unfinishedTransaction
@@ -234,22 +315,43 @@ final class ExternalDisplayVerification {
         let actual = try snapshot().layout()
         let enabled = try external(responsibility.identity, responsibility.numericIDHint).isEnabled
         let internalActive = try snapshot().displays.filter { $0.identity == .builtIn && $0.isOnline && $0.isActive }.count == 1
+        try checkAccess()
+        guard try store.load() == record else { throw RecoveryError.unfinishedTransaction }
         try record.confirmRestored(actual: actual, internalEnabled: internalActive, externalEnabled: enabled)
         try store.save(record)
     }
 }
 
+private extension ExternalRecoveryObservation {
+    var identifiedState: ExternalDisplayState? {
+        if case .identified(let state) = self { return state }
+        return nil
+    }
+    var isEnabled: Bool {
+        switch self {
+        case .identified(let state): return state.isEnabled
+        case .connection(let evidence): return evidence.isOnline && evidence.isActive
+        }
+    }
+    var isDisabled: Bool {
+        switch self {
+        case .identified(let state): return !state.isActive
+        case .connection(let evidence): return evidence.isDisabled
+        }
+    }
+}
+
 enum ExternalVerificationCommand: Equatable {
-    case status(String), disable(String), restore(String)
+    case status(String), diagnose(String), disable(String), restore(String)
 
     init?(arguments: [String]) throws {
         guard let flag = arguments.first,
-              ["--external-status", "--verify-external-disable", "--recover-external"].contains(flag) else { return nil }
-        if flag == "--external-status" {
+              ["--external-status", "--diagnose-external-recovery", "--verify-external-disable", "--recover-external"].contains(flag) else { return nil }
+        if flag == "--external-status" || flag == "--diagnose-external-recovery" {
             guard arguments.count == 2, !arguments[1].isEmpty, !arguments[1].hasPrefix("--") else {
                 throw ApplicationLaunchError.invalidArguments
             }
-            self = .status(arguments[1])
+            self = flag == "--external-status" ? .status(arguments[1]) : .diagnose(arguments[1])
         } else {
             guard arguments.count == 3, arguments[1] == "--allow-display-write",
                   !arguments[2].isEmpty, !arguments[2].hasPrefix("--") else {
@@ -260,10 +362,27 @@ enum ExternalVerificationCommand: Equatable {
     }
 }
 
+func readExternalRecoveryDiagnosticReport(
+    directory: URL,
+    reader: (RecoveryRecord) throws -> String = { try externalRecoveryDiagnosticReport(for: $0) }
+) throws -> String {
+    let store = try RecoveryStore(directory: directory)
+    guard let record = try store.load() else { return "没有外屏责任；未写显示配置。" }
+    guard record.externalDisplay != nil, record.internalDisplay == nil else { throw RecoveryError.invalidRecord }
+    let report = try reader(record)
+    guard try store.load() == record else { throw RecoveryError.unfinishedTransaction }
+    return report
+}
+
 func runExternalVerification(_ command: ExternalVerificationCommand) throws {
-    if case .status(let path) = command {
+    switch command {
+    case .status(let path):
         print(try ExternalDisplayVerification(directory: URL(fileURLWithPath: path)).status())
         return
+    case .diagnose(let path):
+        print(try readExternalRecoveryDiagnosticReport(directory: URL(fileURLWithPath: path)))
+        return
+    case .disable, .restore: break
     }
     let gate = InternalPowerGate()
     let observer = InternalSystemPowerObserver(
@@ -279,7 +398,7 @@ func runExternalVerification(_ command: ExternalVerificationCommand) throws {
     let path: String
     switch command {
     case .disable(let value), .restore(let value): path = value
-    case .status: return
+    case .status, .diagnose: return
     }
     let verifier = try ExternalDisplayVerification(
         directory: URL(fileURLWithPath: path),
@@ -293,12 +412,12 @@ func runExternalVerification(_ command: ExternalVerificationCommand) throws {
     case .disable:
         try verifier.disable()
         print("外接屏已独立核验停用；请手动切到 PC。内屏交互和 PC 画面仍须人工确认。")
-        print("会话保持中；status 只读核对，restore / stop 恢复后结束。")
+        print("会话保持中；status 只读核对，restore / stop 恢复后结束。UUID 为零时需退出此入口并在同一目录的候选 App 中显式确认恢复。")
         try holdExternalVerification(verifier)
     case .restore:
         try verifier.restore()
         print("Mac 外屏启用及布局已核验，责任记录保留；请手动切回 Mac 输入。")
-    case .status: break
+    case .status, .diagnose: break
     }
 }
 

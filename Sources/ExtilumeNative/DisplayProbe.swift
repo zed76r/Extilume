@@ -41,6 +41,11 @@ private let coreDisplayCreateInfo: CoreDisplayCreateInfo? = {
     return unsafeBitCast(symbol, to: CoreDisplayCreateInfo.self)
 }()
 
+func coreDisplayRecoveryDiagnosticInfo(_ id: UInt32) -> [String: Any]? {
+    guard id != 0 else { return nil }
+    return coreDisplayCreateInfo?(id)?.takeRetainedValue() as? [String: Any]
+}
+
 private func registryEvidence() -> [DisplayRegistryEvidence] {
     var iterator: io_iterator_t = 0
     let status = IOServiceGetMatchingServices(
@@ -152,6 +157,7 @@ private enum ProbeError: Error, CustomStringConvertible {
 
 // 仅输出固定分类，不插入底层错误描述或设备身份。
 func snapshotWitnessFailureCode(_ error: Error) -> String {
+    if error is ExternalConnectionRecoveryError { return "connection-confirmation-required" }
     if let error = error as? DisplayEnableTransactionError {
         switch error {
         case .symbolUnavailable: return "enable-symbol-unavailable"
@@ -366,12 +372,15 @@ func readExternalDisplay(
     identity: ExternalDisplayIdentity,
     numericIDHint: UInt32
 ) throws -> ExternalDisplayState {
-    try matchExternalDisplay(
+    let bootSession = try currentBootSession()
+    guard identity.bootSession == bootSession else { throw RecoveryError.identityConflict }
+    return try matchExternalDisplay(
         identity: identity,
         numericIDHint: numericIDHint,
         candidates: try displayList("在线", read: CGGetOnlineDisplayList)
             + displayList("活动", read: CGGetActiveDisplayList),
-        currentBootSession: try currentBootSession(),
+        privateCandidates: readPrivateDisplaySlots().displayIDs ?? [],
+        currentBootSession: bootSession,
         read: readExternalDisplayState
     )
 }
@@ -565,6 +574,7 @@ public func runDisplayProbe() {
         print("""
         只读：extilume-probe
         外屏责任只读：extilume-probe --external-status <0700 状态目录>
+        外屏恢复身份诊断（只读）：extilume-probe --diagnose-external-recovery <0700 状态目录>
         外屏停用原型（需当轮授权）：extilume-probe --verify-external-disable --allow-display-write <0700 独立状态目录>
         外屏恢复原型（需当轮授权）：extilume-probe --recover-external --allow-display-write <同一状态目录>
         主屏验证：extilume-probe --verify-primary <0700 状态目录>
@@ -586,7 +596,7 @@ public func runDisplayProbe() {
         验证命令：status、confirm-user（仅在你已手动修改布局后）、reapply、stop。
         内屏停用验证命令：status、restore、confirm-user、reapply、stop。睡眠及完整故障恢复尚未实机验收。
         """)
-    } else if ["--external-status", "--verify-external-disable", "--recover-external"].contains(CommandLine.arguments.dropFirst().first ?? "") {
+    } else if ["--external-status", "--diagnose-external-recovery", "--verify-external-disable", "--recover-external"].contains(CommandLine.arguments.dropFirst().first ?? "") {
         do {
             guard let command = try ExternalVerificationCommand(arguments: Array(CommandLine.arguments.dropFirst())) else {
                 throw ApplicationLaunchError.invalidArguments
@@ -599,6 +609,10 @@ public func runDisplayProbe() {
     } else if CommandLine.arguments.count == 3, CommandLine.arguments[1] == "--external-display-snapshot",
               let descriptor = Int32(CommandLine.arguments[2]), descriptor >= 3 {
         do { try serveExternalDisplay(descriptor: descriptor) }
+        catch { exit(EXIT_FAILURE) }
+    } else if CommandLine.arguments.count == 3, CommandLine.arguments[1] == "--external-recovery-snapshot",
+              let descriptor = Int32(CommandLine.arguments[2]), descriptor >= 3 {
+        do { try serveExternalRecoveryObservation(descriptor: descriptor) }
         catch { exit(EXIT_FAILURE) }
     } else if CommandLine.arguments.dropFirst().first == "--record-suspension-evidence" {
         do {

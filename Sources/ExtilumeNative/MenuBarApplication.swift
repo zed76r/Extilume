@@ -16,13 +16,24 @@ extension PrimaryController: PrimaryApplicationControlling {}
 @MainActor
 public func runMenuBarApplication() throws {
     let applicationLease = try acquireApplicationControlLease()
-    let directory = try applicationStateDirectory(arguments: Array(CommandLine.arguments.dropFirst())) {
+    let launchOptions = try applicationLaunchOptions(arguments: Array(CommandLine.arguments.dropFirst())) {
         try FileManager.default.url(
             for: .applicationSupportDirectory, in: .userDomainMask,
             appropriateFor: nil, create: true
         )
     }
-    let controller = try DisplayModeCoordinator(directory: directory)
+    let controller: DisplayModeCoordinator
+    if launchOptions.verifiesExternalHandoff {
+        let launchPreferences = try externalHandoffLaunchPreferences(for: launchOptions.stateDirectory)
+        controller = try DisplayModeCoordinator(
+            directory: launchOptions.stateDirectory,
+            preferences: launchPreferences.preferences,
+            availableModes: [.externalPrimary, .internalOnly],
+            inputSettings: ExternalDisplayInputSettings(defaults: launchPreferences.defaults)
+        )
+    } else {
+        controller = try DisplayModeCoordinator(directory: launchOptions.stateDirectory)
+    }
     let application = NSApplication.shared
     let delegate = MenuBarApplicationDelegate(controllerFactory: { controller }, developmentBuild: true)
     application.delegate = delegate
@@ -37,6 +48,7 @@ final class MenuBarApplicationDelegate: NSObject, NSApplicationDelegate {
     private let requestTermination: () -> Void
     private let replyTermination: (Bool) -> Void
     private let openSettings: (URL) -> Void
+    private let confirmConnectionRecovery: () -> Bool
     private var controller: (any PrimaryApplicationControlling)?
     private var statusItem: NSStatusItem?
     private var signals: [DispatchSourceSignal] = []
@@ -55,6 +67,9 @@ final class MenuBarApplicationDelegate: NSObject, NSApplicationDelegate {
     private var status: PrimarySessionStatus = .waiting
     private var recoveryInProgress = false
     private var confirmationInProgress = false
+    private var connectionRecoveryRequest: UUID?
+    private var connectionRecoveryConfirmation: ExternalConnectionRecoveryConfirmation?
+    private var controllerGeneration = UUID()
     private var terminationPending = false
     private var quitAfterRecovery = false
 
@@ -63,12 +78,24 @@ final class MenuBarApplicationDelegate: NSObject, NSApplicationDelegate {
         developmentBuild: Bool = false,
         requestTermination: @escaping () -> Void = { NSApplication.shared.terminate(nil) },
         replyTermination: @escaping (Bool) -> Void = { NSApplication.shared.reply(toApplicationShouldTerminate: $0) },
-        openSettings: @escaping (URL) -> Void = { NSWorkspace.shared.open($0) }
+        openSettings: @escaping (URL) -> Void = { NSWorkspace.shared.open($0) },
+        confirmConnectionRecovery: @escaping () -> Bool = {
+            let alert = NSAlert()
+            alert.alertStyle = .warning
+            alert.messageText = "确认 HDMI 物理连接未改变"
+            alert.informativeText = "从本次交接开始，你是否没有拔插 HDMI、换接口或更换显示器？仅在显示器上切换 PC / Mac 输入源不算改变物理连接。\n\n确认后将尝试恢复 Mac 的 HDMI 输出；恢复后请将显示器切到 Mac。此确认仅用于这一次恢复，不会确认或保存恢复布局。若不确定，请取消。"
+            alert.addButton(withTitle: "取消")
+            alert.addButton(withTitle: "连接未变，恢复外接屏")
+            alert.buttons[0].keyEquivalent = "\r"
+            alert.buttons[1].keyEquivalent = ""
+            return alert.runModal() == .alertSecondButtonReturn
+        }
     ) {
         self.controllerFactory = controllerFactory
         self.requestTermination = requestTermination
         self.replyTermination = replyTermination
         self.openSettings = openSettings
+        self.confirmConnectionRecovery = confirmConnectionRecovery
         super.init()
         menu.autoenablesItems = false
         fixedModeItem.isEnabled = false
@@ -141,6 +168,9 @@ final class MenuBarApplicationDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func startController(recoveryOnly: Bool) {
+        cancelConnectionRecovery()
+        controllerGeneration = UUID()
+        let generation = controllerGeneration
         do {
             let controller = try controllerFactory()
             self.controller = controller
@@ -156,14 +186,21 @@ final class MenuBarApplicationDelegate: NSObject, NSApplicationDelegate {
                         modeItems.append(item)
                     }
                 }
-                selector.modeDidChange = { [weak self] in self?.render() }
+                selector.modeDidChange = { [weak self] in
+                    guard let self else { return }
+                    if self.modeSelector?.selectedMode != .internalOnly { self.cancelConnectionRecovery() }
+                    self.render()
+                }
             }
             (controller as? any ExternalDisplayInputSettingsSelecting)?.inputSettingsDidChange = { [weak self] in
                 self?.render()
             }
             render()
             controller.startApplication(registerEvents: true, recoveryOnly: recoveryOnly) { [weak self] status in
-                DispatchQueue.main.async { [weak self] in self?.receive(status) }
+                DispatchQueue.main.async { [weak self] in
+                    guard let self, self.controllerGeneration == generation else { return }
+                    self.receive(status)
+                }
             }
         } catch {
             recoveryInProgress = false
@@ -176,6 +213,13 @@ final class MenuBarApplicationDelegate: NSObject, NSApplicationDelegate {
     private func receive(_ newStatus: PrimarySessionStatus) {
         print("会话状态：\(newStatus.text)")
         guard !terminationPending || newStatus == .quitWaitingForDisplays else { return }
+        if connectionRecoveryRequest != nil {
+            if newStatus == status {
+                render()
+                return
+            }
+            cancelConnectionRecovery()
+        }
         status = newStatus
         statusMode = modeSelector?.selectedMode
         if newStatus == .applying {
@@ -244,7 +288,7 @@ final class MenuBarApplicationDelegate: NSObject, NSApplicationDelegate {
 
     private func render() {
         let busy = recoveryInProgress || confirmationInProgress || terminationPending
-        let text = confirmationInProgress ? "正在确认排列…" : (recoveryInProgress ? "正在恢复…" : statusText)
+        let text = connectionRecoveryRequest != nil ? "正在确认连接…" : confirmationInProgress ? "正在确认排列…" : (recoveryInProgress ? "正在恢复…" : statusText)
         stateItem.title = text
         let externalOnly = modeSelector?.selectedMode == .externalOnly
         let internalOnly = modeSelector?.selectedMode == .internalOnly
@@ -285,7 +329,7 @@ final class MenuBarApplicationDelegate: NSObject, NSApplicationDelegate {
             confirmItem.toolTip = "独立核对完整双屏后，将你确认的排列设为恢复布局；不会重新停用外屏。"
         }
         renderInputSettings()
-        settingsItem.isEnabled = !confirmationInProgress
+        settingsItem.isEnabled = !confirmationInProgress && connectionRecoveryRequest == nil
         quitItem.isEnabled = status.canQuit && !busy
         statusItem?.button?.setAccessibilityLabel(accessibilityStatusLabel)
         statusItem?.button?.toolTip = "Extilume：\(text)"
@@ -369,9 +413,7 @@ final class MenuBarApplicationDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func restoreForConfiguration() {
         guard canRestoreForConfiguration, let selector = modeSelector else { return }
-        recoveryInProgress = true
-        render()
-        selector.restoreForConfiguration()
+        beginExplicitRecovery { selector.restoreForConfiguration() }
     }
 
     @objc private func retryApplication() {
@@ -385,22 +427,88 @@ final class MenuBarApplicationDelegate: NSObject, NSApplicationDelegate {
     @objc private func retryRecovery() {
         guard status.canRetryRecovery, !recoveryInProgress, !confirmationInProgress, !terminationPending else { return }
         let retryQuit = status == .quitFailed || status == .quitWaitingForDisplays
-        if retryQuit, controller != nil {
+        if retryQuit, controller != nil, connectionRecoveryController == nil {
             requestTermination()
             return
         }
-        quitAfterRecovery = retryQuit
+        beginExplicitRecovery(quitAfterRecovery: retryQuit) { [self] in
+            if let controller {
+                controller.recoverApplication()
+            } else {
+                startController(recoveryOnly: true)
+            }
+        }
+    }
+
+    private var connectionRecoveryController: (any ExternalConnectionRecoveryControlling)? {
+        guard modeSelector?.selectedMode == .internalOnly else { return nil }
+        return controller as? any ExternalConnectionRecoveryControlling
+    }
+
+    private func cancelConnectionRecovery() {
+        guard connectionRecoveryRequest != nil else { return }
+        connectionRecoveryConfirmation?.cancel()
+        connectionRecoveryConfirmation = nil
+        connectionRecoveryRequest = nil
+        recoveryInProgress = false
+    }
+
+    private func beginExplicitRecovery(quitAfterRecovery: Bool = false, ordinaryRecovery: @escaping @MainActor () -> Void) {
         recoveryInProgress = true
+        guard let owner = connectionRecoveryController else {
+            self.quitAfterRecovery = quitAfterRecovery
+            render()
+            ordinaryRecovery()
+            return
+        }
+        let request = UUID()
+        connectionRecoveryRequest = request
         render()
-        if let controller {
-            controller.recoverApplication()
-        } else {
-            startController(recoveryOnly: true)
+        owner.prepareConnectionRecovery { [weak self] result in
+            RunLoop.main.perform(inModes: [.common, .modalPanel]) { [weak self] in
+                MainActor.assumeIsolated {
+                    guard let self, self.connectionRecoveryRequest == request,
+                          self.connectionRecoveryController === owner, !self.terminationPending else {
+                        if case .success(let confirmation) = result { confirmation?.cancel() }
+                        return
+                    }
+                    let confirmation: ExternalConnectionRecoveryConfirmation?
+                    do { confirmation = try result.get() }
+                    catch {
+                        self.cancelConnectionRecovery()
+                        self.render()
+                        return
+                    }
+                    self.connectionRecoveryConfirmation = confirmation
+                    let accepted = confirmation == nil || self.confirmConnectionRecovery()
+                    // NSAlert runs a nested event loop; recheck the intent after the user's answer.
+                    guard self.connectionRecoveryRequest == request,
+                          self.connectionRecoveryController === owner, !self.terminationPending else {
+                        confirmation?.cancel()
+                        return
+                    }
+                    self.connectionRecoveryRequest = nil
+                    self.connectionRecoveryConfirmation = nil
+                    guard accepted else {
+                        confirmation?.cancel()
+                        self.recoveryInProgress = false
+                        self.render()
+                        return
+                    }
+                    self.quitAfterRecovery = quitAfterRecovery
+                    self.render()
+                    if let confirmation {
+                        owner.recoverAfterConfirmingConnection(confirmation)
+                    } else {
+                        ordinaryRecovery()
+                    }
+                }
+            }
         }
     }
 
     @objc private func openDisplaySettings() {
-        guard !confirmationInProgress else { return }
+        guard !confirmationInProgress, connectionRecoveryRequest == nil else { return }
         guard let url = URL(string: "x-apple.systempreferences:com.apple.Displays-Settings.extension") else { return }
         openSettings(url)
     }
@@ -424,6 +532,11 @@ final class MenuBarApplicationDelegate: NSObject, NSApplicationDelegate {
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         print("处理正常退出请求")
         guard !terminationPending else { return .terminateLater }
+        if connectionRecoveryRequest != nil {
+            cancelConnectionRecovery()
+            render()
+            return .terminateCancel
+        }
         guard !recoveryInProgress, !confirmationInProgress else { return .terminateCancel }
         guard let controller else {
             status = .quitFailed

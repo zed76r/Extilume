@@ -217,6 +217,36 @@ final class DisplayEnableTransaction {
         }
     }
 
+    // 只由当次连接确认后的持锁恢复入口调用；不替代停用、DDC 或最终身份核验。
+    func enableExternalConnectionForRecovery(
+        record: RecoveryRecord,
+        loadRecord: () throws -> RecoveryRecord?,
+        observationReader: () throws -> ExternalRecoveryObservation,
+        checkAccess: () throws -> Void,
+        nativeCall: NativeCall = { $0() }
+    ) throws {
+        try record.validate()
+        guard record.phase == .restoring, record.internalDisplay == nil,
+              let responsibility = record.externalDisplay, responsibility.baseline,
+              responsibility.pending else { throw RecoveryError.invalidRecord }
+        let initial = try observationReader()
+        guard case .connection(let evidence) = initial, evidence.isDisabled,
+              initial.matches(identity: responsibility.identity, numericIDHint: responsibility.numericIDHint) else {
+            throw RecoveryError.identityConflict
+        }
+        try setEnabled(display: evidence.id, enabled: true, nativeCall: nativeCall) {
+            try checkAccess()
+            guard try loadRecord() == record else { throw RecoveryError.unfinishedTransaction }
+            let actual = try observationReader()
+            guard actual.matches(identity: responsibility.identity, numericIDHint: responsibility.numericIDHint) else {
+                throw RecoveryError.identityConflict
+            }
+            if case .identified(let state) = actual, state.id != evidence.id { throw RecoveryError.identityConflict }
+            try checkAccess()
+            guard try loadRecord() == record else { throw RecoveryError.unfinishedTransaction }
+        }
+    }
+
     // 仅由持锁控制／恢复入口调用；调用方须校验落盘责任、身份和适用保护。
     func setEnabled(
         display: CGDirectDisplayID, enabled: Bool,

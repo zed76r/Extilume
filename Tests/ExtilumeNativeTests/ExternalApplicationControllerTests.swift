@@ -21,6 +21,8 @@ final class ExternalApplicationControllerTests: XCTestCase {
         var failRecovery = false
         var failDisable = false
         var originalMissing = false
+        var zeroWhileDisabled = false
+        var afterConfigure: (@Sendable () -> Void)?
         var blockNextCommit = false
         let commitStarted = DispatchSemaphore(value: 0)
         let continueCommit = DispatchSemaphore(value: 0)
@@ -81,12 +83,27 @@ final class ExternalApplicationControllerTests: XCTestCase {
                 try ExternalDisplayVerification(directory: directory, recoveryStore: store,
                     snapshot: { self.readSnapshot() }, topology: { self.readSnapshot() },
                     external: { _, _ in
-                        if self.lock.withLock({ self.originalMissing }) { throw RecoveryError.identityConflict }
+                        if self.lock.withLock({ self.originalMissing || (self.zeroWhileDisabled && !self.enabled) }) {
+                            throw RecoveryError.identityConflict
+                        }
                         return self.readExternal()
+                    }, recoveryObservation: { _, _ in
+                        if self.lock.withLock({ self.originalMissing }) { throw RecoveryError.identityConflict }
+                        if self.lock.withLock({ self.zeroWhileDisabled && !self.enabled }) {
+                            return .connection(ExternalConnectionEvidence(id: 2,
+                                observedUUID: UUID(uuidString: "00000000-0000-0000-0000-000000000000")!,
+                                registryPath: self.identity.registryPath, edidUUID: self.identity.edidUUID,
+                                bootSession: self.identity.bootSession, registryEntryID: self.identity.registryEntryID,
+                                isBuiltin: false, isOnline: false, isActive: false, matchingSlotCount: 1,
+                                allSlotsExcludeOriginalUUID: true, registryIsHDMI: true, registryClassMatches: true))
+                        }
+                        return .identified(self.readExternal())
                     }, capture: { _ in self.readExternal() },
                     lidIsOpen: { self.lock.withLock { self.lid } }, transaction: {
                         DisplayEnableTransaction(configure: { _, _, value in
-                            self.lock.withLock { self.staged = value }; return .success
+                            self.lock.withLock { self.staged = value }
+                            self.lock.withLock { self.afterConfigure }?()
+                            return .success
                         }, begin: { pointer in
                             pointer.pointee = unsafeBitCast(Unmanaged.passUnretained(self.token).toOpaque(), to: CGDisplayConfigRef.self)
                             return .success
@@ -485,6 +502,106 @@ final class ExternalApplicationControllerTests: XCTestCase {
         XCTAssertFalse(fixture.readExternal().isEnabled)
         XCTAssertTrue(try fixture.record().requiresRecovery)
         XCTAssertEqual(fixture.writeCount, 1)
+    }
+
+    private func prepare(_ controller: ExternalApplicationController) async throws -> ExternalConnectionRecoveryConfirmation {
+        let result = await withCheckedContinuation { continuation in
+            controller.prepareConnectionRecovery { continuation.resume(returning: $0) }
+        }
+        return try XCTUnwrap(result.get())
+    }
+
+    func testZeroUUIDHoldingAndExplicitConnectionRecovery() async throws {
+        let fixture = try Fixture(); try fixture.seedHeld()
+        fixture.zeroWhileDisabled = true
+        let controller = try fixture.controller(); fixture.start(controller, recoveryOnly: true)
+        try await fixture.waitFor(.applied)
+        let before = try fixture.record()
+        let confirmation = try await prepare(controller)
+        XCTAssertEqual(try fixture.record(), before)
+        controller.recoverAfterConfirmingConnection(confirmation)
+        try await fixture.waitFor(.manualConfiguration)
+        XCTAssertTrue(try fixture.record().canClear)
+        XCTAssertEqual(try fixture.readSnapshot().layout(), fixture.baseline)
+        let writes = fixture.writeCount
+        controller.recoverAfterConfirmingConnection(confirmation)
+        try await fixture.waitFor(.recoveryIncomplete)
+        XCTAssertEqual(fixture.writeCount, writes)
+    }
+
+    func testConnectionConfirmationIsRevokedByLifecycleOrAnotherRequest() async throws {
+        for event in 0..<4 {
+            let fixture = try Fixture(); try fixture.seedHeld()
+            fixture.zeroWhileDisabled = true
+            let controller = try fixture.controller(); fixture.start(controller, recoveryOnly: true)
+            try await fixture.waitFor(.applied)
+            let confirmation = try await prepare(controller)
+            switch event {
+            case 0: controller.displayChanged()
+            case 1: controller.willSleep()
+            case 2: controller.didWake()
+            default: controller.recoverApplication()
+            }
+            controller.recoverAfterConfirmingConnection(confirmation)
+            _ = await withCheckedContinuation { continuation in
+                controller.quitApplication { continuation.resume(returning: $0) }
+            }
+            XCTAssertEqual(fixture.writeCount, 0)
+            XCTAssertTrue(try fixture.record().requiresRecovery)
+        }
+    }
+
+    func testDisplayChangeDuringPreparationCannotReturnOrdinaryRecoveryOrToken() async throws {
+        let fixture = try Fixture(); try fixture.seedHeld()
+        fixture.zeroWhileDisabled = true
+        let controller = try fixture.controller(); fixture.start(controller, recoveryOnly: true)
+        try await fixture.waitFor(.applied)
+        let before = try fixture.record()
+        fixture.lock.withLock { fixture.blockNextRead = true }
+        let completed = expectation(description: "stale preparation rejected")
+        controller.prepareConnectionRecovery { result in
+            if case .success = result { XCTFail("stale preparation must not become an ordinary recovery") }
+            completed.fulfill()
+        }
+        XCTAssertEqual(fixture.readStarted.wait(timeout: .now() + 3), .success)
+        controller.displayChanged()
+        fixture.continueRead.signal()
+        await fulfillment(of: [completed], timeout: 3)
+        XCTAssertEqual(fixture.writeCount, 0)
+        XCTAssertEqual(try fixture.record(), before)
+    }
+
+    func testConfirmedRecoveryRevocationAfterConfigurePreventsCommit() async throws {
+        for sleeping in [false, true] {
+            let fixture = try Fixture(); try fixture.seedHeld()
+            fixture.zeroWhileDisabled = true
+            let controller = try fixture.controller(); fixture.start(controller, recoveryOnly: true)
+            try await fixture.waitFor(.applied)
+            let confirmation = try await prepare(controller)
+            fixture.lock.withLock {
+                fixture.afterConfigure = { [weak controller] in
+                    if sleeping { controller?.willSleep() }
+                    else { controller?.displayChanged() }
+                }
+            }
+            controller.recoverAfterConfirmingConnection(confirmation)
+            try await fixture.waitFor(.recoveryIncomplete)
+            XCTAssertEqual(fixture.writeCount, 0)
+            XCTAssertEqual(try fixture.record().phase, .restoring)
+            XCTAssertTrue(try fixture.record().requiresRecovery)
+        }
+    }
+
+    func testConnectionOnlyHandoffNeverSendsAutomaticInput() async throws {
+        let fixture = try Fixture()
+        fixture.zeroWhileDisabled = true
+        let input = Input(fixture), controller = try fixture.controller()
+        controller.configureAutomaticInput(input.session, sendOnStart: true)
+        fixture.start(controller)
+        try await fixture.waitFor(.applied)
+        XCTAssertEqual(input.sendCount, 0)
+        XCTAssertEqual(fixture.writeCount, 1)
+        XCTAssertTrue(try fixture.record().requiresRecovery)
     }
 
     func testClosedLidCompensatesOriginalExternalWithoutInputSourceCommand() async throws {

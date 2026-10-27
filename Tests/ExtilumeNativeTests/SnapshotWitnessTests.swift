@@ -21,10 +21,22 @@ final class SnapshotWitnessTests: XCTestCase {
         }
     }
 
+    private struct ExternalRequest: Encodable {
+        let identity: ExternalDisplayIdentity
+        let numericIDHint: UInt32
+    }
+
     private let identity = UUID(uuidString: "00000000-0000-4000-8000-000000000011")!
     private let hardwareIdentity = InternalDisplayHardwareIdentity(
         bootSession: UUID(uuidString: "00000000-0000-4000-8000-000000000012")!,
         registryEntryID: 42
+    )
+    private let externalIdentity = ExternalDisplayIdentity(
+        uuid: UUID(uuidString: "00000000-0000-4000-8000-000000000021")!,
+        registryPath: "IOService:/display/1",
+        edidUUID: "EDID-1",
+        bootSession: UUID(uuidString: "00000000-0000-4000-8000-000000000022")!,
+        registryEntryID: 52
     )
 
     private func state(
@@ -42,6 +54,10 @@ final class SnapshotWitnessTests: XCTestCase {
             hardwareIdentity: hardwareIdentity,
             reportedIdentityUUID: reportedIdentityUUID
         )
+    }
+
+    private func externalState(identity: ExternalDisplayIdentity? = nil) -> ExternalDisplayState {
+        ExternalDisplayState(id: 7, identity: identity ?? externalIdentity, isOnline: true, isActive: false)
     }
 
     private func descriptor(_ peer: GuardChannel) throws -> Int32 {
@@ -88,9 +104,10 @@ final class SnapshotWitnessTests: XCTestCase {
         slowExit: Bool,
         readRequest: Bool = true,
         replyDelay: TimeInterval = 0,
-        hardwareIdentity: InternalDisplayHardwareIdentity?
+        hardwareIdentity: InternalDisplayHardwareIdentity?,
+        expectedArguments: [String] = ["--internal-display-snapshot"]
     ) throws -> pid_t {
-        XCTAssertEqual(arguments, ["--internal-display-snapshot"])
+        XCTAssertEqual(arguments, expectedArguments)
 
         var script = ""
         if readRequest {
@@ -723,6 +740,138 @@ final class SnapshotWitnessTests: XCTestCase {
         }
     }
 
+    func testExternalIdentityConflictReplyCoversBothReadsAndWrongTarget() throws {
+        let wrongIdentity = ExternalDisplayIdentity(
+            uuid: UUID(uuidString: "00000000-0000-4000-8000-000000000023")!,
+            registryPath: externalIdentity.registryPath,
+            edidUUID: externalIdentity.edidUUID,
+            bootSession: externalIdentity.bootSession,
+            registryEntryID: externalIdentity.registryEntryID
+        )
+
+        for failure in [RecoveryError.identityConflict, .invalidRecord] {
+            try assertExternalIdentityReply(expectedReads: 1) { _ in
+                throw failure
+            }
+            try assertExternalIdentityReply(expectedReads: 2) { read in
+                if read == 1 { return self.externalState() }
+                throw failure
+            }
+        }
+        try assertExternalIdentityReply(expectedReads: 1) { _ in
+            self.externalState(identity: wrongIdentity)
+        }
+    }
+
+    private func assertExternalIdentityReply(
+        expectedReads: Int,
+        reader: (Int) throws -> ExternalDisplayState
+    ) throws {
+        let (client, serverDescriptor) = try rawSocketPair()
+        var ownsServerDescriptor = true
+        defer {
+            if ownsServerDescriptor { Darwin.close(serverDescriptor) }
+        }
+        try client.send(ExternalRequest(identity: externalIdentity, numericIDHint: 7))
+
+        var reads = 0
+        ownsServerDescriptor = false
+        try serveExternalDisplay(descriptor: serverDescriptor) { identity, hint in
+            XCTAssertEqual(identity, self.externalIdentity)
+            XCTAssertEqual(hint, 7)
+            reads += 1
+            return try reader(reads)
+        }
+
+        XCTAssertEqual(reads, expectedReads)
+        let reply = try client.receive(ExternalDisplayReply.self)
+        guard case .identityConflict = reply else {
+            return XCTFail("expected an identity-conflict reply")
+        }
+        XCTAssertThrowsError(try reply.get()) { error in
+            guard case RecoveryError.identityConflict = error else {
+                return XCTFail("expected RecoveryError.identityConflict, got \(error)")
+            }
+        }
+    }
+
+    func testFreshExternalIdentityConflictWaitsForSuccessfulWitnessExit() throws {
+        let successful = runExternalWitness(reply: .identityConflict)
+        guard case .failure(let identityError) = successful.result else {
+            XCTFail("identity-conflict reply should throw")
+            return
+        }
+        guard case RecoveryError.identityConflict = identityError else {
+            XCTFail("expected RecoveryError.identityConflict, got \(identityError)")
+            return
+        }
+        assertAlreadyReaped(try XCTUnwrap(successful.process))
+
+        let failedExit = runExternalWitness(reply: .identityConflict, exitCode: 23)
+        guard case .failure(let processError) = failedExit.result else {
+            XCTFail("a failed witness exit must not be hidden by identity conflict")
+            return
+        }
+        XCTAssertEqual(processError as? SnapshotWitnessError, .processFailed)
+        assertAlreadyReaped(try XCTUnwrap(failedExit.process))
+    }
+
+    func testFreshExternalRejectsWrongTargetAndKeepsDisconnectAsCommunicationFailure() throws {
+        let wrongIdentity = ExternalDisplayIdentity(
+            uuid: UUID(uuidString: "00000000-0000-4000-8000-000000000024")!,
+            registryPath: externalIdentity.registryPath,
+            edidUUID: externalIdentity.edidUUID,
+            bootSession: externalIdentity.bootSession,
+            registryEntryID: externalIdentity.registryEntryID
+        )
+        let wrongTarget = runExternalWitness(reply: .state(externalState(identity: wrongIdentity)))
+        guard case .failure(let targetError) = wrongTarget.result else {
+            XCTFail("a state for another target must be rejected")
+            return
+        }
+        XCTAssertEqual(targetError as? SnapshotWitnessError, .invalidSnapshot)
+        assertAlreadyReaped(try XCTUnwrap(wrongTarget.process))
+
+        let disconnected = runExternalWitness(reply: nil)
+        guard case .failure(let communicationError) = disconnected.result else {
+            XCTFail("a disconnected witness must fail")
+            return
+        }
+        XCTAssertEqual(communicationError as? SnapshotWitnessError, .communicationFailed)
+        assertAlreadyReaped(try XCTUnwrap(disconnected.process))
+    }
+
+    private func runExternalWitness(
+        reply: ExternalDisplayReply?,
+        exitCode: Int32 = 0
+    ) -> (result: Result<ExternalDisplayState, Error>, process: pid_t?) {
+        var process: pid_t?
+        let result = Result<ExternalDisplayState, Error> {
+            try freshExternalDisplay(
+                identity: externalIdentity,
+                numericIDHint: 7,
+                spawn: { arguments, channel in
+                    let frame: Data?
+                    if let reply { frame = try self.framed(reply) }
+                    else { frame = nil }
+                    let child = try self.spawnFixture(
+                        arguments: arguments,
+                        channel: channel,
+                        frame: frame,
+                        exitCode: exitCode,
+                        slowExit: false,
+                        readRequest: false,
+                        hardwareIdentity: nil,
+                        expectedArguments: ["--external-display-snapshot"]
+                    )
+                    process = child
+                    return child
+                }
+            )
+        }
+        return (result, process)
+    }
+
     func testZeroHintIsRejectedWithoutReaderOrChild() throws {
         let (client, server) = try GuardChannel.pair()
         try client.send(Request(identity: identity, numericIDHint: 0))
@@ -757,4 +906,87 @@ final class SnapshotWitnessTests: XCTestCase {
         XCTAssertEqual(snapshotWitnessFailureCode(SnapshotWitnessError.cleanupFailed), "witness-cleanup")
         XCTAssertEqual(snapshotWitnessFailureCode(SnapshotWitnessError.internalInformationUnavailable), "internal-information-unavailable")
     }
+    private enum RecoveryReplyFixture: Codable {
+        case observation(ExternalRecoveryObservation)
+        case stateChanged
+        case identityConflict
+    }
+
+    private func recoveryEvidence(online: Bool = false) -> ExternalRecoveryObservation {
+        .connection(ExternalConnectionEvidence(
+            id: 7, observedUUID: UUID(uuidString: "00000000-0000-0000-0000-000000000000")!,
+            registryPath: externalIdentity.registryPath, edidUUID: externalIdentity.edidUUID,
+            bootSession: externalIdentity.bootSession, registryEntryID: externalIdentity.registryEntryID,
+            isBuiltin: false, isOnline: online, isActive: false, matchingSlotCount: 1,
+            allSlotsExcludeOriginalUUID: true, registryIsHDMI: true, registryClassMatches: true
+        ))
+    }
+
+    func testRecoveryWitnessRequiresTwoMatchingReadsAndMapsMetadataFailures() throws {
+        for failure in [false, true] {
+            let (client, server) = try rawSocketPair()
+            try client.send(ExternalRequest(identity: externalIdentity, numericIDHint: 7))
+            var reads = 0
+            try serveExternalRecoveryObservation(descriptor: server) { _, _ in
+                reads += 1
+                if reads == 2 && failure { throw RecoveryError.invalidRecord }
+                return self.recoveryEvidence(online: reads == 2)
+            }
+            XCTAssertEqual(reads, 2)
+            let reply = try client.receive(RecoveryReplyFixture.self)
+            if failure {
+                guard case .identityConflict = reply else { return XCTFail("expected identity conflict") }
+            } else {
+                guard case .stateChanged = reply else { return XCTFail("expected state changed") }
+            }
+        }
+    }
+
+    func testRecoveryWitnessFailedExitCannotBeMaskedByReply() throws {
+        var process: pid_t?
+        XCTAssertThrowsError(try freshExternalRecoveryObservation(identity: externalIdentity, numericIDHint: 7,
+            spawn: { arguments, channel in
+                let child = try self.spawnFixture(arguments: arguments, channel: channel,
+                    frame: self.framed(RecoveryReplyFixture.identityConflict), exitCode: 23,
+                    slowExit: false, readRequest: false, hardwareIdentity: nil,
+                    expectedArguments: ["--external-recovery-snapshot"])
+                process = child
+                return child
+            })) { error in
+                XCTAssertEqual(error as? SnapshotWitnessError, .processFailed)
+            }
+        assertAlreadyReaped(try XCTUnwrap(process))
+    }
+
+    func testRecoveryWitnessRejectsInvalidRequestBeforeReading() throws {
+        let (client, server) = try rawSocketPair()
+        try client.send(ExternalRequest(identity: externalIdentity, numericIDHint: 0))
+        var reads = 0
+        XCTAssertThrowsError(try serveExternalRecoveryObservation(descriptor: server) { _, _ in
+            reads += 1
+            return self.recoveryEvidence()
+        })
+        XCTAssertEqual(reads, 0)
+    }
+
+    func testRecoveryWitnessParentValidatesEvidence() throws {
+        var process: pid_t?
+        let wrong = ExternalRecoveryObservation.identified(ExternalDisplayState(
+            id: 7, identity: ExternalDisplayIdentity(uuid: UUID(), registryPath: externalIdentity.registryPath,
+                edidUUID: externalIdentity.edidUUID, bootSession: externalIdentity.bootSession,
+                registryEntryID: externalIdentity.registryEntryID), isOnline: true, isActive: true))
+        XCTAssertThrowsError(try freshExternalRecoveryObservation(identity: externalIdentity, numericIDHint: 7,
+            spawn: { arguments, channel in
+                let child = try self.spawnFixture(arguments: arguments, channel: channel,
+                    frame: self.framed(RecoveryReplyFixture.observation(wrong)), exitCode: 0,
+                    slowExit: false, readRequest: false, hardwareIdentity: nil,
+                    expectedArguments: ["--external-recovery-snapshot"])
+                process = child
+                return child
+            })) { error in
+                XCTAssertEqual(error as? SnapshotWitnessError, .invalidSnapshot)
+            }
+        assertAlreadyReaped(try XCTUnwrap(process))
+    }
+
 }
