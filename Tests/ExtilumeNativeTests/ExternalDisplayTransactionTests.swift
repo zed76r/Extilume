@@ -125,6 +125,100 @@ final class ExternalDisplayTransactionTests: XCTestCase {
         XCTAssertEqual(try ExternalVerificationCommand(arguments: ["--verify-external-disable", "--allow-display-write", "/tmp/state"]), .disable("/tmp/state"))
     }
 
+    func testRecoveryDiagnosticArgumentsNeverAcceptWriteFlagOrExtraArguments() throws {
+        XCTAssertEqual(try ExternalVerificationCommand(arguments: ["--diagnose-external-recovery", "/tmp/state"]), .diagnose("/tmp/state"))
+        for arguments in [
+            ["--diagnose-external-recovery"],
+            ["--diagnose-external-recovery", ""],
+            ["--diagnose-external-recovery", "--allow-display-write"],
+            ["--diagnose-external-recovery", "--allow-display-write", "/tmp/state"],
+            ["--diagnose-external-recovery", "/tmp/state", "extra"]
+        ] {
+            XCTAssertThrowsError(try ExternalVerificationCommand(arguments: arguments))
+        }
+    }
+
+    func testCLIRejectsConnectionConfirmationWithoutControllerLifecycle() throws {
+        for arguments in [
+            ["--recover-external", "--allow-display-write", "--confirm-unchanged-connection", "/tmp/state"],
+            ["--recover-external", "--confirm-unchanged-connection", "/tmp/state"],
+            ["--verify-external-disable", "--allow-display-write", "--confirm-unchanged-connection", "/tmp/state"],
+            ["--external-status", "--allow-display-write", "--confirm-unchanged-connection", "/tmp/state"],
+            ["--recover-external", "--allow-display-write", "--confirm-unchanged-connection", ""],
+            ["--recover-external", "--allow-display-write", "--confirm-unchanged-connection", "/tmp/state", "extra"]
+        ] { XCTAssertThrowsError(try ExternalVerificationCommand(arguments: arguments)) }
+    }
+
+    func testRecoveryDiagnosticsReadAnOwnedRecordWithoutWritingOrTakingItsLease() throws {
+        let directory = try directory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let owner = try RecoveryStore(directory: directory)
+        try owner.acquireExclusiveOwnership()
+        let record = try record()
+        try owner.save(record)
+        let path = directory.appendingPathComponent("recovery-record.json")
+        let before = try Data(contentsOf: path)
+        let files = try FileManager.default.contentsOfDirectory(atPath: directory.path)
+        var reads = 0
+
+        let report = try readExternalRecoveryDiagnosticReport(directory: directory) {
+            XCTAssertEqual($0, record)
+            reads += 1
+            return #"{"diagnosticOnly":true}"#
+        }
+
+        XCTAssertEqual(report, #"{"diagnosticOnly":true}"#)
+        XCTAssertEqual(reads, 1)
+        XCTAssertEqual(try Data(contentsOf: path), before)
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: directory.path), files)
+        XCTAssertEqual(try owner.load(), record)
+    }
+
+    func testEmptyDiagnosticDirectoryDoesNotCollectOrCreateRecords() throws {
+        let directory = try directory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let report = try readExternalRecoveryDiagnosticReport(directory: directory) { _ in
+            XCTFail("no record must not trigger native reads")
+            return ""
+        }
+        XCTAssertEqual(report, "没有外屏责任；未写显示配置。")
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: directory.path), [])
+    }
+
+    func testRecoveryDiagnosticsRejectOtherRecordTypesBeforeCollecting() throws {
+        let directory = try directory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let owner = try RecoveryStore(directory: directory)
+        try owner.acquireExclusiveOwnership()
+        let primaryRecord = try RecoveryRecord(baseline: layout(), target: layout())
+        try owner.save(primaryRecord)
+        XCTAssertThrowsError(try readExternalRecoveryDiagnosticReport(directory: directory) { _ in
+            XCTFail("non-external records must not trigger native reads")
+            return ""
+        }) { XCTAssertEqual($0 as? RecoveryError, .invalidRecord) }
+        XCTAssertEqual(try owner.load(), primaryRecord)
+    }
+
+    func testRecoveryDiagnosticFailurePreservesRecordAndConcurrentChangeIsRejected() throws {
+        enum Failure: Error { case unavailable }
+        let directory = try directory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let owner = try RecoveryStore(directory: directory)
+        try owner.acquireExclusiveOwnership()
+        let record = try record()
+        try owner.save(record)
+        XCTAssertThrowsError(try readExternalRecoveryDiagnosticReport(directory: directory) { _ in throw Failure.unavailable })
+        XCTAssertEqual(try owner.load(), record)
+
+        var changed = record
+        changed.beginRestoration()
+        XCTAssertThrowsError(try readExternalRecoveryDiagnosticReport(directory: directory) { _ in
+            try owner.save(changed)
+            return #"{"diagnosticOnly":true}"#
+        }) { XCTAssertEqual($0 as? RecoveryError, .unfinishedTransaction) }
+        XCTAssertEqual(try owner.load(), changed)
+    }
+
     func directory() throws -> URL {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false,

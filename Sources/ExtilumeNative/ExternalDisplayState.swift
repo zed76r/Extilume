@@ -1,7 +1,7 @@
 import Foundation
 import ExtilumeCore
 
-struct ExternalDisplayState: Codable, Equatable {
+struct ExternalDisplayState: Codable, Equatable, Sendable {
     let id: UInt32
     let identity: ExternalDisplayIdentity
     let isOnline: Bool
@@ -25,19 +25,20 @@ func matchExternalDisplay(
     identity: ExternalDisplayIdentity,
     numericIDHint: UInt32,
     candidates: [UInt32],
+    privateCandidates: [UInt32] = [],
     currentBootSession: UUID,
     read: (UInt32) throws -> ExternalDisplayState?
 ) throws -> ExternalDisplayState {
     do { try identity.validate() }
     catch { throw RecoveryError.identityConflict }
     guard numericIDHint != 0,
-          candidates.allSatisfy({ $0 != 0 }),
+          (candidates + privateCandidates).allSatisfy({ $0 != 0 }),
           identity.bootSession == currentBootSession else {
         throw RecoveryError.identityConflict
     }
 
     var seen = Set<UInt32>()
-    let candidateIDs = (candidates + [numericIDHint]).filter { seen.insert($0).inserted }
+    let candidateIDs = (candidates + privateCandidates + [numericIDHint]).filter { seen.insert($0).inserted }
     var states: [ExternalDisplayState] = []
     for candidate in candidateIDs {
         guard let state = try read(candidate) else { continue }

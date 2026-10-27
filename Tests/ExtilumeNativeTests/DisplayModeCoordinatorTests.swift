@@ -14,7 +14,7 @@ final class DisplayModeCoordinatorTests: XCTestCase {
         func setExternalHandoffRequested(_ requested: Bool) throws { externalHandoffRequested = requested }
     }
 
-    private final class Session: PrimaryApplicationControlling {
+    @MainActor private final class Session: PrimaryApplicationControlling, ExternalConnectionRecoveryControlling {
         var handler: (@Sendable (PrimarySessionStatus) -> Void)?
         var quitCompletion: (@Sendable (Bool) -> Void)?
         var starts = 0
@@ -23,6 +23,14 @@ final class DisplayModeCoordinatorTests: XCTestCase {
         var retries = 0
         var recoveryOnly = false
         var onRecover: (() -> Void)?
+        var connectionPreparation: (@Sendable (Result<ExternalConnectionRecoveryConfirmation?, Error>) -> Void)?
+        var confirmedRecoveries = 0
+        func prepareConnectionRecovery(completion: @escaping @Sendable (Result<ExternalConnectionRecoveryConfirmation?, Error>) -> Void) {
+            connectionPreparation = completion
+        }
+        func recoverAfterConfirmingConnection(_ confirmation: ExternalConnectionRecoveryConfirmation) {
+            confirmedRecoveries += 1
+        }
         func startApplication(registerEvents: Bool, recoveryOnly: Bool,
                               onStatus: @escaping @Sendable (PrimarySessionStatus) -> Void) {
             starts += 1
@@ -40,6 +48,37 @@ final class DisplayModeCoordinatorTests: XCTestCase {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false,
                                                attributes: [.posixPermissions: 0o700])
         return directory
+    }
+
+    func testConnectionConfirmationForwardsOnlyOnceToPreparedOwner() async throws {
+        let root = try directory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try saveExternalRecord(root)
+        let preferences = Preferences()
+        preferences.externalHandoffRequested = true
+        let session = Session()
+        let coordinator = try DisplayModeCoordinator(directory: root, preferences: preferences,
+            availableModes: [.externalPrimary, .internalOnly]) { _, _, _ in session }
+        coordinator.startApplication(registerEvents: false, recoveryOnly: false) { _ in }
+        session.handler?(.applied)
+        await drain()
+        let record = try XCTUnwrap(RecoveryStore(directory: root).load())
+        let token = ExternalConnectionRecoveryConfirmation(record: record)
+        let ready = expectation(description: "connection request forwarded")
+        coordinator.prepareConnectionRecovery { received in
+            XCTAssertTrue((try? received.get()) === token)
+            ready.fulfill()
+        }
+        session.connectionPreparation?(.success(token))
+        await fulfillment(of: [ready], timeout: 2)
+        XCTAssertTrue(preferences.externalHandoffRequested)
+        coordinator.recoverAfterConfirmingConnection(token)
+        XCTAssertEqual(session.confirmedRecoveries, 1)
+        XCTAssertFalse(preferences.externalHandoffRequested)
+        session.handler?(.manualConfiguration)
+        await drain()
+        coordinator.recoverAfterConfirmingConnection(token)
+        XCTAssertEqual(session.confirmedRecoveries, 1)
     }
 
     private func drain() async {

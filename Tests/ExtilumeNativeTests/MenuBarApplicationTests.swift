@@ -810,8 +810,222 @@ final class MenuBarApplicationTests: XCTestCase {
         XCTAssertTrue(session.automaticChanges.isEmpty)
     }
 
+    func testConnectionConfirmationRoutesRestoreAndRetryWithoutConfirmingLayout() async throws {
+        for restore in [true, false] {
+            let session = ConnectionSession()
+            var prompts = 0
+            let delegate = MenuBarApplicationDelegate(controllerFactory: { session }, confirmConnectionRecovery: {
+                prompts += 1
+                return true
+            })
+            delegate.startSession()
+            session.emit(restore ? .applied : .recoveryIncomplete)
+            await drainMainQueue()
+            let action = try item(restore ? "恢复外接屏" : "重试恢复", in: delegate)
+            try dispatch(action)
+            try dispatch(action)
+            session.emit(restore ? .applied : .recoveryIncomplete)
+            await drainMainQueue()
+            XCTAssertEqual(session.preparations.count, 1)
+            XCTAssertTrue(delegate.accessibilityStatusLabel.contains("正在确认连接…"))
+            XCTAssertFalse(try item("退出并恢复", in: delegate).isEnabled)
+            XCTAssertFalse(try item("打开显示设置", in: delegate).isEnabled)
+            try dispatch(try item("设为恢复布局", in: delegate))
+            let token = try connectionToken()
+            session.preparations[0](token)
+            await drainConnectionPreparation()
+            XCTAssertEqual(prompts, 1)
+            XCTAssertEqual(session.confirmedRecoveries.map(\.id), [token.id])
+            XCTAssertEqual(session.confirmations, 0)
+            XCTAssertEqual(session.configurationRestores, 0)
+            XCTAssertEqual(session.recoveries, 0)
+            XCTAssertTrue(delegate.accessibilityStatusLabel.contains("正在恢复…"))
+        }
+    }
+
+    func testCancelledConnectionConfirmationRestoresControlsAndConsumesToken() async throws {
+        let session = ConnectionSession()
+        let delegate = MenuBarApplicationDelegate(controllerFactory: { session }, confirmConnectionRecovery: { false })
+        delegate.startSession()
+        session.emit(.applied)
+        await drainMainQueue()
+        let restore = try item("恢复外接屏", in: delegate)
+        try dispatch(restore)
+        let record = try connectionRecord()
+        let token = ExternalConnectionRecoveryConfirmation(record: record)
+        session.preparations[0](token)
+        await drainConnectionPreparation()
+        XCTAssertFalse(token.consume(for: record))
+        XCTAssertTrue(restore.isEnabled)
+        XCTAssertTrue(try item("退出并恢复", in: delegate).isEnabled)
+        XCTAssertTrue(session.confirmedRecoveries.isEmpty)
+        try dispatch(restore)
+        XCTAssertEqual(session.preparations.count, 2)
+    }
+
+    func testNilConnectionPreparationUsesOriginalRecoveryEntryWithoutPrompt() async throws {
+        for restore in [true, false] {
+            let session = ConnectionSession()
+            let delegate = MenuBarApplicationDelegate(controllerFactory: { session }, confirmConnectionRecovery: {
+                XCTFail("Normal recovery must not ask for connection confirmation")
+                return true
+            })
+            delegate.startSession()
+            session.emit(restore ? .applied : .recoveryIncomplete)
+            await drainMainQueue()
+            try dispatch(try item(restore ? "恢复外接屏" : "重试恢复", in: delegate))
+            session.preparations[0](nil)
+            await drainConnectionPreparation()
+            XCTAssertEqual(session.configurationRestores, restore ? 1 : 0)
+            XCTAssertEqual(session.recoveries, restore ? 0 : 1)
+        }
+    }
+
+    func testFailedConnectionPreparationDoesNotFallThroughToOrdinaryRecovery() async throws {
+        let session = ConnectionSession()
+        let delegate = MenuBarApplicationDelegate(controllerFactory: { session }, confirmConnectionRecovery: {
+            XCTFail("Failed preparation must not open a prompt")
+            return true
+        })
+        delegate.startSession()
+        session.emit(.applied)
+        await drainMainQueue()
+        let restore = try item("恢复外接屏", in: delegate)
+        try dispatch(restore)
+        session.preparationResults[0](.failure(RecoveryError.invalidTransition))
+        await drainConnectionPreparation()
+        XCTAssertEqual(session.configurationRestores, 0)
+        XCTAssertEqual(session.recoveries, 0)
+        XCTAssertTrue(session.confirmedRecoveries.isEmpty)
+        XCTAssertTrue(restore.isEnabled)
+    }
+
+    func testDelayedConnectionPreparationRejectsChangedIntentForTokenAndNil() async throws {
+        for invalidation in ["status", "owner", "termination", "mode"] {
+            for returnsToken in [true, false] {
+                let session = ConnectionSession()
+                let replacement = ConnectionSession()
+                var current = session
+                let delegate = MenuBarApplicationDelegate(controllerFactory: { current }, confirmConnectionRecovery: {
+                    XCTFail("Stale preparation must not open a prompt")
+                    return true
+                })
+                delegate.startSession()
+                session.emit(.applied)
+                await drainMainQueue()
+                try dispatch(try item("恢复外接屏", in: delegate))
+                switch invalidation {
+                case "status":
+                    session.emit(.manualConfiguration)
+                    await drainMainQueue()
+                case "owner":
+                    current = replacement
+                    delegate.startSession()
+                case "termination":
+                    XCTAssertEqual(delegate.applicationShouldTerminate(.shared), .terminateCancel)
+                default:
+                    session.selectedMode = .externalPrimary
+                    session.modeDidChange?()
+                    session.selectedMode = .internalOnly
+                    session.modeDidChange?()
+                }
+                let record = try connectionRecord()
+                let token = ExternalConnectionRecoveryConfirmation(record: record)
+                session.preparations[0](returnsToken ? token : nil)
+                await drainConnectionPreparation()
+                XCTAssertEqual(session.configurationRestores, 0, invalidation)
+                XCTAssertEqual(session.recoveries, 0, invalidation)
+                XCTAssertTrue(session.confirmedRecoveries.isEmpty, invalidation)
+                if returnsToken { XCTAssertFalse(token.consume(for: record)) }
+            }
+        }
+    }
+
+    func testConnectionPromptRechecksIntentAfterNestedEvents() async throws {
+        let session = ConnectionSession()
+        var delegate: MenuBarApplicationDelegate!
+        delegate = MenuBarApplicationDelegate(controllerFactory: { session }, confirmConnectionRecovery: {
+            XCTAssertEqual(delegate.applicationShouldTerminate(.shared), .terminateCancel)
+            return true
+        })
+        delegate.startSession()
+        session.emit(.applied)
+        await drainMainQueue()
+        try dispatch(try item("恢复外接屏", in: delegate))
+        let record = try connectionRecord()
+        let token = ExternalConnectionRecoveryConfirmation(record: record)
+        session.preparations[0](token)
+        await drainConnectionPreparation()
+        XCTAssertTrue(session.confirmedRecoveries.isEmpty)
+        XCTAssertFalse(token.consume(for: record))
+    }
+
+    func testQuitRetryPreparesConnectionThenQuitsOnlyAfterRecovery() async throws {
+        for quitStatus in [PrimarySessionStatus.quitFailed, .quitWaitingForDisplays] {
+            let session = ConnectionSession()
+            var terminationRequests = 0
+            var prompts = 0
+            let delegate = MenuBarApplicationDelegate(controllerFactory: { session }, requestTermination: {
+                terminationRequests += 1
+            }, confirmConnectionRecovery: {
+                prompts += 1
+                return true
+            })
+            delegate.startSession()
+            session.emit(quitStatus)
+            await drainMainQueue()
+            XCTAssertEqual(prompts, 0)
+            try dispatch(try item("重试恢复", in: delegate))
+            XCTAssertEqual(terminationRequests, 0)
+            XCTAssertEqual(session.preparations.count, 1)
+            session.preparations[0](try connectionToken())
+            await drainConnectionPreparation()
+            XCTAssertEqual(prompts, 1)
+            XCTAssertEqual(session.confirmedRecoveries.count, 1)
+            XCTAssertEqual(terminationRequests, 0)
+            session.emit(.manualConfiguration)
+            await drainMainQueue()
+            XCTAssertEqual(terminationRequests, 1)
+        }
+    }
+
+    private func connectionRecord() throws -> RecoveryRecord {
+        let id = UUID()
+        let layout = try DisplayLayout(main: id, origins: [id: DisplayOrigin(x: 0, y: 0)])
+        return try RecoveryRecord(baseline: layout, target: layout)
+    }
+
+    private func connectionToken() throws -> ExternalConnectionRecoveryConfirmation {
+        ExternalConnectionRecoveryConfirmation(record: try connectionRecord())
+    }
+
     @MainActor
-    private final class ModeSession: FakeSession, DisplayModeSelecting, ExternalDisplayInputSettingsSelecting {
+    private final class ConnectionSession: ModeSession, ExternalConnectionRecoveryControlling {
+        var preparations: [@Sendable (ExternalConnectionRecoveryConfirmation?) -> Void] = []
+        var confirmedRecoveries: [ExternalConnectionRecoveryConfirmation] = []
+        init(mode: DisplayApplicationMode = .internalOnly) {
+            super.init()
+            selectedMode = mode
+            availableModes.append(.internalOnly)
+        }
+        var preparationResults: [@Sendable (Result<ExternalConnectionRecoveryConfirmation?, Error>) -> Void] = []
+        func prepareConnectionRecovery(completion: @escaping @Sendable (Result<ExternalConnectionRecoveryConfirmation?, Error>) -> Void) {
+            preparationResults.append(completion)
+            preparations.append { completion(.success($0)) }
+        }
+        func recoverAfterConfirmingConnection(_ confirmation: ExternalConnectionRecoveryConfirmation) {
+            confirmedRecoveries.append(confirmation)
+        }
+    }
+
+    private func drainConnectionPreparation() async {
+        await withCheckedContinuation { continuation in
+            RunLoop.main.perform(inModes: [.common, .modalPanel]) { continuation.resume() }
+        }
+    }
+
+    @MainActor
+    private class ModeSession: FakeSession, DisplayModeSelecting, ExternalDisplayInputSettingsSelecting {
         var inputOptions: [UInt16] = []
         var selectedPCInput: UInt16?
         var automaticInputEnabled = false

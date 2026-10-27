@@ -3,7 +3,7 @@ import ExtilumeCore
 import Foundation
 
 @MainActor
-final class DisplayModeCoordinator: PrimaryApplicationControlling, DisplayModeSelecting {
+final class DisplayModeCoordinator: PrimaryApplicationControlling, DisplayModeSelecting, ExternalConnectionRecoveryControlling {
     typealias ControllerFactory = @MainActor (DisplayApplicationMode, URL, RecoveryStore?) throws -> any PrimaryApplicationControlling
 
     private let directory: URL
@@ -28,6 +28,7 @@ final class DisplayModeCoordinator: PrimaryApplicationControlling, DisplayModeSe
     private var failureLatchPersisted = true
     private var pendingStartupRecovery: DisplayApplicationMode?
     private var conflictingResponsibilities = false
+    private var connectionRecoveryConfirmation: (ExternalConnectionRecoveryConfirmation, UUID)?
 
     private(set) var selectedMode: DisplayApplicationMode?
     private(set) var requiresExplicitActivation = false
@@ -163,6 +164,45 @@ final class DisplayModeCoordinator: PrimaryApplicationControlling, DisplayModeSe
               status.canConfirmConfiguration || (activeMode == .externalOnly && status == .manualConfiguration) else { return }
         actionPending = true
         controller.confirmCurrentConfiguration()
+    }
+
+    func prepareConnectionRecovery(completion: @escaping @Sendable (Result<ExternalConnectionRecoveryConfirmation?, Error>) -> Void) {
+        connectionRecoveryConfirmation?.0.cancel()
+        connectionRecoveryConfirmation = nil
+        guard activeMode == .internalOnly, !transitionPending, !quitPending, !actionPending,
+              !conflictingResponsibilities, status == .applied || status.canRetryRecovery,
+              let recovery = controller as? any ExternalConnectionRecoveryControlling else {
+            completion(.failure(RecoveryError.invalidTransition))
+            return
+        }
+        let owner = generation
+        recovery.prepareConnectionRecovery { [weak self] result in
+            Self.onMainRunLoop { [weak self] in
+                guard let self, self.generation == owner, self.activeMode == .internalOnly,
+                      !self.transitionPending, !self.quitPending, !self.actionPending else {
+                    if case .success(let confirmation) = result { confirmation?.cancel() }
+                    completion(.failure(RecoveryError.invalidTransition))
+                    return
+                }
+                if case .success(let confirmation?) = result { self.connectionRecoveryConfirmation = (confirmation, owner) }
+                completion(result)
+            }
+        }
+    }
+
+    func recoverAfterConfirmingConnection(_ confirmation: ExternalConnectionRecoveryConfirmation) {
+        guard let prepared = connectionRecoveryConfirmation, prepared.0 === confirmation, prepared.1 == generation,
+              activeMode == .internalOnly, !transitionPending, !quitPending, !actionPending,
+              !conflictingResponsibilities, status == .applied || status.canRetryRecovery,
+              let recovery = controller as? any ExternalConnectionRecoveryControlling else {
+            confirmation.cancel()
+            return
+        }
+        connectionRecoveryConfirmation = nil
+        guard clearExternalHandoffRequest() else { confirmation.cancel(); return }
+        actionPending = true
+        publish(.applying)
+        recovery.recoverAfterConfirmingConnection(confirmation)
     }
 
     func quitApplication(completion: @escaping @Sendable (Bool) -> Void) {

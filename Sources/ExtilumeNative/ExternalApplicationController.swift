@@ -18,6 +18,8 @@ final class ExternalApplicationController: @unchecked Sendable {
     private var requestedEpoch = UUID()
     private var pendingAction: String?
     private var pendingEpoch: UUID?
+    private var pendingConnectionConfirmation: (ExternalConnectionRecoveryConfirmation, UUID)?
+    private var confirmedRecoveryEpoch: UUID?
     private var automaticReapplicationAllowed = false
     private var unknownChangePending = false
     private var operationEpoch = UUID()
@@ -64,7 +66,8 @@ final class ExternalApplicationController: @unchecked Sendable {
             self.publish(.applying)
             do {
                 let verifier = try self.factory(self.directory, self.store, { try self.checkAccess() }, {
-                    try self.gate.perform($0)
+                    try self.checkAccess()
+                    return try self.gate.perform($0)
                 })
                 self.verifier = verifier
                 if try verifier.hasRecord() {
@@ -102,6 +105,45 @@ final class ExternalApplicationController: @unchecked Sendable {
 
     func recoverApplication() {
         guard let epoch = request("restore") else { return }
+        recover(epoch: epoch, confirmation: nil)
+    }
+
+    func prepareConnectionRecovery(completion: @escaping @Sendable (Result<ExternalConnectionRecoveryConfirmation?, Error>) -> Void) {
+        guard let epoch = request("prepare-connection") else { completion(.failure(RecoveryError.invalidTransition)); return }
+        queue.async {
+            self.operationEpoch = epoch
+            var result: Result<ExternalConnectionRecoveryConfirmation?, Error> = .failure(RecoveryError.invalidTransition)
+            if !self.retired, let verifier = self.verifier {
+                do {
+                    let confirmation = try verifier.prepareConnectionRecovery()
+                    self.lock.withLock {
+                        if self.requestedEpoch == epoch {
+                            if let confirmation { self.pendingConnectionConfirmation = (confirmation, epoch) }
+                            result = .success(confirmation)
+                        } else { confirmation?.cancel() }
+                    }
+                } catch {
+                    result = .failure(error)
+                    self.publishFailure(error, epoch: epoch)
+                }
+            }
+            self.finish(epoch)
+            completion(result)
+        }
+    }
+
+    func recoverAfterConfirmingConnection(_ confirmation: ExternalConnectionRecoveryConfirmation) {
+        guard let epoch = request("restore", confirmation: confirmation) else {
+            confirmation.cancel()
+            if let current = lock.withLock({ pendingAction == nil ? requestedEpoch : nil }) {
+                queue.async { if !self.retired { self.publishIfCurrent(.recoveryIncomplete, epoch: current) } }
+            }
+            return
+        }
+        recover(epoch: epoch, confirmation: confirmation)
+    }
+
+    private func recover(epoch: UUID, confirmation: ExternalConnectionRecoveryConfirmation?) {
         queue.async {
             self.operationEpoch = epoch
             self.scheduler.cancel()
@@ -111,7 +153,11 @@ final class ExternalApplicationController: @unchecked Sendable {
             guard !self.retired, let verifier = self.verifier else { return }
             self.publish(.applying)
             do {
-                try verifier.restore()
+                try verifier.restore(confirmation: confirmation, connectionEnabled: {
+                    self.lock.withLock {
+                        if self.confirmedRecoveryEpoch == epoch { self.confirmedRecoveryEpoch = nil }
+                    }
+                })
                 self.publishIfCurrent(.manualConfiguration, epoch: epoch)
             } catch { self.publishFailure(error, epoch: epoch) }
         }
@@ -175,6 +221,7 @@ final class ExternalApplicationController: @unchecked Sendable {
                 inputResult?(.unconfirmed)
                 return
             }
+            guard try verifier.hasCompleteIdentityForInput() else { inputResult?(.unconfirmed); return }
             try checkAccess()
             inputResult?(session?.sendOnce(to: target) ?? .unavailable)
         } catch { inputResult?(.unconfirmed) }
@@ -185,11 +232,29 @@ final class ExternalApplicationController: @unchecked Sendable {
     }
 
     // 来源未知的配置变化只核对，不凭 enabled/remove 回调推断用户意图。
-    func displayChanged() { scheduleReadback(allowReapplication: false) }
+    func displayChanged() {
+        if let cancelled = invalidateConnectionConfirmation() {
+            queue.async { if !self.retired { self.publishIfCurrent(.recoveryIncomplete, epoch: cancelled) } }
+        }
+        scheduleReadback(allowReapplication: false)
+    }
+
+    @discardableResult
+    private func invalidateConnectionConfirmation() -> UUID? {
+        lock.withLock {
+            pendingConnectionConfirmation?.0.cancel()
+            pendingConnectionConfirmation = nil
+            let revoked = confirmedRecoveryEpoch == requestedEpoch || pendingAction == "prepare-connection"
+            if revoked { requestedEpoch = UUID() }
+            confirmedRecoveryEpoch = nil
+            return revoked ? requestedEpoch : nil
+        }
+    }
 
     func willSleep() {
         _ = gate.willSleep()
         scheduler.invalidate()
+        invalidateConnectionConfirmation()
         lock.withLock { requestedEpoch = UUID() }
         queue.async { if !self.retired { self.publish(.recoveryIncomplete) } }
     }
@@ -198,6 +263,7 @@ final class ExternalApplicationController: @unchecked Sendable {
 
     func didWake() {
         _ = gate.didWake()
+        invalidateConnectionConfirmation()
         scheduleReadback(allowReapplication: true)
     }
 
@@ -222,11 +288,17 @@ final class ExternalApplicationController: @unchecked Sendable {
         }
     }
 
-    private func request(_ action: String) -> UUID? {
+    private func request(_ action: String, confirmation: ExternalConnectionRecoveryConfirmation? = nil) -> UUID? {
         lock.withLock {
             if pendingAction == action || pendingAction == "quit" { return nil }
+            if let confirmation {
+                guard let pending = pendingConnectionConfirmation, pending.0 === confirmation,
+                      pending.1 == requestedEpoch else { return nil }
+            } else { pendingConnectionConfirmation?.0.cancel() }
+            pendingConnectionConfirmation = nil
             let epoch = UUID()
             requestedEpoch = epoch
+            confirmedRecoveryEpoch = confirmation == nil ? nil : epoch
             pendingAction = action
             pendingEpoch = epoch
             return epoch
@@ -234,7 +306,10 @@ final class ExternalApplicationController: @unchecked Sendable {
     }
 
     private func finish(_ epoch: UUID) {
-        lock.withLock { if pendingEpoch == epoch { pendingAction = nil; pendingEpoch = nil } }
+        lock.withLock {
+            if pendingEpoch == epoch { pendingAction = nil; pendingEpoch = nil }
+            if confirmedRecoveryEpoch == epoch { confirmedRecoveryEpoch = nil }
+        }
     }
 
     private func checkAccess() throws {
@@ -287,7 +362,7 @@ final class ExternalApplicationController: @unchecked Sendable {
     }
 }
 
-extension ExternalApplicationController: PrimaryApplicationControlling {}
+extension ExternalApplicationController: PrimaryApplicationControlling, ExternalConnectionRecoveryControlling {}
 
 private let externalApplicationDisplayCallback: CGDisplayReconfigurationCallBack = { _, flags, context in
     guard !flags.contains(.beginConfigurationFlag), let context else { return }
