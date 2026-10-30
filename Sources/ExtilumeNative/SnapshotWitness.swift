@@ -12,6 +12,7 @@ enum SnapshotWitnessError: Error, Equatable {
     case cleanupFailed
     case internalStateChanged
     case internalInformationUnavailable
+    case externalStateChanged
 }
 
 func freshSnapshot() throws -> Snapshot {
@@ -78,6 +79,98 @@ func freshInternalDisplay(
         fputs("内屏独立观测失败，类别=\(snapshotWitnessFailureCode(error))；保留恢复责任。\n", stderr)
         throw error
     }
+}
+
+private struct ExternalDisplayRequest: Codable {
+    let identity: ExternalDisplayIdentity
+    let numericIDHint: UInt32
+}
+
+enum ExternalDisplayReply: Codable {
+    case state(ExternalDisplayState)
+    case stateChanged
+    case identityConflict
+
+    func get() throws -> ExternalDisplayState {
+        switch self {
+        case .state(let state): return state
+        case .stateChanged: throw SnapshotWitnessError.externalStateChanged
+        case .identityConflict: throw RecoveryError.identityConflict
+        }
+    }
+}
+
+func freshExternalDisplay(
+    identity: ExternalDisplayIdentity,
+    numericIDHint: UInt32,
+    deadlineNanoseconds: UInt64? = nil,
+    checkAccess: (() throws -> Void)? = nil,
+    spawn: ([String], GuardChannel) throws -> pid_t = spawnProbe
+) throws -> ExternalDisplayState {
+    guard numericIDHint != 0 else { throw SnapshotWitnessError.invalidSnapshot }
+    do { try identity.validate() }
+    catch { throw SnapshotWitnessError.invalidSnapshot }
+    let request = ExternalDisplayRequest(identity: identity, numericIDHint: numericIDHint)
+    do {
+        let reply = try freshWitness(
+            ExternalDisplayReply.self, arguments: ["--external-display-snapshot"], spawn: spawn,
+            deadlineNanoseconds: deadlineNanoseconds, checkAccess: checkAccess,
+            prepare: { channel, check in
+                try channel.send(request, deadlineNanoseconds: deadlineNanoseconds, checkAccess: check)
+            },
+            validate: {
+                switch $0 {
+                case .state(let state): return state.matches(identity: identity)
+                case .stateChanged: return true
+                case .identityConflict: return true
+                }
+            }
+        )
+        return try reply.get()
+    } catch {
+        fputs("外屏独立观测失败，类别=\(snapshotWitnessFailureCode(error))；保留恢复责任。\n", stderr)
+        throw error
+    }
+}
+
+func serveExternalDisplay(
+    descriptor: Int32,
+    reader: (ExternalDisplayIdentity, UInt32) throws -> ExternalDisplayState = {
+        try readExternalDisplay(identity: $0, numericIDHint: $1)
+    }
+) throws {
+    let channel: GuardChannel
+    do { channel = try GuardChannel(descriptor: descriptor) }
+    catch {
+        Darwin.close(descriptor)
+        throw SnapshotWitnessError.communicationFailed
+    }
+    let request = try channel.receive(ExternalDisplayRequest.self)
+    guard request.numericIDHint != 0 else { throw SnapshotWitnessError.invalidSnapshot }
+    do { try request.identity.validate() }
+    catch { throw SnapshotWitnessError.invalidSnapshot }
+    // 请求已验证；读取器的 invalidRecord 表示当前设备身份元数据不可用。
+    let before: ExternalDisplayState
+    do { before = try reader(request.identity, request.numericIDHint) }
+    catch RecoveryError.identityConflict, RecoveryError.invalidRecord {
+        try channel.send(ExternalDisplayReply.identityConflict)
+        return
+    }
+    guard before.matches(identity: request.identity) else {
+        try channel.send(ExternalDisplayReply.identityConflict)
+        return
+    }
+    let after: ExternalDisplayState
+    do { after = try reader(request.identity, request.numericIDHint) }
+    catch RecoveryError.identityConflict, RecoveryError.invalidRecord {
+        try channel.send(ExternalDisplayReply.identityConflict)
+        return
+    }
+    guard after.matches(identity: request.identity) else {
+        try channel.send(ExternalDisplayReply.identityConflict)
+        return
+    }
+    try channel.send(before == after ? ExternalDisplayReply.state(after) : .stateChanged)
 }
 
 func freshWitness<Value: Decodable>(
@@ -289,4 +382,78 @@ private func terminateAndReap(_ process: pid_t) -> Bool {
 
 private func sanitized(_ error: Error) -> SnapshotWitnessError {
     error as? SnapshotWitnessError ?? .communicationFailed
+}
+
+private enum ExternalRecoveryReply: Codable {
+    case observation(ExternalRecoveryObservation)
+    case stateChanged
+    case identityConflict
+
+    func get() throws -> ExternalRecoveryObservation {
+        switch self {
+        case .observation(let observation): return observation
+        case .stateChanged: throw SnapshotWitnessError.externalStateChanged
+        case .identityConflict: throw RecoveryError.identityConflict
+        }
+    }
+}
+
+func freshExternalRecoveryObservation(
+    identity: ExternalDisplayIdentity,
+    numericIDHint: UInt32,
+    deadlineNanoseconds: UInt64? = nil,
+    checkAccess: (() throws -> Void)? = nil,
+    spawn: ([String], GuardChannel) throws -> pid_t = spawnProbe
+) throws -> ExternalRecoveryObservation {
+    guard numericIDHint != 0, (try? identity.validate()) != nil else {
+        throw SnapshotWitnessError.invalidSnapshot
+    }
+    let request = ExternalDisplayRequest(identity: identity, numericIDHint: numericIDHint)
+    let reply = try freshWitness(
+        ExternalRecoveryReply.self, arguments: ["--external-recovery-snapshot"], spawn: spawn,
+        deadlineNanoseconds: deadlineNanoseconds, checkAccess: checkAccess,
+        prepare: { channel, check in
+            try channel.send(request, deadlineNanoseconds: deadlineNanoseconds, checkAccess: check)
+        },
+        validate: {
+            switch $0 {
+            case .observation(let observation): return observation.matches(identity: identity, numericIDHint: numericIDHint)
+            case .stateChanged, .identityConflict: return true
+            }
+        }
+    )
+    return try reply.get()
+}
+
+func serveExternalRecoveryObservation(
+    descriptor: Int32,
+    reader: (ExternalDisplayIdentity, UInt32) throws -> ExternalRecoveryObservation = {
+        try readExternalRecoveryObservation(identity: $0, numericIDHint: $1)
+    }
+) throws {
+    let channel: GuardChannel
+    do { channel = try GuardChannel(descriptor: descriptor) }
+    catch {
+        Darwin.close(descriptor)
+        throw SnapshotWitnessError.communicationFailed
+    }
+    let request = try channel.receive(ExternalDisplayRequest.self)
+    guard request.numericIDHint != 0, (try? request.identity.validate()) != nil else {
+        throw SnapshotWitnessError.invalidSnapshot
+    }
+    do {
+        let before = try reader(request.identity, request.numericIDHint)
+        guard before.matches(identity: request.identity, numericIDHint: request.numericIDHint) else {
+            try channel.send(ExternalRecoveryReply.identityConflict)
+            return
+        }
+        let after = try reader(request.identity, request.numericIDHint)
+        guard after.matches(identity: request.identity, numericIDHint: request.numericIDHint) else {
+            try channel.send(ExternalRecoveryReply.identityConflict)
+            return
+        }
+        try channel.send(before == after ? ExternalRecoveryReply.observation(after) : .stateChanged)
+    } catch RecoveryError.identityConflict, RecoveryError.invalidRecord {
+        try channel.send(ExternalRecoveryReply.identityConflict)
+    }
 }

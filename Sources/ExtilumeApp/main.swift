@@ -6,7 +6,7 @@ setlinebuf(stdout)
 
 if runInternalApplicationWorkerIfRequested() {
     // The private session owner runs independently of the menu process.
-} else if ["--display-snapshot", "--active-display-snapshot", "--internal-display-snapshot", "--display-guard"]
+} else if ["--display-snapshot", "--active-display-snapshot", "--internal-display-snapshot", "--external-display-snapshot", "--external-recovery-snapshot", "--external-display-input", "--display-guard"]
     .contains(CommandLine.arguments.dropFirst().first ?? "") {
     runDisplayProbe()
 } else {

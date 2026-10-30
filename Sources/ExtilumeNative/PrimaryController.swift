@@ -119,7 +119,7 @@ final class PrimaryController: @unchecked Sendable {
             guard record?.phase != .restored else { throw RecoveryError.unfinishedTransaction }
             if var pending = record, pending.sourceUnresolved {
                 // 原进程已退出；完整基准的独立读回只解除责任，不生成补偿写入。
-                guard pending.internalDisplay == nil,
+                guard pending.internalDisplay == nil, pending.externalDisplay == nil,
                       try snapshotReader().layout() == pending.baseline,
                       try snapshotReader().layout() == pending.baseline else {
                     throw RecoveryError.unresolvedSource
@@ -154,7 +154,7 @@ final class PrimaryController: @unchecked Sendable {
 
     func finalizeOnly() throws {
         try queue.sync {
-            guard let restored = try store.load(), restored.canClear, restored.internalDisplay == nil,
+            guard let restored = try store.load(), restored.canClear, restored.internalDisplay == nil, restored.externalDisplay == nil,
                   try snapshotReader().layout() == restored.baseline else { throw RecoveryError.unfinishedTransaction }
             try store.clear()
             print("独立进程已读回恢复基准；本次责任记录已清除。")
@@ -425,7 +425,7 @@ final class PrimaryController: @unchecked Sendable {
             defer { activeApplicationRequestIdentifier = nil; endApplicationRequest(request) }
             reapplication.cancel()
             guard applicationStatus.canConfirmConfiguration,
-                  let original = record, original.internalDisplay == nil,
+                  let original = record, original.internalDisplay == nil, original.externalDisplay == nil,
                   priorResponsibility ? original.canClear : (original.phase == .owned && original.sourceUnresolved) else {
                 publish(.confirmationFailed)
                 return
@@ -542,7 +542,7 @@ final class PrimaryController: @unchecked Sendable {
         record = try store.load()
         guard var pending = record else { priorResponsibility = false; return }
         if pending.sourceUnresolved {
-            guard pending.internalDisplay == nil,
+            guard pending.internalDisplay == nil, pending.externalDisplay == nil,
                   try snapshotReader().layout() == pending.baseline,
                   try snapshotReader().layout() == pending.baseline else { throw RecoveryError.unresolvedSource }
             pending.beginRestoration()
@@ -550,7 +550,7 @@ final class PrimaryController: @unchecked Sendable {
             try store.save(pending)
             record = pending
         } else if !pending.canClear { try restore() }
-        guard let restored = record, restored.canClear, restored.internalDisplay == nil else {
+        guard let restored = record, restored.canClear, restored.internalDisplay == nil, restored.externalDisplay == nil else {
             throw RecoveryError.unfinishedTransaction
         }
         guard try snapshotReader().layout() == restored.baseline else {
@@ -665,7 +665,7 @@ final class PrimaryController: @unchecked Sendable {
 
     private func restore(allowKnownBaseline: Bool = false) throws {
         guard var record else { print("没有本次待恢复记录。"); return }
-        guard record.internalDisplay == nil else { throw RecoveryError.unfinishedTransaction }
+        guard record.internalDisplay == nil, record.externalDisplay == nil else { throw RecoveryError.unfinishedTransaction }
         let snapshot = try snapshotReader()
         let current = try snapshot.layout()
         // C 后直接退出也须提交当前 C，避免 forAppOnly 的退出回退覆盖它。
