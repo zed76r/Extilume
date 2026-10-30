@@ -28,8 +28,8 @@ public func runMenuBarApplication() throws {
         controller = try DisplayModeCoordinator(
             directory: launchOptions.stateDirectory,
             preferences: launchPreferences.preferences,
-            availableModes: [.externalPrimary, .internalOnly],
-            inputSettings: ExternalDisplayInputSettings(defaults: launchPreferences.defaults)
+            availableModes: [.externalPrimary, .externalOnly, .internalOnly],
+            inputSettings: ExternalDisplayInputSettings(defaults: launchPreferences.defaults, permitsExplicitInputSelection: true)
         )
     } else {
         controller = try DisplayModeCoordinator(directory: launchOptions.stateDirectory)
@@ -42,12 +42,13 @@ public func runMenuBarApplication() throws {
 }
 
 @MainActor
-final class MenuBarApplicationDelegate: NSObject, NSApplicationDelegate {
+final class MenuBarApplicationDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     let menu = NSMenu()
     private let controllerFactory: () throws -> any PrimaryApplicationControlling
     private let requestTermination: () -> Void
     private let replyTermination: (Bool) -> Void
     private let openSettings: (URL) -> Void
+    private let lidIsOpen: () -> Bool
     private let confirmConnectionRecovery: () -> Bool
     private var controller: (any PrimaryApplicationControlling)?
     private var statusItem: NSStatusItem?
@@ -60,7 +61,8 @@ final class MenuBarApplicationDelegate: NSObject, NSApplicationDelegate {
     private let recoverItem = NSMenuItem(title: "重试恢复", action: nil, keyEquivalent: "")
     private let restoreForConfigurationItem = NSMenuItem(title: "恢复双屏以调整排列", action: nil, keyEquivalent: "")
     private let confirmItem = NSMenuItem(title: "设为恢复布局", action: nil, keyEquivalent: "")
-    private let automaticInputItem = NSMenuItem(title: "自动切到 PC", action: nil, keyEquivalent: "")
+    private let monitorInputItem = NSMenuItem(title: "显示器输入源", action: nil, keyEquivalent: "")
+    private let inputUnavailableItem = NSMenuItem(title: "输入源不可用，不影响停用外接屏", action: nil, keyEquivalent: "")
     private let inputResultItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
     private let settingsItem = NSMenuItem(title: "打开显示设置", action: nil, keyEquivalent: "")
     private let quitItem = NSMenuItem(title: "退出并恢复", action: nil, keyEquivalent: "q")
@@ -75,6 +77,7 @@ final class MenuBarApplicationDelegate: NSObject, NSApplicationDelegate {
 
     init(
         controllerFactory: @escaping () throws -> any PrimaryApplicationControlling,
+        lidIsOpen: @escaping () -> Bool = { clamshellState() == "开盖" },
         developmentBuild: Bool = false,
         requestTermination: @escaping () -> Void = { NSApplication.shared.terminate(nil) },
         replyTermination: @escaping (Bool) -> Void = { NSApplication.shared.reply(toApplicationShouldTerminate: $0) },
@@ -82,10 +85,10 @@ final class MenuBarApplicationDelegate: NSObject, NSApplicationDelegate {
         confirmConnectionRecovery: @escaping () -> Bool = {
             let alert = NSAlert()
             alert.alertStyle = .warning
-            alert.messageText = "确认 HDMI 物理连接未改变"
-            alert.informativeText = "从本次交接开始，你是否没有拔插 HDMI、换接口或更换显示器？仅在显示器上切换 PC / Mac 输入源不算改变物理连接。\n\n确认后将尝试恢复 Mac 的 HDMI 输出；恢复后请将显示器切到 Mac。此确认仅用于这一次恢复，不会确认或保存恢复布局。若不确定，请取消。"
+            alert.messageText = "确认当前外接屏连接"
+            alert.informativeText = "请确认：当前连接的是本次交接前的同一台外接显示器，并通过 HDMI 直连原来的 Mac 端口。拔插后接回也可以；若换了显示器、换了接口或不确定，请取消。\n\n确认后将尝试启用 Mac 的 HDMI 输出。认错显示器可能短暂向所接屏幕输出 Mac 画面。恢复后仍需核验恢复结果，请将显示器切到 Mac 输入并检查画面。\n\n此确认仅用于这一次恢复，不会确认或保存显示器排列。"
             alert.addButton(withTitle: "取消")
-            alert.addButton(withTitle: "连接未变，恢复外接屏")
+            alert.addButton(withTitle: "确认连接并尝试恢复")
             alert.buttons[0].keyEquivalent = "\r"
             alert.buttons[1].keyEquivalent = ""
             return alert.runModal() == .alertSecondButtonReturn
@@ -95,9 +98,11 @@ final class MenuBarApplicationDelegate: NSObject, NSApplicationDelegate {
         self.requestTermination = requestTermination
         self.replyTermination = replyTermination
         self.openSettings = openSettings
+        self.lidIsOpen = lidIsOpen
         self.confirmConnectionRecovery = confirmConnectionRecovery
         super.init()
         menu.autoenablesItems = false
+        menu.delegate = self
         fixedModeItem.isEnabled = false
         stateItem.isEnabled = false
         if developmentBuild {
@@ -119,7 +124,9 @@ final class MenuBarApplicationDelegate: NSObject, NSApplicationDelegate {
         confirmItem.target = self
         confirmItem.action = #selector(confirmCurrentConfiguration)
         menu.addItem(confirmItem)
-        menu.addItem(automaticInputItem)
+        menu.addItem(monitorInputItem)
+        inputUnavailableItem.isEnabled = false
+        menu.addItem(inputUnavailableItem)
         inputResultItem.isEnabled = false
         menu.addItem(inputResultItem)
         settingsItem.action = #selector(openDisplaySettings)
@@ -129,6 +136,10 @@ final class MenuBarApplicationDelegate: NSObject, NSApplicationDelegate {
         quitItem.target = self
         quitItem.action = #selector(quitApplication)
         menu.addItem(quitItem)
+        render()
+    }
+
+    func menuWillOpen(_ menu: NSMenu) {
         render()
     }
 
@@ -188,7 +199,7 @@ final class MenuBarApplicationDelegate: NSObject, NSApplicationDelegate {
                 }
                 selector.modeDidChange = { [weak self] in
                     guard let self else { return }
-                    if self.modeSelector?.selectedMode != .internalOnly { self.cancelConnectionRecovery() }
+                    self.cancelConnectionRecovery()
                     self.render()
                 }
             }
@@ -258,8 +269,11 @@ final class MenuBarApplicationDelegate: NSObject, NSApplicationDelegate {
             return status.text
         }
         guard let mode = selector.selectedMode else { return "请选择显示模式" }
+        if status == .applying && mode != .internalOnly && connectionRecoveryController != nil {
+            return "正在恢复外接屏…"
+        }
         if selector.requiresExplicitActivation {
-            return mode == .internalOnly ? "已选择仅内屏，等待点击模式应用" : "已选择仅外屏，等待点击模式应用"
+            return mode == .internalOnly ? "请点击“停用外接屏”以应用" : "已选择仅外屏，等待点击模式应用"
         }
         if status == .applied && statusMode != mode { return "已选择模式，尚未应用" }
         if mode == .externalOnly {
@@ -273,7 +287,7 @@ final class MenuBarApplicationDelegate: NSObject, NSApplicationDelegate {
         if mode == .internalOnly {
             switch status {
             case .applying: return "正在停用外接屏…"
-            case .applied: return "外接屏已停用，请切换显示器到 PC"
+            case .applied: return "外接屏已停用，可手动切换显示器输入源"
             case .manualConfiguration: return "外接屏已恢复，请切换显示器到 Mac"
             default: break
             }
@@ -282,33 +296,47 @@ final class MenuBarApplicationDelegate: NSObject, NSApplicationDelegate {
     }
 
     var accessibilityStatusLabel: String {
+        if modeSelector?.selectedMode == .internalOnly { return "Extilume，\(stateItem.title)" }
         let mode = modeSelector.map { $0.selectedMode?.title ?? "未选择" } ?? "外屏主屏"
         return "Extilume，模式：\(mode)，\(stateItem.title)"
     }
 
     private func render() {
         let busy = recoveryInProgress || confirmationInProgress || terminationPending
-        let text = connectionRecoveryRequest != nil ? "正在确认连接…" : confirmationInProgress ? "正在确认排列…" : (recoveryInProgress ? "正在恢复…" : statusText)
+        let needsOpenLid = !busy && status == .recoveryIncomplete && connectionRecoveryController != nil && !lidIsOpen()
+        let text = needsOpenLid ? "恢复未完成，请开盖完成核验" : connectionRecoveryRequest != nil ? "正在确认连接…" : confirmationInProgress ? "正在确认排列…" : (recoveryInProgress ? "正在恢复…" : statusText)
         stateItem.title = text
         let externalOnly = modeSelector?.selectedMode == .externalOnly
         let internalOnly = modeSelector?.selectedMode == .internalOnly
         let modeIsApplied = status == .applied && statusMode == modeSelector?.selectedMode
             && modeSelector?.requiresExplicitActivation == false && !busy
         for item in modeItems {
-            item.state = modeIsApplied && item.representedObject as? String == statusMode?.rawValue ? .on : .off
+            if item.representedObject as? String == DisplayApplicationMode.internalOnly.rawValue {
+                item.state = .off
+                item.isHidden = (internalOnly || connectionRecoveryController != nil) && status.needsRecovery
+                item.title = internalOnly && (recoveryInProgress || status == .restoringAndQuitting) ? "正在恢复外接屏…"
+                    : internalOnly && status == .applying ? "正在停用外接屏…"
+                    : internalOnly && modeIsApplied ? "恢复外接屏" : "停用外接屏"
+                item.toolTip = internalOnly && modeIsApplied
+                    ? "恢复 Mac 外屏配置后，请手动切换显示器到 Mac；不会自动重新停用外接屏。" : nil
+            } else {
+                item.state = modeIsApplied && item.representedObject as? String == statusMode?.rawValue ? .on : .off
+            }
             item.isEnabled = canSelectMode
         }
-        retryItem.title = status == .manualConfiguration ? (internalOnly ? "应用仅内屏" : (externalOnly ? "应用仅外屏" : "设为外屏主屏")) : "重试"
-        retryItem.isHidden = !status.canRetryApplication
+        retryItem.title = status == .manualConfiguration ? (internalOnly ? "再次停用外接屏" : (externalOnly ? "应用仅外屏" : "设为外屏主屏")) : "重试"
+        retryItem.isHidden = !status.canRetryApplication || internalOnly
         retryItem.isEnabled = status.canRetryApplication && !busy
+        recoverItem.title = needsOpenLid ? "开盖后重试恢复" : "重试恢复"
         recoverItem.isHidden = !status.canRetryRecovery
-        recoverItem.isEnabled = status.canRetryRecovery && !busy
-        let recoveryHint = status == .quitWaitingForDisplays
+        recoverItem.isEnabled = status.canRetryRecovery && !busy && !needsOpenLid
+        let recoveryHint = needsOpenLid
+            ? "请打开笔记本上盖，再点“重试恢复”以完成完整双屏布局的恢复核验。"
+            : status == .quitWaitingForDisplays
             ? "请打开笔记本上盖或接回原外接显示器，再点“重试恢复”以恢复并退出。" : nil
         stateItem.toolTip = recoveryHint
         recoverItem.toolTip = recoveryHint
-        restoreForConfigurationItem.title = internalOnly ? "恢复外接屏" : "恢复双屏以调整排列"
-        restoreForConfigurationItem.isHidden = !canRestoreForConfiguration
+        restoreForConfigurationItem.isHidden = !canRestoreForConfiguration || internalOnly
         restoreForConfigurationItem.isEnabled = canRestoreForConfiguration
         restoreForConfigurationItem.toolTip = internalOnly
             ? "恢复 Mac 外屏配置后，请手动切换显示器到 Mac；不会自动重新停用外接屏。"
@@ -339,6 +367,10 @@ final class MenuBarApplicationDelegate: NSObject, NSApplicationDelegate {
         controller as? any ExternalDisplayInputSettingsSelecting
     }
 
+    private var inputSources: (any ExternalDisplayInputSourcesSelecting)? {
+        controller as? any ExternalDisplayInputSourcesSelecting
+    }
+
     private var showsInputSettings: Bool {
         modeSelector?.availableModes.contains(.internalOnly) == true || modeSelector?.selectedMode == .internalOnly
     }
@@ -349,15 +381,59 @@ final class MenuBarApplicationDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func renderInputSettings() {
-        automaticInputItem.isHidden = !showsInputSettings
+        monitorInputItem.isHidden = !showsInputSettings
+        inputUnavailableItem.isHidden = !showsInputSettings
+            || (inputSettings?.inputUnavailableReason == nil && inputSettings?.inputOptions.isEmpty == false)
+        if let sources = inputSources {
+            inputUnavailableItem.isHidden = !showsInputSettings || sources.detectingInputSources
+                || !sources.detectedInputOptions.isEmpty
+        }
+        inputUnavailableItem.toolTip = inputSources == nil
+            ? inputSettings?.inputUnavailableReason : inputSources?.inputDiscoveryMessage
         inputResultItem.isHidden = !showsInputSettings || inputSettings?.inputResultText == nil
         inputResultItem.title = inputSettings?.inputResultText ?? ""
         let submenu = NSMenu()
         submenu.autoenablesItems = false
-        automaticInputItem.submenu = submenu
-        automaticInputItem.isEnabled = showsInputSettings
+        monitorInputItem.submenu = submenu
+        monitorInputItem.isEnabled = showsInputSettings
         guard showsInputSettings else { return }
-        if let reason = inputSettings?.inputUnavailableReason {
+        if let sources = inputSources {
+            let detect = NSMenuItem(title: sources.detectingInputSources ? "正在检测输入源…" : "检测输入源",
+                                    action: #selector(detectInputSources), keyEquivalent: "")
+            detect.target = self
+            detect.isEnabled = canSelectMode && sources.canDetectInputSources && !sources.detectingInputSources
+            submenu.addItem(detect)
+            if let message = sources.inputDiscoveryMessage {
+                let result = NSMenuItem(title: message, action: nil, keyEquivalent: "")
+                result.isEnabled = false
+                submenu.addItem(result)
+            }
+            if !sources.detectingInputSources && sources.detectedInputOptions.isEmpty {
+                let hint = NSMenuItem(title: "未识别输入源，不影响停用外接屏", action: nil, keyEquivalent: "")
+                hint.isEnabled = false
+                submenu.addItem(hint)
+            }
+            for input in sources.detectedInputOptions {
+                let name: String
+                switch input {
+                case 0x0F: name = "标准 DP 1"
+                case 0x10: name = "标准 DP 2"
+                case 0x11: name = "标准 HDMI 1"
+                case 0x12: name = "标准 HDMI 2"
+                default: name = "输入"
+                }
+                let option = NSMenuItem(title: String(format: "停用外接屏并切至%@（0x%02X）", name, Int(input)),
+                                        action: #selector(disableExternalSelectingInput(_:)), keyEquivalent: "")
+                option.target = self
+                option.representedObject = NSNumber(value: input)
+                option.isEnabled = canSelectMode && sources.canSelectDetectedInput && !sources.detectingInputSources
+                option.toolTip = "请按显示器实际端口确认；先停用外接屏，再尝试切换输入源。切换失败仍保持停用。"
+                submenu.addItem(option)
+            }
+            return
+        }
+        if !inputUnavailableItem.isHidden {
+            let reason = inputSettings?.inputUnavailableReason ?? "未识别到可用输入源，请使用显示器按键切换"
             let reasonItem = NSMenuItem(title: reason, action: nil, keyEquivalent: "")
             reasonItem.isEnabled = false
             submenu.addItem(reasonItem)
@@ -373,7 +449,7 @@ final class MenuBarApplicationDelegate: NSObject, NSApplicationDelegate {
             option.isEnabled = canEditInputSettings
             submenu.addItem(option)
         }
-        let toggle = NSMenuItem(title: "启用自动切到 PC", action: #selector(toggleAutomaticInput), keyEquivalent: "")
+        let toggle = NSMenuItem(title: "停用后切到所选 PC 输入", action: #selector(toggleAutomaticInput), keyEquivalent: "")
         toggle.target = self
         toggle.state = inputSettings?.automaticInputEnabled == true ? .on : .off
         if let settings = inputSettings, let input = settings.selectedPCInput {
@@ -381,8 +457,26 @@ final class MenuBarApplicationDelegate: NSObject, NSApplicationDelegate {
         } else {
             toggle.isEnabled = false
         }
-        toggle.toolTip = "只在显式交接时尝试切换；请保留显示器实体输入按钮。输入读回不代表 PC 画面已确认。"
+        toggle.toolTip = "可选：只在点击停用外接屏后尝试切换一次；请保留显示器实体输入按钮。输入读回不代表 PC 画面已确认。"
         submenu.addItem(toggle)
+    }
+
+    @objc private func detectInputSources() {
+        guard showsInputSettings, canSelectMode, let sources = inputSources,
+              sources.canDetectInputSources, !sources.detectingInputSources else { return }
+        sources.detectInputSources()
+        render()
+    }
+
+    @objc private func disableExternalSelectingInput(_ sender: NSMenuItem) {
+        guard showsInputSettings, canSelectMode, let sources = inputSources,
+              sources.canSelectDetectedInput, !sources.detectingInputSources,
+              let number = sender.representedObject as? NSNumber,
+              let input = UInt16(exactly: number.intValue), sources.detectedInputOptions.contains(input) else { return }
+        status = .applying
+        render()
+        sources.disableExternal(selectingInput: input)
+        render()
     }
 
     @objc private func selectPCInput(_ sender: NSMenuItem) {
@@ -405,6 +499,16 @@ final class MenuBarApplicationDelegate: NSObject, NSApplicationDelegate {
               let rawValue = sender.representedObject as? String,
               let mode = DisplayApplicationMode(rawValue: rawValue),
               selector.availableModes.contains(mode) else { return }
+        if mode == .internalOnly, selector.selectedMode == .internalOnly {
+            if canRestoreForConfiguration {
+                restoreForConfiguration()
+                return
+            }
+            if status.canRetryApplication {
+                retryApplication()
+                return
+            }
+        }
         status = .applying
         render()
         selector.selectMode(mode)
@@ -441,8 +545,9 @@ final class MenuBarApplicationDelegate: NSObject, NSApplicationDelegate {
     }
 
     private var connectionRecoveryController: (any ExternalConnectionRecoveryControlling)? {
-        guard modeSelector?.selectedMode == .internalOnly else { return nil }
-        return controller as? any ExternalConnectionRecoveryControlling
+        guard let owner = controller as? any ExternalConnectionRecoveryControlling,
+              owner.hasExternalRecoveryOwner else { return nil }
+        return owner
     }
 
     private func cancelConnectionRecovery() {

@@ -12,7 +12,7 @@ final class MenuBarApplicationTests: XCTestCase {
         for state in states {
             let session = ModeSession()
             session.selectedMode = .externalOnly
-            let delegate = MenuBarApplicationDelegate(controllerFactory: { session }, developmentBuild: true)
+            let delegate = MenuBarApplicationDelegate(controllerFactory: { session }, lidIsOpen: { true }, developmentBuild: true)
             delegate.startSession()
             session.emit(state)
             await drainMainQueue()
@@ -36,9 +36,10 @@ final class MenuBarApplicationTests: XCTestCase {
         delegate.startSession()
 
         XCTAssertEqual(delegate.menu.items.filter { !$0.isSeparatorItem }.map(\.title), [
-            "模式：外屏主屏", "等待外屏连接", "重试", "重试恢复", "设为恢复布局", "自动切到 PC", "", "打开显示设置", "退出并恢复"
+            "模式：外屏主屏", "等待外屏连接", "重试", "重试恢复", "设为恢复布局", "显示器输入源", "输入源不可用，不影响停用外接屏", "", "打开显示设置", "退出并恢复"
         ])
-        XCTAssertTrue(try item("自动切到 PC", in: delegate).isHidden)
+        XCTAssertTrue(try item("显示器输入源", in: delegate).isHidden)
+        XCTAssertTrue(try item("输入源不可用，不影响停用外接屏", in: delegate).isHidden)
         XCTAssertFalse(delegate.menu.autoenablesItems)
         XCTAssertFalse(try item("模式：外屏主屏", in: delegate).isEnabled)
         XCTAssertTrue(try item("重试", in: delegate).isHidden)
@@ -467,7 +468,7 @@ final class MenuBarApplicationTests: XCTestCase {
 
     func testDualModeSelectionDispatchesRealActionsAndSeparatesSelectionFromApplication() async throws {
         let session = ModeSession()
-        let delegate = MenuBarApplicationDelegate(controllerFactory: { session })
+        let delegate = MenuBarApplicationDelegate(controllerFactory: { session }, lidIsOpen: { true })
         delegate.startSession()
         XCTAssertNotNil(delegate.menu.item(withTitle: "请选择显示模式"))
         XCTAssertEqual(delegate.accessibilityStatusLabel, "Extilume，模式：未选择，请选择显示模式")
@@ -507,7 +508,7 @@ final class MenuBarApplicationTests: XCTestCase {
         let session = ModeSession()
         session.selectedMode = .externalOnly
         session.requiresExplicitActivation = true
-        let delegate = MenuBarApplicationDelegate(controllerFactory: { session })
+        let delegate = MenuBarApplicationDelegate(controllerFactory: { session }, lidIsOpen: { true })
         delegate.startSession()
         XCTAssertNotNil(delegate.menu.item(withTitle: "已选择仅外屏，等待点击模式应用"))
         let only = try item("仅外屏（停用内屏）", in: delegate)
@@ -545,7 +546,7 @@ final class MenuBarApplicationTests: XCTestCase {
     func testDualModesRejectSelectionThroughoutRecoveryAndExit() async throws {
         let session = ModeSession()
         session.selectedMode = .externalOnly
-        let delegate = MenuBarApplicationDelegate(controllerFactory: { session }, replyTermination: { _ in })
+        let delegate = MenuBarApplicationDelegate(controllerFactory: { session }, lidIsOpen: { true }, replyTermination: { _ in })
         delegate.startSession()
         let modes = try [item("外屏主屏", in: delegate), item("仅外屏（停用内屏）", in: delegate)]
         for status in [PrimarySessionStatus.applying, .recoveryIncomplete, .unconfirmed, .confirmationFailed,
@@ -584,7 +585,7 @@ final class MenuBarApplicationTests: XCTestCase {
     func testRestoreForConfigurationRoutesOnlyFromAppliedOnlyExternalAndBlocksRepeatedActions() async throws {
         let session = ModeSession()
         session.selectedMode = .externalOnly
-        let delegate = MenuBarApplicationDelegate(controllerFactory: { session })
+        let delegate = MenuBarApplicationDelegate(controllerFactory: { session }, lidIsOpen: { true })
         delegate.startSession()
         let restore = try item("恢复双屏以调整排列", in: delegate)
         XCTAssertTrue(restore.isHidden)
@@ -629,7 +630,7 @@ final class MenuBarApplicationTests: XCTestCase {
         for selected in [DisplayApplicationMode.externalPrimary, .externalOnly] {
             let session = ModeSession()
             session.selectedMode = selected
-            let delegate = MenuBarApplicationDelegate(controllerFactory: { session }, replyTermination: { _ in })
+            let delegate = MenuBarApplicationDelegate(controllerFactory: { session }, lidIsOpen: { true }, replyTermination: { _ in })
             delegate.startSession()
             let modes = try [item("外屏主屏", in: delegate), item("仅外屏（停用内屏）", in: delegate)]
             XCTAssertTrue(modes.allSatisfy { $0.state == .off })
@@ -653,11 +654,11 @@ final class MenuBarApplicationTests: XCTestCase {
 
     func testHandoffAvailabilityIsExplicitAndRejectsUnavailableAction() throws {
         let session = ModeSession()
-        let delegate = MenuBarApplicationDelegate(controllerFactory: { session })
+        let delegate = MenuBarApplicationDelegate(controllerFactory: { session }, lidIsOpen: { true })
         delegate.startSession()
-        XCTAssertNil(delegate.menu.item(withTitle: "仅内屏（外屏给 PC）"))
+        XCTAssertNil(delegate.menu.item(withTitle: "停用外接屏"))
         let existing = try item("外屏主屏", in: delegate)
-        let unavailable = NSMenuItem(title: "仅内屏（外屏给 PC）", action: existing.action, keyEquivalent: "")
+        let unavailable = NSMenuItem(title: "停用外接屏", action: existing.action, keyEquivalent: "")
         unavailable.target = existing.target
         unavailable.representedObject = DisplayApplicationMode.internalOnly.rawValue
         try dispatch(unavailable)
@@ -667,18 +668,19 @@ final class MenuBarApplicationTests: XCTestCase {
     func testHandoffStatusRestoreAndExplicitReactivation() async throws {
         let session = ModeSession()
         session.availableModes.append(.internalOnly)
-        let delegate = MenuBarApplicationDelegate(controllerFactory: { session })
+        let delegate = MenuBarApplicationDelegate(controllerFactory: { session }, lidIsOpen: { true })
         delegate.startSession()
-        let handoff = try item("仅内屏（外屏给 PC）", in: delegate)
+        let handoff = try item("停用外接屏", in: delegate)
         try dispatch(handoff)
         XCTAssertEqual(session.selections, [.internalOnly])
         XCTAssertEqual(handoff.state, .off)
-        XCTAssertEqual(delegate.accessibilityStatusLabel, "Extilume，模式：仅内屏（外屏给 PC），正在停用外接屏…")
+        XCTAssertEqual(delegate.accessibilityStatusLabel, "Extilume，正在停用外接屏…")
         XCTAssertFalse(handoff.isEnabled)
         session.emit(.applied)
         await drainMainQueue()
-        XCTAssertEqual(handoff.state, .on)
-        XCTAssertEqual(delegate.accessibilityStatusLabel, "Extilume，模式：仅内屏（外屏给 PC），外接屏已停用，请切换显示器到 PC")
+        XCTAssertEqual(handoff.state, .off)
+        XCTAssertEqual(handoff.title, "恢复外接屏")
+        XCTAssertEqual(delegate.accessibilityStatusLabel, "Extilume，外接屏已停用，可手动切换显示器输入源")
         let restore = try item("恢复外接屏", in: delegate)
         XCTAssertFalse(restore.isHidden)
         XCTAssertTrue(restore.isEnabled)
@@ -695,21 +697,52 @@ final class MenuBarApplicationTests: XCTestCase {
         session.emit(.manualConfiguration)
         await drainMainQueue()
         XCTAssertTrue(delegate.accessibilityStatusLabel.contains("外接屏已恢复，请切换显示器到 Mac"))
-        XCTAssertTrue(restore.isHidden)
+        XCTAssertTrue(restore === handoff)
+        XCTAssertFalse(handoff.isHidden)
+        XCTAssertEqual(handoff.title, "停用外接屏")
         XCTAssertEqual(handoff.state, .off)
         XCTAssertEqual(session.selections, [.internalOnly])
         XCTAssertEqual(session.retries, 0)
         XCTAssertTrue(try item("设为恢复布局", in: delegate).isHidden)
-        try dispatch(try item("应用仅内屏", in: delegate))
+        XCTAssertTrue(try item("再次停用外接屏", in: delegate).isHidden)
+        try dispatch(handoff)
         XCTAssertEqual(session.retries, 1)
         XCTAssertTrue(delegate.accessibilityStatusLabel.contains("正在停用外接屏…"))
+    }
+
+    func testExternalActionIsUniqueAcrossCandidateStates() async throws {
+        for state in [PrimarySessionStatus.waiting, .applied, .manualConfiguration,
+                      .applicationFailedRestored, .recoveryIncomplete, .unconfirmed,
+                      .confirmationFailed, .quitFailed, .quitWaitingForDisplays] {
+            let session = ModeSession()
+            session.availableModes = [.externalPrimary, .externalOnly, .internalOnly]
+            session.selectedMode = .internalOnly
+            let delegate = MenuBarApplicationDelegate(controllerFactory: { session }, lidIsOpen: { true })
+            delegate.startSession()
+            session.emit(state)
+            await drainMainQueue()
+            let externalActions = delegate.menu.items.filter {
+                !$0.isHidden && ["停用外接屏", "恢复外接屏", "再次停用外接屏", "重试恢复", "重试"].contains($0.title)
+            }
+            XCTAssertEqual(externalActions.count, 1, "\(state)")
+            XCTAssertFalse(try item(DisplayApplicationMode.externalPrimary.title, in: delegate).isHidden)
+            XCTAssertFalse(try item(DisplayApplicationMode.externalOnly.title, in: delegate).isHidden)
+            let action = try XCTUnwrap(externalActions.first)
+            XCTAssertEqual(action.title, state.needsRecovery ? "重试恢复" : state == .applied ? "恢复外接屏" : "停用外接屏")
+            XCTAssertEqual(action.state, .off)
+            XCTAssertTrue(action.isEnabled)
+            if state.needsRecovery {
+                XCTAssertTrue(delegate.accessibilityStatusLabel.contains(state.text))
+                XCTAssertFalse(delegate.accessibilityStatusLabel.contains("已恢复"))
+            }
+        }
     }
 
     func testHandoffErrorsAndBusyStatesKeepModesExclusive() async throws {
         let session = ModeSession()
         session.availableModes.append(.internalOnly)
         session.selectedMode = .internalOnly
-        let delegate = MenuBarApplicationDelegate(controllerFactory: { session }, replyTermination: { _ in })
+        let delegate = MenuBarApplicationDelegate(controllerFactory: { session }, lidIsOpen: { true }, replyTermination: { _ in })
         delegate.startSession()
         let modes = try session.availableModes.map { try item($0.title, in: delegate) }
         for status in [PrimarySessionStatus.applying, .recoveryIncomplete, .quitFailed,
@@ -719,9 +752,15 @@ final class MenuBarApplicationTests: XCTestCase {
             XCTAssertTrue(modes.allSatisfy { !$0.isEnabled && $0.state == .off })
             for mode in modes { try dispatch(mode) }
             XCTAssertTrue(session.selections.isEmpty)
-            let restore = try item("恢复外接屏", in: delegate)
+            let restore = try item("恢复双屏以调整排列", in: delegate)
             XCTAssertTrue(restore.isHidden)
             XCTAssertFalse(restore.isEnabled)
+            XCTAssertEqual(modes.last?.isHidden, status.needsRecovery)
+            if status.canRetryRecovery {
+                let retryRecovery = try item("重试恢复", in: delegate)
+                XCTAssertFalse(retryRecovery.isHidden)
+                XCTAssertTrue(retryRecovery.isEnabled)
+            }
             if status != .applying {
                 XCTAssertTrue(delegate.accessibilityStatusLabel.contains(status.text))
             }
@@ -730,16 +769,16 @@ final class MenuBarApplicationTests: XCTestCase {
 
     func testInputSettingsAreHiddenUntilCandidateOrRecoveryIsVisible() throws {
         let session = ModeSession()
-        let delegate = MenuBarApplicationDelegate(controllerFactory: { session })
+        let delegate = MenuBarApplicationDelegate(controllerFactory: { session }, lidIsOpen: { true })
         delegate.startSession()
-        let settings = try item("自动切到 PC", in: delegate)
+        let settings = try item("显示器输入源", in: delegate)
         XCTAssertTrue(settings.isHidden)
         session.selectedMode = .internalOnly
         session.modeDidChange?()
         XCTAssertFalse(settings.isHidden)
         let submenu = try XCTUnwrap(settings.submenu)
         XCTAssertFalse(try XCTUnwrap(submenu.item(withTitle: "当前连接尚未验收自动输入源切换")).isEnabled)
-        let toggle = try XCTUnwrap(submenu.item(withTitle: "启用自动切到 PC"))
+        let toggle = try XCTUnwrap(submenu.item(withTitle: "停用后切到所选 PC 输入"))
         XCTAssertEqual(toggle.state, .off)
         XCTAssertFalse(toggle.isEnabled)
         try dispatch(toggle)
@@ -747,28 +786,138 @@ final class MenuBarApplicationTests: XCTestCase {
         XCTAssertTrue(session.automaticChanges.isEmpty)
     }
 
+    func testDisableDoesNotDependOnInputDiscoveryOrInvokeInputSettings() throws {
+        for reason in [nil, "未识别到输入源", "显示器不支持输入源切换"] as [String?] {
+            let session = ModeSession()
+            session.availableModes.append(.internalOnly)
+            session.inputUnavailableReason = reason
+            let delegate = MenuBarApplicationDelegate(controllerFactory: { session }, lidIsOpen: { true })
+            delegate.startSession()
+            let disable = try item("停用外接屏", in: delegate)
+            XCTAssertTrue(disable.isEnabled)
+            let hint = try item("输入源不可用，不影响停用外接屏", in: delegate)
+            XCTAssertFalse(hint.isHidden)
+            XCTAssertFalse(hint.isEnabled)
+            let settings = try item("显示器输入源", in: delegate)
+            XCTAssertTrue(settings.isEnabled)
+            let toggle = try XCTUnwrap(settings.submenu?.item(withTitle: "停用后切到所选 PC 输入"))
+            XCTAssertFalse(toggle.isEnabled)
+            try dispatch(toggle)
+            try dispatch(disable)
+            XCTAssertEqual(session.selections, [.internalOnly])
+            XCTAssertTrue(session.inputSelections.isEmpty)
+            XCTAssertTrue(session.automaticChanges.isEmpty)
+            XCTAssertFalse(disable.isEnabled)
+        }
+    }
+
+    func testDiscoveryDeduplicatesPendingButDoesNotBlockStandaloneDisable() throws {
+        let session = InputDiscoverySession()
+        let delegate = MenuBarApplicationDelegate(controllerFactory: { session }, lidIsOpen: { true })
+        delegate.startSession()
+        let settings = try item("显示器输入源", in: delegate)
+        let detect = try XCTUnwrap(settings.submenu?.item(withTitle: "检测输入源"))
+        XCTAssertTrue(detect.isEnabled)
+        try dispatch(detect)
+        try dispatch(detect)
+        XCTAssertEqual(session.detections, 1)
+        let pending = try XCTUnwrap(settings.submenu?.item(withTitle: "正在检测输入源…"))
+        XCTAssertFalse(pending.isEnabled)
+        try dispatch(pending)
+        XCTAssertEqual(session.detections, 1)
+        let disable = try item("停用外接屏", in: delegate)
+        XCTAssertTrue(disable.isEnabled)
+        try dispatch(disable)
+        XCTAssertEqual(session.selections, [.internalOnly])
+        XCTAssertTrue(session.sourceSelections.isEmpty)
+        XCTAssertTrue(session.inputSelections.isEmpty)
+        XCTAssertTrue(session.automaticChanges.isEmpty)
+    }
+
+    func testDetectedSourcesRouteOnlyToCurrentDisableAndInputAction() throws {
+        let session = InputDiscoverySession()
+        let delegate = MenuBarApplicationDelegate(controllerFactory: { session }, lidIsOpen: { true })
+        delegate.startSession()
+        let settings = try item("显示器输入源", in: delegate)
+        try dispatch(try XCTUnwrap(settings.submenu?.item(withTitle: "检测输入源")))
+        session.detectingInputSources = false
+        session.detectedInputOptions = [0x0F, 0x10, 0x11, 0x12, 0x99]
+        session.inputSettingsDidChange?()
+        XCTAssertEqual(session.detections, 1)
+        XCTAssertNil(settings.submenu?.item(withTitle: "停用后切到所选 PC 输入"))
+        XCTAssertNil(settings.submenu?.item(withTitle: "当前连接尚未验收自动输入源切换"))
+        XCTAssertFalse(try XCTUnwrap(settings.submenu).items.contains { $0.title.hasPrefix("PC 输入") })
+        for name in ["标准 DP 1（0x0F）", "标准 DP 2（0x10）", "标准 HDMI 1（0x11）", "标准 HDMI 2（0x12）", "输入（0x99）"] {
+            XCTAssertNotNil(settings.submenu?.item(withTitle: "停用外接屏并切至" + name))
+        }
+        XCTAssertTrue(try item("输入源不可用，不影响停用外接屏", in: delegate).isHidden)
+        let source = try XCTUnwrap(settings.submenu?.item(withTitle: "停用外接屏并切至标准 HDMI 2（0x12）"))
+        source.representedObject = NSNumber(value: 0x13)
+        try dispatch(source)
+        XCTAssertTrue(session.sourceSelections.isEmpty)
+        source.representedObject = NSNumber(value: 0x12)
+        try dispatch(source)
+        try dispatch(source)
+        XCTAssertEqual(session.sourceSelections, [0x12])
+        XCTAssertTrue(session.selections.isEmpty)
+        XCTAssertTrue(session.inputSelections.isEmpty)
+        XCTAssertTrue(session.automaticChanges.isEmpty)
+        XCTAssertFalse(session.automaticInputEnabled)
+    }
+
+    func testUnavailableDiscoveryKeepsDisableAvailableAndBusyRecoveryBlocksSources() async throws {
+        let session = InputDiscoverySession()
+        session.inputDiscoveryMessage = "未识别到输入源"
+        session.canDetectInputSources = false
+        let delegate = MenuBarApplicationDelegate(controllerFactory: { session }, lidIsOpen: { true })
+        delegate.startSession()
+        XCTAssertTrue(try item("停用外接屏", in: delegate).isEnabled)
+        XCTAssertFalse(try item("输入源不可用，不影响停用外接屏", in: delegate).isHidden)
+        let settings = try item("显示器输入源", in: delegate)
+        let unavailable = try XCTUnwrap(settings.submenu?.item(withTitle: "检测输入源"))
+        XCTAssertFalse(unavailable.isEnabled)
+        try dispatch(unavailable)
+        XCTAssertEqual(session.detections, 0)
+        session.canDetectInputSources = true
+        session.detectedInputOptions = [0x11]
+        session.inputSettingsDidChange?()
+        for status in [PrimarySessionStatus.applying, .recoveryIncomplete, .quitFailed, .restoringAndQuitting] {
+            session.emit(status)
+            await drainMainQueue()
+            let detect = try XCTUnwrap(settings.submenu?.item(withTitle: "检测输入源"))
+            let source = try XCTUnwrap(settings.submenu?.item(withTitle: "停用外接屏并切至标准 HDMI 1（0x11）"))
+            XCTAssertFalse(detect.isEnabled)
+            XCTAssertFalse(source.isEnabled)
+            try dispatch(detect)
+            try dispatch(source)
+        }
+        XCTAssertEqual(session.detections, 0)
+        XCTAssertTrue(session.sourceSelections.isEmpty)
+    }
+
     func testVerifiedInputSettingsRequireExplicitPortAndToggleAndPreserveSeparateResult() async throws {
         let session = ModeSession()
         session.availableModes.append(.internalOnly)
         session.inputUnavailableReason = nil
         session.inputOptions = [0x11, 0x12]
-        let delegate = MenuBarApplicationDelegate(controllerFactory: { session })
+        let delegate = MenuBarApplicationDelegate(controllerFactory: { session }, lidIsOpen: { true })
         delegate.startSession()
-        let settings = try item("自动切到 PC", in: delegate)
+        let settings = try item("显示器输入源", in: delegate)
+        XCTAssertTrue(try item("输入源不可用，不影响停用外接屏", in: delegate).isHidden)
         func option(_ title: String) throws -> NSMenuItem {
             try XCTUnwrap(settings.submenu?.item(withTitle: title))
         }
-        XCTAssertFalse(try option("启用自动切到 PC").isEnabled)
+        XCTAssertFalse(try option("停用后切到所选 PC 输入").isEnabled)
         XCTAssertTrue(session.inputSelections.isEmpty)
         try dispatch(try option("PC 输入 0x12（请确认端口）"))
         XCTAssertEqual(session.inputSelections, [0x12])
         XCTAssertEqual(try option("PC 输入 0x12（请确认端口）").state, .on)
         XCTAssertEqual(try option("PC 输入 0x11（请确认端口）").state, .off)
-        XCTAssertTrue(try option("启用自动切到 PC").isEnabled)
+        XCTAssertTrue(try option("停用后切到所选 PC 输入").isEnabled)
         XCTAssertTrue(session.automaticChanges.isEmpty)
-        try dispatch(try option("启用自动切到 PC"))
+        try dispatch(try option("停用后切到所选 PC 输入"))
         XCTAssertEqual(session.automaticChanges, [true])
-        XCTAssertEqual(try option("启用自动切到 PC").state, .on)
+        XCTAssertEqual(try option("停用后切到所选 PC 输入").state, .on)
         session.inputResultText = "输入源未确认，请手动检查显示器"
         session.inputSettingsDidChange?()
         let result = try item("输入源未确认，请手动检查显示器", in: delegate)
@@ -780,7 +929,7 @@ final class MenuBarApplicationTests: XCTestCase {
             session.emit(status)
             await drainMainQueue()
             let port = try option("PC 输入 0x11（请确认端口）")
-            let toggle = try option("启用自动切到 PC")
+            let toggle = try option("停用后切到所选 PC 输入")
             XCTAssertFalse(port.isEnabled)
             XCTAssertFalse(toggle.isEnabled)
             try dispatch(port)
@@ -795,16 +944,16 @@ final class MenuBarApplicationTests: XCTestCase {
         session.availableModes.append(.internalOnly)
         session.inputUnavailableReason = nil
         session.inputOptions = [0x11]
-        let delegate = MenuBarApplicationDelegate(controllerFactory: { session })
+        let delegate = MenuBarApplicationDelegate(controllerFactory: { session }, lidIsOpen: { true })
         delegate.startSession()
-        let submenu = try XCTUnwrap(try item("自动切到 PC", in: delegate).submenu)
+        let submenu = try XCTUnwrap(try item("显示器输入源", in: delegate).submenu)
         let port = try XCTUnwrap(submenu.item(withTitle: "PC 输入 0x11（请确认端口）"))
         port.representedObject = NSNumber(value: 0x12)
         try dispatch(port)
         XCTAssertTrue(session.inputSelections.isEmpty)
         session.selectedPCInput = 0x12
         session.inputSettingsDidChange?()
-        let toggle = try XCTUnwrap(try item("自动切到 PC", in: delegate).submenu?.item(withTitle: "启用自动切到 PC"))
+        let toggle = try XCTUnwrap(try item("显示器输入源", in: delegate).submenu?.item(withTitle: "停用后切到所选 PC 输入"))
         XCTAssertFalse(toggle.isEnabled)
         try dispatch(toggle)
         XCTAssertTrue(session.automaticChanges.isEmpty)
@@ -814,7 +963,7 @@ final class MenuBarApplicationTests: XCTestCase {
         for restore in [true, false] {
             let session = ConnectionSession()
             var prompts = 0
-            let delegate = MenuBarApplicationDelegate(controllerFactory: { session }, confirmConnectionRecovery: {
+            let delegate = MenuBarApplicationDelegate(controllerFactory: { session }, lidIsOpen: { true }, confirmConnectionRecovery: {
                 prompts += 1
                 return true
             })
@@ -845,7 +994,7 @@ final class MenuBarApplicationTests: XCTestCase {
 
     func testCancelledConnectionConfirmationRestoresControlsAndConsumesToken() async throws {
         let session = ConnectionSession()
-        let delegate = MenuBarApplicationDelegate(controllerFactory: { session }, confirmConnectionRecovery: { false })
+        let delegate = MenuBarApplicationDelegate(controllerFactory: { session }, lidIsOpen: { true }, confirmConnectionRecovery: { false })
         delegate.startSession()
         session.emit(.applied)
         await drainMainQueue()
@@ -866,7 +1015,7 @@ final class MenuBarApplicationTests: XCTestCase {
     func testNilConnectionPreparationUsesOriginalRecoveryEntryWithoutPrompt() async throws {
         for restore in [true, false] {
             let session = ConnectionSession()
-            let delegate = MenuBarApplicationDelegate(controllerFactory: { session }, confirmConnectionRecovery: {
+            let delegate = MenuBarApplicationDelegate(controllerFactory: { session }, lidIsOpen: { true }, confirmConnectionRecovery: {
                 XCTFail("Normal recovery must not ask for connection confirmation")
                 return true
             })
@@ -883,7 +1032,7 @@ final class MenuBarApplicationTests: XCTestCase {
 
     func testFailedConnectionPreparationDoesNotFallThroughToOrdinaryRecovery() async throws {
         let session = ConnectionSession()
-        let delegate = MenuBarApplicationDelegate(controllerFactory: { session }, confirmConnectionRecovery: {
+        let delegate = MenuBarApplicationDelegate(controllerFactory: { session }, lidIsOpen: { true }, confirmConnectionRecovery: {
             XCTFail("Failed preparation must not open a prompt")
             return true
         })
@@ -906,7 +1055,7 @@ final class MenuBarApplicationTests: XCTestCase {
                 let session = ConnectionSession()
                 let replacement = ConnectionSession()
                 var current = session
-                let delegate = MenuBarApplicationDelegate(controllerFactory: { current }, confirmConnectionRecovery: {
+                let delegate = MenuBarApplicationDelegate(controllerFactory: { current }, lidIsOpen: { true }, confirmConnectionRecovery: {
                     XCTFail("Stale preparation must not open a prompt")
                     return true
                 })
@@ -928,6 +1077,7 @@ final class MenuBarApplicationTests: XCTestCase {
                     session.modeDidChange?()
                     session.selectedMode = .internalOnly
                     session.modeDidChange?()
+                    XCTAssertTrue(session.hasExternalRecoveryOwner)
                 }
                 let record = try connectionRecord()
                 let token = ExternalConnectionRecoveryConfirmation(record: record)
@@ -944,7 +1094,7 @@ final class MenuBarApplicationTests: XCTestCase {
     func testConnectionPromptRechecksIntentAfterNestedEvents() async throws {
         let session = ConnectionSession()
         var delegate: MenuBarApplicationDelegate!
-        delegate = MenuBarApplicationDelegate(controllerFactory: { session }, confirmConnectionRecovery: {
+        delegate = MenuBarApplicationDelegate(controllerFactory: { session }, lidIsOpen: { true }, confirmConnectionRecovery: {
             XCTAssertEqual(delegate.applicationShouldTerminate(.shared), .terminateCancel)
             return true
         })
@@ -965,7 +1115,7 @@ final class MenuBarApplicationTests: XCTestCase {
             let session = ConnectionSession()
             var terminationRequests = 0
             var prompts = 0
-            let delegate = MenuBarApplicationDelegate(controllerFactory: { session }, requestTermination: {
+            let delegate = MenuBarApplicationDelegate(controllerFactory: { session }, lidIsOpen: { true }, requestTermination: {
                 terminationRequests += 1
             }, confirmConnectionRecovery: {
                 prompts += 1
@@ -989,6 +1139,132 @@ final class MenuBarApplicationTests: XCTestCase {
         }
     }
 
+    func testExternalRecoveryOwnerSurvivesSelectedOnlyModeAndCancelledRecoveryRetry() async throws {
+        for failure in [PrimarySessionStatus.quitFailed, .recoveryIncomplete] {
+            let session = ConnectionSession(mode: .externalOnly)
+            var accepted = false
+            var prompts = 0
+            var terminationRequests = 0
+            let delegate = MenuBarApplicationDelegate(controllerFactory: { session }, lidIsOpen: { true }, requestTermination: {
+                terminationRequests += 1
+            }, confirmConnectionRecovery: {
+                prompts += 1
+                return accepted
+            })
+            delegate.startSession()
+            session.emit(.applying)
+            await drainMainQueue()
+            XCTAssertTrue(delegate.accessibilityStatusLabel.contains("正在恢复外接屏…"))
+            XCTAssertFalse(delegate.accessibilityStatusLabel.contains("正在停用内屏"))
+            session.emit(failure)
+            await drainMainQueue()
+            XCTAssertTrue(try item("停用外接屏", in: delegate).isHidden)
+            let retry = try item("重试恢复", in: delegate)
+            XCTAssertFalse(retry.isHidden)
+            try dispatch(retry)
+            let record = try connectionRecord()
+            let cancelled = ExternalConnectionRecoveryConfirmation(record: record)
+            session.preparations[0](cancelled)
+            await drainConnectionPreparation()
+            XCTAssertFalse(cancelled.consume(for: record))
+            XCTAssertTrue(session.hasExternalRecoveryOwner)
+            XCTAssertTrue(retry.isEnabled)
+            XCTAssertTrue(session.confirmedRecoveries.isEmpty)
+            XCTAssertEqual(terminationRequests, 0)
+            accepted = true
+            try dispatch(retry)
+            XCTAssertEqual(session.preparations.count, 2)
+            let confirmed = try connectionToken()
+            session.preparations[1](confirmed)
+            await drainConnectionPreparation()
+            XCTAssertEqual(prompts, 2)
+            XCTAssertEqual(session.confirmedRecoveries.map(\.id), [confirmed.id])
+            XCTAssertTrue(session.selections.isEmpty)
+            XCTAssertEqual(session.recoveries, 0)
+            XCTAssertEqual(terminationRequests, 0)
+            session.emit(.manualConfiguration)
+            await drainMainQueue()
+            XCTAssertEqual(terminationRequests, failure == .quitFailed ? 1 : 0)
+        }
+    }
+
+    func testClosedLidExternalRecoveryHintUsesActualOwnerAndResetsAfterOpening() async throws {
+        for mode in [DisplayApplicationMode.internalOnly, .externalOnly, .externalPrimary] {
+            let session = ConnectionSession(mode: mode)
+            var lidOpen = false
+            let delegate = MenuBarApplicationDelegate(controllerFactory: { session }, lidIsOpen: { lidOpen })
+            delegate.startSession()
+            session.emit(.recoveryIncomplete)
+            await drainMainQueue()
+            let state = try item("恢复未完成，请开盖完成核验", in: delegate)
+            let retry = try item("开盖后重试恢复", in: delegate)
+            XCTAssertFalse(retry.isHidden)
+            XCTAssertFalse(retry.isEnabled)
+            XCTAssertEqual(state.toolTip, "请打开笔记本上盖，再点“重试恢复”以完成完整双屏布局的恢复核验。")
+            XCTAssertEqual(retry.toolTip, state.toolTip)
+            XCTAssertTrue(delegate.accessibilityStatusLabel.contains(state.title))
+            XCTAssertTrue(session.hasExternalRecoveryOwner)
+            XCTAssertTrue(session.preparations.isEmpty)
+
+            lidOpen = true
+            let menuDelegate = try XCTUnwrap(delegate.menu.delegate)
+            menuDelegate.menuWillOpen?(delegate.menu)
+            XCTAssertNotNil(delegate.menu.item(withTitle: "恢复未完成"))
+            XCTAssertEqual(retry.title, "重试恢复")
+            XCTAssertTrue(retry.isEnabled)
+            XCTAssertNil(retry.toolTip)
+            try dispatch(retry)
+            XCTAssertEqual(session.preparations.count, 1)
+
+            lidOpen = false
+            session.emit(.recoveryIncomplete)
+            await drainMainQueue()
+            XCTAssertNotNil(delegate.menu.item(withTitle: "正在确认连接…"))
+            XCTAssertEqual(retry.title, "重试恢复")
+            XCTAssertFalse(retry.isEnabled)
+            XCTAssertNil(retry.toolTip)
+        }
+    }
+
+    func testClosedLidDoesNotChangeOtherOwnersOrRecoveryStatuses() async throws {
+        for externalOwner in [false, true] {
+            let session = ConnectionSession()
+            session.hasExternalRecoveryOwner = externalOwner
+            let delegate = MenuBarApplicationDelegate(controllerFactory: { session }, lidIsOpen: { false })
+            delegate.startSession()
+            for state in [PrimarySessionStatus.recoveryIncomplete, .applying, .quitFailed, .quitWaitingForDisplays, .restoringAndQuitting] {
+                if externalOwner && state == .recoveryIncomplete { continue }
+                session.emit(state)
+                await drainMainQueue()
+                XCTAssertNotNil(delegate.menu.item(withTitle: state == .applying ? "正在停用外接屏…" : state.text))
+                let retry = try item("重试恢复", in: delegate)
+                XCTAssertEqual(retry.isEnabled, state.canRetryRecovery)
+                XCTAssertEqual(retry.isHidden, !state.canRetryRecovery)
+                XCTAssertEqual(retry.toolTip, state == .quitWaitingForDisplays
+                    ? "请打开笔记本上盖或接回原外接显示器，再点“重试恢复”以恢复并退出。" : nil)
+            }
+        }
+    }
+
+    func testPrimaryRecoveryOwnerDoesNotPrepareExternalConnectionOnQuitRetry() async throws {
+        let session = ConnectionSession(mode: .externalPrimary)
+        session.hasExternalRecoveryOwner = false
+        var terminationRequests = 0
+        let delegate = MenuBarApplicationDelegate(controllerFactory: { session }, lidIsOpen: { true }, requestTermination: {
+            terminationRequests += 1
+        }, confirmConnectionRecovery: {
+            XCTFail("Primary recovery must not ask for external connection confirmation")
+            return false
+        })
+        delegate.startSession()
+        session.emit(.quitFailed)
+        await drainMainQueue()
+        try dispatch(try item("重试恢复", in: delegate))
+        XCTAssertTrue(session.preparations.isEmpty)
+        XCTAssertTrue(session.confirmedRecoveries.isEmpty)
+        XCTAssertEqual(terminationRequests, 1)
+    }
+
     private func connectionRecord() throws -> RecoveryRecord {
         let id = UUID()
         let layout = try DisplayLayout(main: id, origins: [id: DisplayOrigin(x: 0, y: 0)])
@@ -1001,6 +1277,7 @@ final class MenuBarApplicationTests: XCTestCase {
 
     @MainActor
     private final class ConnectionSession: ModeSession, ExternalConnectionRecoveryControlling {
+        var hasExternalRecoveryOwner = true
         var preparations: [@Sendable (ExternalConnectionRecoveryConfirmation?) -> Void] = []
         var confirmedRecoveries: [ExternalConnectionRecoveryConfirmation] = []
         init(mode: DisplayApplicationMode = .internalOnly) {
@@ -1021,6 +1298,31 @@ final class MenuBarApplicationTests: XCTestCase {
     private func drainConnectionPreparation() async {
         await withCheckedContinuation { continuation in
             RunLoop.main.perform(inModes: [.common, .modalPanel]) { continuation.resume() }
+        }
+    }
+
+    @MainActor
+    private final class InputDiscoverySession: ModeSession, ExternalDisplayInputSourcesSelecting {
+        var detectedInputOptions: [UInt16] = []
+        var detectingInputSources = false
+        var inputDiscoveryMessage: String?
+        var canDetectInputSources = true
+        var canSelectDetectedInput = true
+        var detections = 0
+        var sourceSelections: [UInt16] = []
+        init(exposesInputSources: Bool = true) {
+            super.init()
+            availableModes.append(.internalOnly)
+        }
+        func detectInputSources() {
+            detections += 1
+            detectingInputSources = true
+            inputSettingsDidChange?()
+        }
+        func disableExternal(selectingInput input: UInt16) {
+            sourceSelections.append(input)
+            selectedMode = .internalOnly
+            modeDidChange?()
         }
     }
 
@@ -1115,6 +1417,7 @@ final class MenuBarApplicationTests: XCTestCase {
                 }
                 return session
             },
+            lidIsOpen: { true },
             requestTermination: { [unowned self] in terminationRequests += 1 },
             replyTermination: { [unowned self] in terminationReplies.append($0) },
             openSettings: { [unowned self] in openedURLs.append($0) }

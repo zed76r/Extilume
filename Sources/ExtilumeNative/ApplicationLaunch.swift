@@ -75,9 +75,12 @@ func applicationPreferenceSuiteName(for directory: URL) -> String {
 }
 
 @MainActor
-func externalHandoffLaunchPreferences(for directory: URL) throws -> (defaults: UserDefaults, preferences: DisplayModePreferences) {
+func externalHandoffLaunchPreferences(for directory: URL, protectionDefaults: UserDefaults = .standard) throws -> (defaults: UserDefaults, preferences: DisplayModePreferences) {
     guard let defaults = UserDefaults(suiteName: applicationPreferenceSuiteName(for: directory)) else {
         throw RecoveryStoreError.ioFailure
     }
-    return (defaults, DisplayModePreferences(defaults: defaults))
+    let preferences = DisplayModePreferences(defaults: defaults, protectionDefaults: protectionDefaults)
+    // Carry directory-only failures forward so changing profiles cannot bypass them.
+    if preferences.internalControlLocked { try preferences.lockInternalControl() }
+    return (defaults, preferences)
 }

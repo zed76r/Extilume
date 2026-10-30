@@ -80,7 +80,7 @@ final class ExternalDisplayInputTests: XCTestCase {
             hardwareVerifiedTarget: identity,
             bootSessionReader: { identity.bootSession }
         ) { request in
-            executeExternalDisplayInputProbe(request, transport: transport, now: { 1 }, sleep: { _ in })
+            executeExternalDisplayInputProbe(request, transport: transport, now: { 1 }, sleep: { _ in }, authorizeWrite: {})
         }
         let capabilities = ExternalDisplayInputCapabilities(target: identity, inputValues: [0x11])
 
@@ -112,7 +112,7 @@ final class ExternalDisplayInputTests: XCTestCase {
             ),
             transport: transport,
             now: { 10 },
-            sleep: { _ in }
+            sleep: { _ in }, authorizeWrite: {}
         )
         XCTAssertEqual(reply, .failed(.timedOut))
         XCTAssertTrue(transport.writes.isEmpty)
@@ -143,7 +143,7 @@ final class ExternalDisplayInputTests: XCTestCase {
             ExternalDisplayInputProbeRequest(target: identity, operation: .selectInput(0x11), deadlineNanoseconds: deadline),
             transport: mismatch,
             now: { 1 },
-            sleep: { _ in }
+            sleep: { _ in }, authorizeWrite: {}
         ), .failed(.readbackMismatch))
         XCTAssertEqual(mismatch.writes, [0x11])
 
@@ -152,9 +152,89 @@ final class ExternalDisplayInputTests: XCTestCase {
             ExternalDisplayInputProbeRequest(target: identity, operation: .selectInput(0x11), deadlineNanoseconds: deadline),
             transport: unavailable,
             now: { 1 },
-            sleep: { _ in }
+            sleep: { _ in }, authorizeWrite: {}
         ), .failed(.readbackUnavailable))
         XCTAssertEqual(unavailable.writes, [0x11])
+    }
+
+    func testCapabilityProbeDoesNotAuthorizeOrWrite() {
+        let identity = target()
+        let transport = FakeTransport(inputValues: [0x11], readback: 0x11)
+        let reply = executeExternalDisplayInputProbe(
+            ExternalDisplayInputProbeRequest(target: identity, operation: .capabilities, deadlineNanoseconds: 10),
+            transport: transport, now: { 1 }, sleep: { _ in }, authorizeWrite: { XCTFail("unexpected authorization") }
+        )
+        XCTAssertEqual(reply, .capabilities(ExternalDisplayInputCapabilities(target: identity, inputValues: [0x11])))
+        XCTAssertTrue(transport.writes.isEmpty)
+    }
+
+    func testAuthorizationFailureAfterCapabilitiesPreventsWrite() {
+        let identity = target()
+        let transport = FakeTransport(inputValues: [0x11], readback: 0x11)
+        let reply = executeExternalDisplayInputProbe(
+            ExternalDisplayInputProbeRequest(target: identity, operation: .selectInput(0x11), deadlineNanoseconds: 10),
+            transport: transport, now: { 1 }, sleep: { _ in },
+            authorizeWrite: { throw ExternalDisplayInputFailure.hardwareAcceptanceRequired }
+        )
+        XCTAssertEqual(reply, .failed(.hardwareAcceptanceRequired))
+        XCTAssertTrue(transport.writes.isEmpty)
+    }
+
+    func testWriteApprovalChecksReadyAndFreshState() throws {
+        let identity = target()
+        let deadline = try ContinuousClock.nanoseconds() + 2_000_000_000
+        let request = ExternalDisplayInputProbeRequest(target: identity, operation: .selectInput(0x11), deadlineNanoseconds: deadline)
+        let (parent, child) = try GuardChannel.pair()
+        let state = ExternalDisplayState(id: 42, identity: identity, isOnline: true, isActive: false)
+        try child.send(ExternalDisplayInputWriteReady(target: identity, input: 0x11, deadlineNanoseconds: deadline), deadlineNanoseconds: deadline)
+        try approveExternalDisplayInputWrite(request, channel: parent, checkAccess: {}, authorizeWrite: { state })
+        XCTAssertEqual(try child.receive(ExternalDisplayState.self, deadlineNanoseconds: deadline), state)
+
+        let (parent2, child2) = try GuardChannel.pair()
+        try child2.send(ExternalDisplayInputWriteReady(target: target(), input: 0x11, deadlineNanoseconds: deadline), deadlineNanoseconds: deadline)
+        XCTAssertThrowsError(try approveExternalDisplayInputWrite(request, channel: parent2, checkAccess: {}, authorizeWrite: { XCTFail("wrong target"); return state }))
+
+        let (rejectedParent, rejectedChild) = try GuardChannel.pair()
+        try rejectedChild.send(ExternalDisplayInputWriteReady(target: identity, input: 0x11, deadlineNanoseconds: deadline), deadlineNanoseconds: deadline)
+        XCTAssertThrowsError(try approveExternalDisplayInputWrite(request, channel: rejectedParent, checkAccess: {}, authorizeWrite: nil))
+        let (cancelledParent, cancelledChild) = try GuardChannel.pair()
+        try cancelledChild.send(ExternalDisplayInputWriteReady(target: identity, input: 0x11, deadlineNanoseconds: deadline), deadlineNanoseconds: deadline)
+        XCTAssertThrowsError(try approveExternalDisplayInputWrite(request, channel: cancelledParent, checkAccess: {
+            throw ExternalDisplayInputFailure.hardwareAcceptanceRequired
+        }, authorizeWrite: { XCTFail("cancelled"); return state }))
+
+        let (parent3, child3) = try GuardChannel.pair()
+        try parent3.send(state, deadlineNanoseconds: deadline)
+        try requestExternalDisplayInputWriteApproval(request, channel: child3, read: { target, id in
+            XCTAssertEqual(target, identity)
+            XCTAssertEqual(id, 42)
+            return state
+        })
+        XCTAssertEqual(try parent3.receive(ExternalDisplayInputWriteReady.self, deadlineNanoseconds: deadline),
+                       ExternalDisplayInputWriteReady(target: identity, input: 0x11, deadlineNanoseconds: deadline))
+
+        let (parent4, child4) = try GuardChannel.pair()
+        try parent4.send(state, deadlineNanoseconds: deadline)
+        XCTAssertThrowsError(try requestExternalDisplayInputWriteApproval(request, channel: child4, read: { _, _ in
+            ExternalDisplayState(id: 43, identity: identity, isOnline: true, isActive: false)
+        }))
+    }
+
+    func testGrantIsSingleUseAndExact() {
+        let identity = target()
+        let config = ExternalDisplayInputConfiguration(target: identity, pcInput: 0x11, automaticEnabled: true)
+        let grant = ExternalDisplayInputSelectionAuthorization(configuration: config, deadlineNanoseconds: 10)
+        XCTAssertTrue(grant.isAvailable(for: identity, now: 1))
+        XCTAssertFalse(grant.consume(configuration: config, deadlineNanoseconds: 11, now: 1))
+        XCTAssertFalse(grant.consume(configuration: config, deadlineNanoseconds: 10, now: 1))
+        for wrong in [ExternalDisplayInputConfiguration(target: target(), pcInput: 0x11, automaticEnabled: true),
+                      ExternalDisplayInputConfiguration(target: identity, pcInput: 0x12, automaticEnabled: true)] {
+            let separate = ExternalDisplayInputSelectionAuthorization(configuration: config, deadlineNanoseconds: 10)
+            XCTAssertFalse(separate.consume(configuration: wrong, deadlineNanoseconds: 10, now: 1))
+            XCTAssertFalse(separate.isAvailable(for: identity, now: 1))
+        }
+        let expired = ExternalDisplayInputSelectionAuthorization(configuration: config, deadlineNanoseconds: 10)
+        XCTAssertFalse(expired.consume(configuration: config, deadlineNanoseconds: 10, now: 10))
     }
 
     private func target() -> ExternalDisplayIdentity {

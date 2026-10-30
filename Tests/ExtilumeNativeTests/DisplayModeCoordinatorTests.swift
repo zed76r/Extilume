@@ -9,9 +9,13 @@ final class DisplayModeCoordinatorTests: XCTestCase {
         var selectedMode: DisplayApplicationMode?
         var internalControlLocked = false
         var externalHandoffRequested = false
+        var failHandoffSave = false
         func select(_ mode: DisplayApplicationMode) throws { selectedMode = mode }
         func lockInternalControl() throws { internalControlLocked = true }
-        func setExternalHandoffRequested(_ requested: Bool) throws { externalHandoffRequested = requested }
+        func setExternalHandoffRequested(_ requested: Bool) throws {
+            if failHandoffSave { throw RecoveryStoreError.ioFailure }
+            externalHandoffRequested = requested
+        }
     }
 
     @MainActor private final class Session: PrimaryApplicationControlling, ExternalConnectionRecoveryControlling {
@@ -157,6 +161,97 @@ final class DisplayModeCoordinatorTests: XCTestCase {
         XCTAssertEqual(external.starts, 1)
         XCTAssertFalse(external.recoveryOnly)
         XCTAssertEqual(target, root)
+    }
+
+    func testSettledExternalRecordRetiresBeforeStartupEvenWithSavedHandoff() throws {
+        for requested in [false, true] {
+            let root = try directory()
+            defer { try? FileManager.default.removeItem(at: root) }
+            try saveExternalRecord(root, settled: true)
+            let previous = try XCTUnwrap(RecoveryStore(directory: root).load())
+            XCTAssertTrue(previous.canClear)
+            XCTAssertNotNil(previous.externalDisplay?.identity.bootSession)
+            let preferences = Preferences()
+            preferences.selectedMode = .internalOnly
+            preferences.externalHandoffRequested = requested
+            var creations = 0
+            let statuses = StatusValues()
+            let coordinator = try DisplayModeCoordinator(directory: root, preferences: preferences,
+                availableModes: [.externalPrimary, .internalOnly]) { _, _, _ in
+                creations += 1
+                return Session()
+            }
+
+            coordinator.startApplication(registerEvents: false, recoveryOnly: false) { statuses.append($0) }
+            XCTAssertNil(try RecoveryStore(directory: root).load())
+            XCTAssertFalse(preferences.externalHandoffRequested)
+            XCTAssertTrue(coordinator.requiresExplicitActivation)
+            XCTAssertEqual(creations, 0)
+            XCTAssertEqual(statuses.last, .waiting)
+        }
+    }
+
+    func testSettledMixedResponsibilitiesRetainConflictProtection() throws {
+        let root = try directory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try saveExternalRecord(root, settled: true, mixed: true)
+        let previous = try XCTUnwrap(RecoveryStore(directory: root).load())
+        XCTAssertTrue(previous.canClear)
+        XCTAssertNotNil(previous.internalDisplay)
+        XCTAssertNotNil(previous.externalDisplay)
+        let preferences = Preferences()
+        preferences.selectedMode = .internalOnly
+        preferences.externalHandoffRequested = true
+        let statuses = StatusValues()
+        var creations = 0
+        let coordinator = try DisplayModeCoordinator(directory: root, preferences: preferences) { _, _, _ in
+            creations += 1
+            return Session()
+        }
+        coordinator.startApplication(registerEvents: false, recoveryOnly: false) { statuses.append($0) }
+        XCTAssertEqual(try RecoveryStore(directory: root).load(), previous)
+        XCTAssertTrue(preferences.externalHandoffRequested)
+        XCTAssertEqual(statuses.last, .recoveryIncomplete)
+        XCTAssertEqual(creations, 0)
+    }
+
+    func testUnsettledExternalRecordsStillStartRecovery() throws {
+        for unresolved in [false, true] {
+            let root = try directory()
+            defer { try? FileManager.default.removeItem(at: root) }
+            try saveExternalRecord(root, unresolved: unresolved)
+            let previous = try XCTUnwrap(RecoveryStore(directory: root).load())
+            XCTAssertFalse(previous.canClear)
+            XCTAssertEqual(previous.sourceUnresolved, unresolved)
+            let session = Session()
+            var modes: [DisplayApplicationMode] = []
+            let coordinator = try DisplayModeCoordinator(directory: root, preferences: Preferences()) { mode, _, _ in
+                modes.append(mode)
+                return session
+            }
+            coordinator.startApplication(registerEvents: false, recoveryOnly: false) { _ in }
+            XCTAssertEqual(modes, [.internalOnly])
+            XCTAssertTrue(session.recoveryOnly)
+            XCTAssertEqual(try RecoveryStore(directory: root).load(), previous)
+        }
+    }
+
+    func testSettledExternalRecordSurvivesPreferenceSaveFailure() throws {
+        let root = try directory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try saveExternalRecord(root, settled: true)
+        let previous = try XCTUnwrap(RecoveryStore(directory: root).load())
+        let preferences = Preferences()
+        preferences.externalHandoffRequested = true
+        preferences.failHandoffSave = true
+        var creations = 0
+        XCTAssertThrowsError(try DisplayModeCoordinator(directory: root, preferences: preferences) { _, _, _ in
+            creations += 1
+            return Session()
+        })
+        XCTAssertEqual(try RecoveryStore(directory: root).load(), previous)
+        XCTAssertTrue(preferences.externalHandoffRequested)
+        XCTAssertEqual(creations, 0)
     }
 
     func testExistingExternalRootResponsibilityOverridesOnlyInMemoryModeForRecovery() async throws {
@@ -330,6 +425,61 @@ final class DisplayModeCoordinatorTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: root.appendingPathComponent("recovery-record.json").path))
     }
 
+    func testProtectedExternalOnlySelectionRestoresExternalOwnerBeforeRejection() async throws {
+        for restored in [false, true] {
+            let root = try directory()
+            defer { try? FileManager.default.removeItem(at: root) }
+            let preferences = Preferences()
+            preferences.internalControlLocked = true
+            let external = Session()
+            var modes: [DisplayApplicationMode] = []
+            let statuses = StatusValues()
+            let coordinator = try DisplayModeCoordinator(directory: root, preferences: preferences,
+                availableModes: [.externalPrimary, .externalOnly, .internalOnly]) { mode, _, _ in
+                modes.append(mode)
+                return external
+            }
+            coordinator.startApplication(registerEvents: false, recoveryOnly: false) { statuses.append($0) }
+            coordinator.selectMode(.internalOnly)
+            external.handler?(.applied)
+            await drain()
+
+            coordinator.selectMode(.externalOnly)
+            XCTAssertEqual(modes, [.internalOnly])
+            XCTAssertTrue(coordinator.hasExternalRecoveryOwner)
+            XCTAssertFalse(preferences.externalHandoffRequested)
+            let finishRestore = try XCTUnwrap(external.quitCompletion)
+            finishRestore(restored)
+            await drain()
+
+            XCTAssertEqual(modes, [.internalOnly], "Protected internal control must never start")
+            XCTAssertTrue(preferences.internalControlLocked)
+            if restored {
+                XCTAssertFalse(coordinator.hasExternalRecoveryOwner)
+                guard case .unsupported = statuses.last else { return XCTFail("Restored owner must leave the protection gate closed") }
+            } else {
+                XCTAssertEqual(statuses.last, .recoveryIncomplete)
+                external.handler?(.quitFailed)
+                await drain()
+                XCTAssertEqual(statuses.last, .recoveryIncomplete, "A late mode-handoff failure is not an application quit")
+                coordinator.recoverApplication()
+                XCTAssertEqual(external.recoveries, 1)
+                external.handler?(.manualConfiguration)
+                await drain()
+                let quit = expectation(description: "A real quit remains a quit after mode recovery")
+                coordinator.quitApplication { success in
+                    XCTAssertFalse(success)
+                    quit.fulfill()
+                }
+                external.quitCompletion?(false)
+                await fulfillment(of: [quit], timeout: 1)
+                external.handler?(.quitFailed)
+                await drain()
+                XCTAssertEqual(statuses.last, .quitFailed)
+            }
+        }
+    }
+
     func testFailedRecoveryRetainsOwnerAndPersistentDisableLatch() async throws {
         let root = try directory()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -462,7 +612,7 @@ final class DisplayModeCoordinatorTests: XCTestCase {
         try store.save(record)
     }
 
-    private func saveExternalRecord(_ directory: URL) throws {
+    private func saveExternalRecord(_ directory: URL, settled: Bool = false, unresolved: Bool = false, mixed: Bool = false) throws {
         let builtIn = UUID(uuidString: "00000000-0000-4000-8000-000000000001")!
         let external = UUID(uuidString: "00000000-0000-4000-8000-000000000002")!
         let baseline = try DisplayLayout(main: builtIn, origins: [
@@ -479,9 +629,17 @@ final class DisplayModeCoordinatorTests: XCTestCase {
         let responsibility = ExternalDisplayResponsibility(
             identity: identity, numericIDHint: 7, baseline: true, applied: false
         )
-        var record = try RecoveryRecord(baseline: baseline, target: baseline, externalDisplay: responsibility)
+        var record = try RecoveryRecord(baseline: baseline, target: baseline,
+            internalDisplay: mixed ? InternalDisplayResponsibility(identity: builtIn, baseline: true, applied: true) : nil,
+            externalDisplay: responsibility)
         try record.markApplying()
         try record.confirmApplied(target, internalEnabled: true, externalEnabled: false)
+        if settled {
+            record.beginRestoration()
+            try record.confirmRestored(actual: baseline, internalEnabled: true, externalEnabled: true)
+        } else if unresolved {
+            XCTAssertThrowsError(try record.observe(target, source: .unknown))
+        }
         let store = try RecoveryStore(directory: directory)
         try store.acquireExclusiveOwnership()
         try store.save(record)

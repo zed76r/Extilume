@@ -6,7 +6,8 @@ import Foundation
 // 状态只在串行队列访问；请求与睡眠门禁能在独立读回阻塞期间撤销新写入。
 final class ExternalApplicationController: @unchecked Sendable {
     typealias Factory = @Sendable (
-        URL, RecoveryStore, @escaping () throws -> Void, @escaping DisplayEnableTransaction.NativeCall
+        URL, RecoveryStore, @escaping () throws -> Void, @escaping DisplayEnableTransaction.NativeCall,
+        @escaping DisplayEnableTransaction.NativeCall
     ) throws -> ExternalDisplayVerification
 
     private let queue = DispatchQueue(label: "Extilume.external-handoff")
@@ -20,6 +21,7 @@ final class ExternalApplicationController: @unchecked Sendable {
     private var pendingEpoch: UUID?
     private var pendingConnectionConfirmation: (ExternalConnectionRecoveryConfirmation, UUID)?
     private var confirmedRecoveryEpoch: UUID?
+    private var activeInputEpoch: UUID?
     private var automaticReapplicationAllowed = false
     private var unknownChangePending = false
     private var operationEpoch = UUID()
@@ -33,14 +35,15 @@ final class ExternalApplicationController: @unchecked Sendable {
     private var holding = false
     private var automaticInput: ExternalAutomaticInputSession?
     private var sendInputOnStart = false
+    private var requiresMatchingInputTarget = false
     private var inputResult: (@Sendable (ExternalDisplayInputResult) -> Void)?
 
     init(directory: URL, recoveryStore: RecoveryStore? = nil,
-         verificationFactory: @escaping Factory = { directory, store, check, native in
+         verificationFactory: @escaping Factory = { directory, store, check, native, completion in
              try ExternalDisplayVerification(directory: directory, recoveryStore: store,
                  writeOrigins: { origins, validate in
                      try configureOrigins(origins, option: .forSession, nativeCall: native, validateBeforeCommit: validate)
-                 }, nativeCall: native, checkAccess: check)
+                 }, nativeCall: native, recoveryCompletionCall: completion, checkAccess: check)
          }) throws {
         self.directory = directory
         store = try recoveryStore ?? RecoveryStore(directory: directory)
@@ -68,6 +71,15 @@ final class ExternalApplicationController: @unchecked Sendable {
                 let verifier = try self.factory(self.directory, self.store, { try self.checkAccess() }, {
                     try self.checkAccess()
                     return try self.gate.perform($0)
+                }, { complete in
+                    try self.gate.perform {
+                        try self.lock.withLock {
+                            guard self.requestedEpoch == self.operationEpoch else { throw RecoveryError.invalidTransition }
+                            // 此刻提交已接纳，后续显示回调交给独立结果核验。
+                            self.confirmedRecoveryEpoch = nil
+                        }
+                        return complete()
+                    }
                 })
                 self.verifier = verifier
                 if try verifier.hasRecord() {
@@ -153,11 +165,7 @@ final class ExternalApplicationController: @unchecked Sendable {
             guard !self.retired, let verifier = self.verifier else { return }
             self.publish(.applying)
             do {
-                try verifier.restore(confirmation: confirmation, connectionEnabled: {
-                    self.lock.withLock {
-                        if self.confirmedRecoveryEpoch == epoch { self.confirmedRecoveryEpoch = nil }
-                    }
-                })
+                try verifier.restore(confirmation: confirmation)
                 self.publishIfCurrent(.manualConfiguration, epoch: epoch)
             } catch { self.publishFailure(error, epoch: epoch) }
         }
@@ -201,20 +209,61 @@ final class ExternalApplicationController: @unchecked Sendable {
     }
 
     func configureAutomaticInput(_ session: ExternalAutomaticInputSession?, sendOnStart: Bool = false,
+                                 requiresMatchingTarget: Bool = false,
                                  onResult: @escaping @Sendable (ExternalDisplayInputResult) -> Void = { _ in }) {
         queue.async {
             self.automaticInput = session
             self.sendInputOnStart = sendOnStart
+            self.requiresMatchingInputTarget = requiresMatchingTarget
             self.inputResult = onResult
         }
     }
 
     private func explicitDisable(_ verifier: ExternalDisplayVerification, sendInput: Bool) throws {
         var session = sendInput ? automaticInput : nil
+        let expectedInputTarget = requiresMatchingInputTarget ? session?.configuration.target : nil
+        if requiresMatchingInputTarget {
+            automaticInput = nil
+            requiresMatchingInputTarget = false
+            sendInputOnStart = false
+        }
         var prepared = false
-        try verifier.disable { target in prepared = session?.prepare(for: target) == true }
-        guard sendInput, automaticInput != nil else { return }
+        try verifier.disable(expectedTarget: expectedInputTarget) { target in
+            prepared = session?.prepare(for: target) == true
+        }
+        guard sendInput, session != nil else { return }
         guard prepared, let target = try verifier.targetIdentity() else { inputResult?(.unavailable); return }
+        sendPreparedInput(&session, verifier: verifier, target: target)
+    }
+
+    func selectInputWhileDisabled(_ selection: ExternalAutomaticInputSession) {
+        guard let epoch = request("input") else { return }
+        queue.async {
+            self.operationEpoch = epoch
+            self.scheduler.cancel()
+            defer { self.finish(epoch) }
+            guard !self.retired, let verifier = self.verifier else { return }
+            self.publish(.applying)
+            do {
+                try self.checkAccess()
+                guard try verifier.targetIdentity() == selection.configuration.target,
+                      try verifier.reconcile(allowReapplication: false) == .applied else {
+                    throw RecoveryError.identityConflict
+                }
+                if try verifier.hasCompleteIdentityForInput() {
+                    var session: ExternalAutomaticInputSession? = selection
+                    if session?.prepare(for: selection.configuration.target) == true {
+                        self.sendPreparedInput(&session, verifier: verifier, target: selection.configuration.target)
+                    } else { self.inputResult?(.unavailable) }
+                } else { self.inputResult?(.unavailable) }
+                self.holding = true
+                self.publishIfCurrent(.applied, epoch: epoch)
+            } catch { self.publishFailure(error, epoch: epoch) }
+        }
+    }
+
+    private func sendPreparedInput(_ session: inout ExternalAutomaticInputSession?,
+                                   verifier: ExternalDisplayVerification, target: ExternalDisplayIdentity) {
         do {
             try checkAccess()
             guard try verifier.reconcile(allowReapplication: false) == .applied else {
@@ -223,7 +272,18 @@ final class ExternalApplicationController: @unchecked Sendable {
             }
             guard try verifier.hasCompleteIdentityForInput() else { inputResult?(.unconfirmed); return }
             try checkAccess()
-            inputResult?(session?.sendOnce(to: target) ?? .unavailable)
+            lock.withLock { activeInputEpoch = operationEpoch }
+            defer { lock.withLock { activeInputEpoch = nil } }
+            inputResult?(session?.sendOnce(to: target, checkAccess: { try self.checkAccess() }, authorizeWrite: {
+                try self.checkAccess()
+                guard try verifier.reconcile(allowReapplication: false) == .applied else {
+                    throw RecoveryError.unfinishedTransaction
+                }
+                let state = try verifier.externalStateForInput()
+                guard state.matches(identity: target) else { throw RecoveryError.identityConflict }
+                try self.checkAccess()
+                return state
+            }) ?? .unavailable)
         } catch { inputResult?(.unconfirmed) }
     }
 
@@ -244,9 +304,11 @@ final class ExternalApplicationController: @unchecked Sendable {
         lock.withLock {
             pendingConnectionConfirmation?.0.cancel()
             pendingConnectionConfirmation = nil
-            let revoked = confirmedRecoveryEpoch == requestedEpoch || pendingAction == "prepare-connection"
+            let revoked = confirmedRecoveryEpoch == requestedEpoch || activeInputEpoch == requestedEpoch
+                || pendingAction == "prepare-connection"
             if revoked { requestedEpoch = UUID() }
             confirmedRecoveryEpoch = nil
+            activeInputEpoch = nil
             return revoked ? requestedEpoch : nil
         }
     }
@@ -298,6 +360,7 @@ final class ExternalApplicationController: @unchecked Sendable {
             pendingConnectionConfirmation = nil
             let epoch = UUID()
             requestedEpoch = epoch
+            activeInputEpoch = nil
             confirmedRecoveryEpoch = confirmation == nil ? nil : epoch
             pendingAction = action
             pendingEpoch = epoch
@@ -319,7 +382,13 @@ final class ExternalApplicationController: @unchecked Sendable {
 
     private func publishFailure(_ error: Error, epoch: UUID) {
         if case RecoveryError.unresolvedSource = error { publishIfCurrent(.unconfirmed, epoch: epoch) }
-        else { publishIfCurrent(.recoveryIncomplete, epoch: epoch) }
+        else {
+            do {
+                if try store.load() == nil {
+                    publishIfCurrent(.unsupported("未停用外接屏：请确认开盖、原 HDMI 外屏及非镜像双屏，再重试"), epoch: epoch)
+                } else { publishIfCurrent(.recoveryIncomplete, epoch: epoch) }
+            } catch { publishIfCurrent(.recoveryIncomplete, epoch: epoch) }
+        }
     }
 
     private func publishIfCurrent(_ value: PrimarySessionStatus, epoch: UUID) {

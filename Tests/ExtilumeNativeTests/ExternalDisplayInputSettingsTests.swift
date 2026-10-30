@@ -196,7 +196,7 @@ final class ExternalDisplayInputSettingsTests: XCTestCase {
         XCTAssertNil(recreated.automaticSession)
     }
 
-    func testResultTextSeparatesInputCodeReadbackFromPCPicture() throws {
+    func testResultTextSeparatesInputReadbackFromPictureAndKeepsDisabledFallback() throws {
         let (name, defaults) = try preferences()
         defer { defaults.removePersistentDomain(forName: name) }
         let settings = ExternalDisplayInputSettings(defaults: defaults)
@@ -205,13 +205,13 @@ final class ExternalDisplayInputSettingsTests: XCTestCase {
 
         settings.recordResult(.confirmed)
         XCTAssertTrue(try XCTUnwrap(settings.inputResultText).contains("读回"))
-        XCTAssertTrue(try XCTUnwrap(settings.inputResultText).contains("PC 画面尚未确认"))
+        XCTAssertTrue(try XCTUnwrap(settings.inputResultText).contains("实际画面请确认"))
         settings.recordResult(.unconfirmed)
-        XCTAssertTrue(try XCTUnwrap(settings.inputResultText).contains("输入码读回未确认"))
-        XCTAssertTrue(try XCTUnwrap(settings.inputResultText).contains("PC 画面未确认"))
+        XCTAssertTrue(try XCTUnwrap(settings.inputResultText).contains("输入源切换未确认"))
+        XCTAssertTrue(try XCTUnwrap(settings.inputResultText).contains("外接屏保持停用"))
         settings.recordResult(.unavailable)
-        XCTAssertTrue(try XCTUnwrap(settings.inputResultText).contains("自动输入源切换不可用"))
-        XCTAssertTrue(try XCTUnwrap(settings.inputResultText).contains("PC 画面未确认"))
+        XCTAssertTrue(try XCTUnwrap(settings.inputResultText).contains("输入源切换不可用"))
+        XCTAssertTrue(try XCTUnwrap(settings.inputResultText).contains("外接屏保持停用"))
         XCTAssertEqual(changes, 3)
     }
 

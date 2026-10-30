@@ -76,6 +76,31 @@ protocol ExternalDisplayInputControlling {
         capabilities: ExternalDisplayInputCapabilities,
         deadlineNanoseconds: UInt64
     ) throws
+    func sendOnce(
+        _ configuration: ExternalDisplayInputConfiguration,
+        capabilities: ExternalDisplayInputCapabilities,
+        deadlineNanoseconds: UInt64,
+        checkAccess: @escaping () throws -> Void,
+        authorizeWrite: @escaping () throws -> ExternalDisplayState
+    ) throws
+}
+
+extension ExternalDisplayInputControlling {
+    func sendOnce(
+        _ configuration: ExternalDisplayInputConfiguration,
+        capabilities: ExternalDisplayInputCapabilities,
+        deadlineNanoseconds: UInt64,
+        checkAccess: @escaping () throws -> Void,
+        authorizeWrite: @escaping () throws -> ExternalDisplayState
+    ) throws {
+        try checkAccess()
+        let state = try authorizeWrite()
+        guard state.matches(identity: configuration.target), !state.isActive else {
+            throw ExternalDisplayInputFailure.identityMismatch
+        }
+        try checkAccess()
+        try sendOnce(configuration, capabilities: capabilities, deadlineNanoseconds: deadlineNanoseconds)
+    }
 }
 
 enum ExternalDisplayInputProbeOperation: Codable, Equatable {
@@ -105,22 +130,34 @@ final class ExternalDisplayInputController: ExternalDisplayInputControlling {
     typealias Probe = (ExternalDisplayInputProbeRequest) throws -> ExternalDisplayInputProbeReply
 
     private let hardwareVerifiedTarget: ExternalDisplayIdentity?
+    private let explicitSelectionAuthorization: ExternalDisplayInputSelectionAuthorization?
+    private let customProbe: Probe?
     private let bootSessionReader: () -> UUID?
     private let probe: Probe
 
     init(
         hardwareVerifiedTarget: ExternalDisplayIdentity? = nil,
+        explicitSelectionAuthorization: ExternalDisplayInputSelectionAuthorization? = nil,
         bootSessionReader: @escaping () -> UUID? = { try? currentBootSession() },
-        probe: @escaping Probe = runExternalDisplayInputProbe
+        probe: Probe? = nil
     ) {
         self.hardwareVerifiedTarget = hardwareVerifiedTarget
+        self.explicitSelectionAuthorization = explicitSelectionAuthorization
+        self.customProbe = probe
         self.bootSessionReader = bootSessionReader
-        self.probe = probe
+        self.probe = probe ?? { try runExternalDisplayInputProbe($0) }
     }
 
     func availability(for target: ExternalDisplayIdentity) -> ExternalDisplayInputAvailability {
         do { try target.validate() }
         catch { return .unavailable(.identityMismatch) }
+        if let grant = explicitSelectionAuthorization {
+            guard bootSessionReader() == target.bootSession else { return .unavailable(.identityMismatch) }
+            guard let now = try? ContinuousClock.nanoseconds(), grant.isAvailable(for: target, now: now) else {
+                return .unavailable(.hardwareAcceptanceRequired)
+            }
+            return .available
+        }
         guard let hardwareVerifiedTarget else { return .unavailable(.hardwareAcceptanceRequired) }
         guard hardwareVerifiedTarget == target,
               bootSessionReader() == target.bootSession else {
@@ -156,16 +193,54 @@ final class ExternalDisplayInputController: ExternalDisplayInputControlling {
         capabilities: ExternalDisplayInputCapabilities,
         deadlineNanoseconds: UInt64
     ) throws {
+        guard customProbe != nil else { throw ExternalDisplayInputFailure.hardwareAcceptanceRequired }
+        try send(configuration, capabilities: capabilities, deadlineNanoseconds: deadlineNanoseconds,
+                 checkAccess: nil, authorizeWrite: nil)
+    }
+
+    func sendOnce(
+        _ configuration: ExternalDisplayInputConfiguration,
+        capabilities: ExternalDisplayInputCapabilities,
+        deadlineNanoseconds: UInt64,
+        checkAccess: @escaping () throws -> Void,
+        authorizeWrite: @escaping () throws -> ExternalDisplayState
+    ) throws {
+        try send(configuration, capabilities: capabilities, deadlineNanoseconds: deadlineNanoseconds,
+                 checkAccess: checkAccess, authorizeWrite: authorizeWrite)
+    }
+
+    private func send(
+        _ configuration: ExternalDisplayInputConfiguration,
+        capabilities: ExternalDisplayInputCapabilities,
+        deadlineNanoseconds: UInt64,
+        checkAccess: (() throws -> Void)?,
+        authorizeWrite: (() throws -> ExternalDisplayState)?
+    ) throws {
+        let now = try ContinuousClock.nanoseconds()
+        if let grant = explicitSelectionAuthorization {
+            guard grant.consume(configuration: configuration, deadlineNanoseconds: deadlineNanoseconds, now: now) else {
+                throw ExternalDisplayInputFailure.hardwareAcceptanceRequired
+            }
+        } else if case .unavailable(let failure) = availability(for: configuration.target) { throw failure }
+        guard bootSessionReader() == configuration.target.bootSession else { throw ExternalDisplayInputFailure.identityMismatch }
         try configuration.validate(capabilities: capabilities)
-        if case .unavailable(let failure) = availability(for: configuration.target) { throw failure }
-        guard try ContinuousClock.nanoseconds() < deadlineNanoseconds else {
-            throw ExternalDisplayInputFailure.timedOut
+        guard now < deadlineNanoseconds else { throw ExternalDisplayInputFailure.timedOut }
+        let request = ExternalDisplayInputProbeRequest(target: configuration.target,
+            operation: .selectInput(configuration.pcInput), deadlineNanoseconds: deadlineNanoseconds)
+        let reply: ExternalDisplayInputProbeReply
+        if customProbe != nil {
+            if let checkAccess, let authorizeWrite {
+                try checkAccess()
+                let state = try authorizeWrite()
+                guard state.matches(identity: configuration.target), !state.isActive else {
+                    throw ExternalDisplayInputFailure.identityMismatch
+                }
+                try checkAccess()
+            }
+            reply = try run(request)
+        } else {
+            reply = try runExternalDisplayInputProbe(request, checkAccess: checkAccess, authorizeWrite: authorizeWrite)
         }
-        let reply = try run(ExternalDisplayInputProbeRequest(
-            target: configuration.target,
-            operation: .selectInput(configuration.pcInput),
-            deadlineNanoseconds: deadlineNanoseconds
-        ))
         guard case .confirmed(let target, let input) = reply else {
             try throwFailure(reply)
             throw ExternalDisplayInputFailure.readbackMismatch
@@ -196,14 +271,23 @@ private extension ExternalDisplayInputFailure {
 }
 
 func runExternalDisplayInputProbe(
-    _ request: ExternalDisplayInputProbeRequest
+    _ request: ExternalDisplayInputProbeRequest,
+    checkAccess: (() throws -> Void)? = nil,
+    authorizeWrite: (() throws -> ExternalDisplayState)? = nil,
+    spawn: ([String], GuardChannel) throws -> pid_t = spawnProbe
 ) throws -> ExternalDisplayInputProbeReply {
     try freshWitness(
         ExternalDisplayInputProbeReply.self,
         arguments: ["--external-display-input"],
+        spawn: spawn,
         deadlineNanoseconds: request.deadlineNanoseconds,
+        checkAccess: checkAccess,
         prepare: { channel, check in
             try channel.send(request, deadlineNanoseconds: request.deadlineNanoseconds, checkAccess: check)
+            if case .selectInput = request.operation {
+                try approveExternalDisplayInputWrite(request, channel: channel, checkAccess: check,
+                                                     authorizeWrite: authorizeWrite)
+            }
         },
         validate: { reply in
             switch (request.operation, reply) {
@@ -244,16 +328,63 @@ func runExternalDisplayInputProbeIfRequested(
         throw error
     }
     let request = try channel.receive(ExternalDisplayInputProbeRequest.self)
-    let reply = executeExternalDisplayInputProbe(request, transport: transport)
+    let reply = executeExternalDisplayInputProbe(request, transport: transport, authorizeWrite: {
+        try requestExternalDisplayInputWriteApproval(request, channel: channel)
+    })
     try channel.send(reply, deadlineNanoseconds: request.deadlineNanoseconds)
     return true
+}
+
+struct ExternalDisplayInputWriteReady: Codable, Equatable {
+    let target: ExternalDisplayIdentity
+    let input: UInt16
+    let deadlineNanoseconds: UInt64
+}
+
+func approveExternalDisplayInputWrite(
+    _ request: ExternalDisplayInputProbeRequest, channel: GuardChannel,
+    checkAccess: (() throws -> Void)?, authorizeWrite: (() throws -> ExternalDisplayState)?
+) throws {
+    guard case .selectInput(let input) = request.operation else { throw ExternalDisplayInputFailure.invalidInput }
+    let ready = try channel.receive(ExternalDisplayInputWriteReady.self,
+                                    deadlineNanoseconds: request.deadlineNanoseconds, checkAccess: checkAccess)
+    guard ready == ExternalDisplayInputWriteReady(target: request.target, input: input,
+                                                   deadlineNanoseconds: request.deadlineNanoseconds) else {
+        throw ExternalDisplayInputFailure.identityMismatch
+    }
+    try checkAccess?()
+    guard let authorizeWrite else { throw ExternalDisplayInputFailure.hardwareAcceptanceRequired }
+    let state = try authorizeWrite()
+    guard state.matches(identity: request.target), !state.isActive else { throw ExternalDisplayInputFailure.identityMismatch }
+    try checkAccess?()
+    try channel.send(state, deadlineNanoseconds: request.deadlineNanoseconds, checkAccess: checkAccess)
+}
+
+func requestExternalDisplayInputWriteApproval(
+    _ request: ExternalDisplayInputProbeRequest, channel: GuardChannel,
+    read: (ExternalDisplayIdentity, UInt32) throws -> ExternalDisplayState = {
+        try readExternalDisplay(identity: $0, numericIDHint: $1)
+    }
+) throws {
+    guard case .selectInput(let input) = request.operation else { throw ExternalDisplayInputFailure.invalidInput }
+    try channel.send(ExternalDisplayInputWriteReady(target: request.target, input: input,
+                                                    deadlineNanoseconds: request.deadlineNanoseconds),
+                     deadlineNanoseconds: request.deadlineNanoseconds)
+    let approved = try channel.receive(ExternalDisplayState.self, deadlineNanoseconds: request.deadlineNanoseconds)
+    guard approved.matches(identity: request.target), !approved.isActive else { throw ExternalDisplayInputFailure.identityMismatch }
+    let actual = try read(request.target, approved.id)
+    guard actual.id == approved.id, actual.matches(identity: request.target), !actual.isActive else {
+        throw ExternalDisplayInputFailure.identityMismatch
+    }
+    try checkDeadline(request.deadlineNanoseconds)
 }
 
 func executeExternalDisplayInputProbe(
     _ request: ExternalDisplayInputProbeRequest,
     transport: ExternalDisplayInputTransport,
     now: () throws -> UInt64 = { try ContinuousClock.nanoseconds() },
-    sleep: (UInt64) -> Void = { Thread.sleep(forTimeInterval: Double($0) / 1_000_000_000) }
+    sleep: (UInt64) -> Void = { Thread.sleep(forTimeInterval: Double($0) / 1_000_000_000) },
+    authorizeWrite: () throws -> Void = { throw ExternalDisplayInputFailure.hardwareAcceptanceRequired }
 ) -> ExternalDisplayInputProbeReply {
     do {
         do { try request.target.validate() }
@@ -283,6 +414,8 @@ func executeExternalDisplayInputProbe(
             )
             try checkDeadline()
             guard values.contains(input) else { throw ExternalDisplayInputFailure.unsupportedInput }
+            try authorizeWrite()
+            try checkDeadline()
             try transport.writeInput(input, to: request.target, deadlineNanoseconds: request.deadlineNanoseconds)
             try checkDeadline()
 
@@ -494,6 +627,7 @@ private struct AppleSiliconExternalDisplayInputTransport: ExternalDisplayInputTr
         }
         try checkDeadline(deadlineNanoseconds)
         try withAVService(for: target) { service, api in
+            try checkDeadline(deadlineNanoseconds)
             try api.write(service, payload: packet)
             try checkDeadline(deadlineNanoseconds)
         }

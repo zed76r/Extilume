@@ -14,6 +14,7 @@ final class ExternalDisplayVerification {
     private let transaction: () throws -> DisplayEnableTransaction
     private let writeOrigins: ([UInt32: DisplayOrigin], @escaping () throws -> Void) throws -> Void
     private let nativeCall: DisplayEnableTransaction.NativeCall
+    private let recoveryCompletionCall: DisplayEnableTransaction.NativeCall?
     private let checkAccess: () throws -> Void
 
     init(directory: URL, recoveryStore: RecoveryStore? = nil,
@@ -31,6 +32,7 @@ final class ExternalDisplayVerification {
              try configureOrigins($0, option: .forSession, validateBeforeCommit: $1)
          },
          nativeCall: @escaping DisplayEnableTransaction.NativeCall = { $0() },
+         recoveryCompletionCall: DisplayEnableTransaction.NativeCall? = nil,
          checkAccess: @escaping () throws -> Void = {}) throws {
         store = try recoveryStore ?? RecoveryStore(directory: directory)
         self.snapshot = snapshot
@@ -46,6 +48,7 @@ final class ExternalDisplayVerification {
         self.writeOrigins = writeOrigins
         self.checkAccess = checkAccess
         self.nativeCall = nativeCall
+        self.recoveryCompletionCall = recoveryCompletionCall
     }
 
     func status() throws -> String {
@@ -55,11 +58,12 @@ final class ExternalDisplayVerification {
         let actual = try observe(responsibility)
         let current = try snapshot()
         let internalActive = current.displays.filter { $0.identity == .builtIn && $0.isOnline && $0.isActive }.count == 1
-        let identityText = actual.identifiedState == nil ? "原停用连接已核对；恢复需确认连接未变" : "外屏目标已重认"
+        let identityText = actual.identifiedState == nil ? "原停用连接已核对；恢复需确认原屏与原端口" : "外屏目标已重认"
         return "\(identityText)；外屏活动=\(actual.isEnabled)，内屏活动=\(internalActive)，待恢复=\(record.requiresRecovery)。未写显示配置；PC 画面须人工确认。"
     }
 
-    func disable(beforeDisable: (ExternalDisplayIdentity) -> Void = { _ in }) throws {
+    func disable(expectedTarget: ExternalDisplayIdentity? = nil,
+                 beforeDisable: (ExternalDisplayIdentity) -> Void = { _ in }) throws {
         try store.acquireExclusiveOwnership()
         var previous = try store.load()
         if let settled = previous, settled.canClear, settled.externalDisplay != nil {
@@ -80,6 +84,7 @@ final class ExternalDisplayVerification {
             throw DisplayEnableTransactionError.unsafeTopology
         }
         let target = try capture(display.id)
+        if let expectedTarget, expectedTarget != target.identity { throw RecoveryError.identityConflict }
         guard target.id == display.id, target.identity.uuid == display.identityUUID, target.isEnabled else {
             throw RecoveryError.identityConflict
         }
@@ -176,6 +181,18 @@ final class ExternalDisplayVerification {
         return try observe(responsibility).identifiedState != nil
     }
 
+    func externalStateForInput() throws -> ExternalDisplayState {
+        guard let record = try store.load(), record.phase == .owned, !record.sourceUnresolved,
+              let responsibility = record.externalDisplay, responsibility.pending else {
+            throw RecoveryError.unfinishedTransaction
+        }
+        let state = try external(responsibility.identity, responsibility.numericIDHint)
+        guard state.matches(identity: responsibility.identity), !state.isActive else { throw RecoveryError.identityConflict }
+        try checkAccess()
+        guard try store.load() == record else { throw RecoveryError.unfinishedTransaction }
+        return state
+    }
+
     private func observe(_ responsibility: ExternalDisplayResponsibility) throws -> ExternalRecoveryObservation {
         let observation = try recoveryObservation(responsibility.identity, responsibility.numericIDHint)
         guard observation.matches(identity: responsibility.identity, numericIDHint: responsibility.numericIDHint) else {
@@ -235,14 +252,12 @@ final class ExternalDisplayVerification {
         try store.save(record)
     }
 
-    func restore(confirmation: ExternalConnectionRecoveryConfirmation? = nil,
-                 connectionEnabled: () -> Void = {}) throws {
+    func restore(confirmation: ExternalConnectionRecoveryConfirmation? = nil) throws {
         try store.acquireExclusiveOwnership()
-        try restoreLocked(confirmation: confirmation, connectionEnabled: connectionEnabled)
+        try restoreLocked(confirmation: confirmation)
     }
 
-    private func restoreLocked(confirmation: ExternalConnectionRecoveryConfirmation? = nil,
-                               connectionEnabled: () -> Void = {}) throws {
+    private func restoreLocked(confirmation: ExternalConnectionRecoveryConfirmation? = nil) throws {
         guard var record = try store.load(), let responsibility = record.externalDisplay,
               record.internalDisplay == nil else { throw RecoveryError.invalidRecord }
         try checkAccess()
@@ -283,15 +298,14 @@ final class ExternalDisplayVerification {
                     checkAccess: {
                         try self.checkAccess()
                         try self.validateConnectionRecovery(durable)
-                    }, nativeCall: nativeCall
+                    }, nativeCall: nativeCall, completionCall: recoveryCompletionCall
                 )
-                connectionEnabled()
                 try checkAccess()
             } else {
                 try transaction().enableExternalForRecovery(
                     record: record, loadRecord: store.load,
                     externalReader: { try self.external(responsibility.identity, responsibility.numericIDHint) },
-                    checkAccess: checkAccess, nativeCall: nativeCall
+                    checkAccess: checkAccess, nativeCall: nativeCall, completionCall: recoveryCompletionCall
                 )
             }
         }

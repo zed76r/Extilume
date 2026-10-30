@@ -26,17 +26,100 @@ final class ExternalDisplayInputSettings: ExternalDisplayInputSettingsSelecting 
     private let synchronizeDefaults: () -> Bool
     private var persistenceFailed = false
     private var resultText: String?
+    let permitsExplicitInputSelection: Bool
+    private let discoverInputs: @Sendable (@escaping @Sendable () throws -> Void) throws -> ExternalDisplayInputCapabilities
+    private let explicitController: (ExternalDisplayInputSelectionAuthorization) -> any ExternalDisplayInputControlling
+    private let now: () throws -> UInt64
+    private var detectedCapabilities: ExternalDisplayInputCapabilities?
+    private var detectedUntil: UInt64 = 0
+    private var detectionGeneration = UUID()
+    private var discoveryCancellation: ExternalInputDiscoveryCancellation?
+    private(set) var detectingInputSources = false
+    private(set) var inputDiscoveryMessage: String? = "未检测输入源；可直接停用外接屏"
 
     var inputSettingsDidChange: (@MainActor () -> Void)?
 
     init(defaults: UserDefaults = .standard,
          capabilities: ExternalDisplayInputCapabilities? = nil,
          inputController: any ExternalDisplayInputControlling = ExternalDisplayInputController(),
-         synchronize: (() -> Bool)? = nil) {
+         synchronize: (() -> Bool)? = nil,
+         permitsExplicitInputSelection: Bool = false,
+         discoverInputs: @escaping @Sendable (@escaping @Sendable () throws -> Void) throws -> ExternalDisplayInputCapabilities = discoverExternalDisplayInputCapabilities,
+         explicitController: @escaping (ExternalDisplayInputSelectionAuthorization) -> any ExternalDisplayInputControlling = {
+             ExternalDisplayInputController(explicitSelectionAuthorization: $0)
+         },
+         now: @escaping () throws -> UInt64 = { try ContinuousClock.nanoseconds() }) {
         self.defaults = defaults
         self.capabilities = capabilities
         self.inputController = inputController
         synchronizeDefaults = synchronize ?? { defaults.synchronize() }
+        self.permitsExplicitInputSelection = permitsExplicitInputSelection
+        self.discoverInputs = discoverInputs
+        self.explicitController = explicitController
+        self.now = now
+    }
+
+    var detectedInputOptions: [UInt16] {
+        guard permitsExplicitInputSelection, !detectingInputSources,
+              let detectedCapabilities, let time = try? now(), time < detectedUntil,
+              (try? detectedCapabilities.validate(for: detectedCapabilities.target)) != nil else { return [] }
+        return detectedCapabilities.inputValues.sorted()
+    }
+
+    func detectInputSources() {
+        guard permitsExplicitInputSelection, !detectingInputSources else { return }
+        detectingInputSources = true
+        detectedCapabilities = nil
+        inputDiscoveryMessage = "正在检测显示器输入源；可直接停用外接屏"
+        let generation = UUID()
+        detectionGeneration = generation
+        let discover = discoverInputs
+        let cancellation = ExternalInputDiscoveryCancellation()
+        discoveryCancellation = cancellation
+        inputSettingsDidChange?()
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let result = Result { try discover { try cancellation.check() } }
+            Task { @MainActor [weak self] in
+                guard let self, self.detectionGeneration == generation else { return }
+                self.detectingInputSources = false
+                self.discoveryCancellation = nil
+                do {
+                    let capabilities = try result.get()
+                    try capabilities.validate(for: capabilities.target)
+                    self.detectedCapabilities = capabilities
+                    self.detectedUntil = try self.now() + 30_000_000_000
+                    self.inputDiscoveryMessage = "已读取支持的输入码；请按显示器实际端口选择"
+                } catch {
+                    self.detectedCapabilities = nil
+                    self.inputDiscoveryMessage = "未能识别输入源，请手动选源；可直接停用外接屏"
+                }
+                self.inputSettingsDidChange?()
+            }
+        }
+    }
+
+    func cancelInputDetection() {
+        guard detectingInputSources else { return }
+        detectionGeneration = UUID()
+        discoveryCancellation?.cancel()
+        discoveryCancellation = nil
+        detectingInputSources = false
+        inputDiscoveryMessage = "检测已取消；可直接停用外接屏"
+        inputSettingsDidChange?()
+    }
+
+    func explicitSession(selecting input: UInt16) -> ExternalAutomaticInputSession? {
+        guard detectedInputOptions.contains(input), let capabilities = detectedCapabilities,
+              let time = try? now() else {
+            inputDiscoveryMessage = "输入源列表不可用或已过期，请重新检测；可直接停用外接屏"
+            inputSettingsDidChange?()
+            return nil
+        }
+        let configuration = ExternalDisplayInputConfiguration(target: capabilities.target, pcInput: input, automaticEnabled: true)
+        let deadline = time + 3_000_000_000
+        let authorization = ExternalDisplayInputSelectionAuthorization(configuration: configuration, deadlineNanoseconds: deadline)
+        return ExternalAutomaticInputSession(configuration: configuration, capabilities: capabilities,
+            controller: explicitController(authorization), deadlineNanoseconds: deadline)
     }
 
     var inputOptions: [UInt16] {
@@ -97,9 +180,9 @@ final class ExternalDisplayInputSettings: ExternalDisplayInputSettingsSelecting 
 
     func recordResult(_ result: ExternalDisplayInputResult) {
         resultText = switch result {
-        case .confirmed: "显示器已读回所选输入码；PC 画面尚未确认"
-        case .unconfirmed: "显示器输入码读回未确认；PC 画面未确认"
-        case .unavailable: "自动输入源切换不可用；PC 画面未确认"
+        case .confirmed: "显示器已读回所选输入码；实际画面请确认"
+        case .unconfirmed: "输入源切换未确认，请手动选源；外接屏保持停用"
+        case .unavailable: "输入源切换不可用，请手动选源；外接屏保持停用"
         }
         inputSettingsDidChange?()
     }

@@ -197,7 +197,8 @@ final class DisplayEnableTransaction {
         loadRecord: () throws -> RecoveryRecord?,
         externalReader: () throws -> ExternalDisplayState,
         checkAccess: () throws -> Void = {},
-        nativeCall: NativeCall = { $0() }
+        nativeCall: NativeCall = { $0() },
+        completionCall: NativeCall? = nil
     ) throws {
         try record.validate()
         guard record.phase == .restoring, record.internalDisplay == nil,
@@ -205,7 +206,7 @@ final class DisplayEnableTransaction {
               responsibility.pending else { throw RecoveryError.invalidRecord }
         let initial = try externalReader()
         guard initial.identity == responsibility.identity else { throw RecoveryError.identityConflict }
-        try setEnabled(display: initial.id, enabled: true, nativeCall: nativeCall) {
+        try setEnabled(display: initial.id, enabled: true, nativeCall: nativeCall, completionCall: completionCall) {
             try checkAccess()
             guard try loadRecord() == record else { throw RecoveryError.unfinishedTransaction }
             let actual = try externalReader()
@@ -223,7 +224,8 @@ final class DisplayEnableTransaction {
         loadRecord: () throws -> RecoveryRecord?,
         observationReader: () throws -> ExternalRecoveryObservation,
         checkAccess: () throws -> Void,
-        nativeCall: NativeCall = { $0() }
+        nativeCall: NativeCall = { $0() },
+        completionCall: NativeCall? = nil
     ) throws {
         try record.validate()
         guard record.phase == .restoring, record.internalDisplay == nil,
@@ -234,7 +236,7 @@ final class DisplayEnableTransaction {
               initial.matches(identity: responsibility.identity, numericIDHint: responsibility.numericIDHint) else {
             throw RecoveryError.identityConflict
         }
-        try setEnabled(display: evidence.id, enabled: true, nativeCall: nativeCall) {
+        try setEnabled(display: evidence.id, enabled: true, nativeCall: nativeCall, completionCall: completionCall) {
             try checkAccess()
             guard try loadRecord() == record else { throw RecoveryError.unfinishedTransaction }
             let actual = try observationReader()
