@@ -9,7 +9,7 @@ public enum DisplayApplicationMode: String, Codable, Sendable, CaseIterable {
         switch self {
         case .externalPrimary: "外屏主屏"
         case .externalOnly: "仅外屏（停用内屏）"
-        case .internalOnly: "仅内屏（外屏给 PC）"
+        case .internalOnly: "停用外接屏"
         }
     }
 }

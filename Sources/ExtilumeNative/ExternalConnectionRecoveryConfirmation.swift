@@ -27,6 +27,11 @@ enum ExternalConnectionRecoveryError: Error, Equatable {
 
 @MainActor
 protocol ExternalConnectionRecoveryControlling: AnyObject, Sendable {
+    var hasExternalRecoveryOwner: Bool { get }
     func prepareConnectionRecovery(completion: @escaping @Sendable (Result<ExternalConnectionRecoveryConfirmation?, Error>) -> Void)
     func recoverAfterConfirmingConnection(_ confirmation: ExternalConnectionRecoveryConfirmation)
+}
+
+extension ExternalConnectionRecoveryControlling {
+    var hasExternalRecoveryOwner: Bool { true }
 }

@@ -185,9 +185,11 @@ final class ApplicationLaunchTests: XCTestCase {
         defaults.removePersistentDomain(forName: suiteName)
         defer { defaults.removePersistentDomain(forName: suiteName) }
 
-        let standard = UserDefaults.standard
-        let standardMode = standard.object(forKey: "explicitDisplayMode.v1") as? NSObject
-        let standardHandoff = standard.object(forKey: "externalHandoffRequested.v1") as? NSObject
+        let protectionName = "ExtilumeProtectionTests.\(UUID().uuidString)"
+        let protection = try XCTUnwrap(UserDefaults(suiteName: protectionName))
+        defer { protection.removePersistentDomain(forName: protectionName) }
+        protection.set(DisplayApplicationMode.externalOnly.rawValue, forKey: "explicitDisplayMode.v1")
+        protection.set(true, forKey: "externalHandoffRequested.v1")
         let preferences = DisplayModePreferences(defaults: defaults)
         try preferences.select(.internalOnly)
         try preferences.setExternalHandoffRequested(true)
@@ -195,16 +197,18 @@ final class ApplicationLaunchTests: XCTestCase {
         XCTAssertEqual(inputSettings.inputOptions, [])
         XCTAssertFalse(inputSettings.automaticInputEnabled)
 
-        let restarted = try externalHandoffLaunchPreferences(for: launchOptions.stateDirectory)
+        let restarted = try externalHandoffLaunchPreferences(for: launchOptions.stateDirectory, protectionDefaults: protection)
         XCTAssertEqual(restarted.preferences.selectedMode, .internalOnly)
         XCTAssertTrue(restarted.preferences.externalHandoffRequested)
         XCTAssertFalse(ExternalDisplayInputSettings(defaults: restarted.defaults).automaticInputEnabled)
-        XCTAssertEqual(standard.object(forKey: "explicitDisplayMode.v1") as? NSObject, standardMode)
-        XCTAssertEqual(standard.object(forKey: "externalHandoffRequested.v1") as? NSObject, standardHandoff)
+        try restarted.preferences.select(.externalPrimary)
+        try restarted.preferences.setExternalHandoffRequested(false)
+        XCTAssertEqual(protection.string(forKey: "explicitDisplayMode.v1"), DisplayApplicationMode.externalOnly.rawValue)
+        XCTAssertTrue(protection.bool(forKey: "externalHandoffRequested.v1"))
 
         let freshDirectory = try makeDirectory(in: root, name: "fresh-state", mode: 0o700)
         let freshSuiteName = applicationPreferenceSuiteName(for: freshDirectory)
-        let fresh = try externalHandoffLaunchPreferences(for: freshDirectory)
+        let fresh = try externalHandoffLaunchPreferences(for: freshDirectory, protectionDefaults: protection)
         defer { fresh.defaults.removePersistentDomain(forName: freshSuiteName) }
         var factoryCalls = 0
         let coordinator = try DisplayModeCoordinator(
@@ -220,6 +224,62 @@ final class ApplicationLaunchTests: XCTestCase {
         XCTAssertNil(coordinator.selectedMode)
         XCTAssertFalse(fresh.preferences.externalHandoffRequested)
         XCTAssertEqual(factoryCalls, 0)
+    }
+
+    @MainActor
+    func testExternalHandoffProtectionLockPersistsAcrossDirectories() throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let protectionName = "ExtilumeProtectionTests.\(UUID().uuidString)"
+        let protection = try XCTUnwrap(UserDefaults(suiteName: protectionName))
+        defer { protection.removePersistentDomain(forName: protectionName) }
+        let firstDirectory = root.appendingPathComponent("first", isDirectory: true)
+        let secondDirectory = try makeDirectory(in: root, name: "second", mode: 0o700)
+        let first = try externalHandoffLaunchPreferences(for: firstDirectory, protectionDefaults: protection)
+        defer {
+            first.defaults.removePersistentDomain(forName: applicationPreferenceSuiteName(for: firstDirectory))
+        }
+        let key = "internalControlFailure.v1"
+
+        XCTAssertFalse(first.preferences.internalControlLocked)
+        for value in [false as Any, "malformed" as Any] {
+            protection.set(value, forKey: key)
+            XCTAssertTrue(first.preferences.internalControlLocked)
+        }
+        protection.removeObject(forKey: key)
+        first.defaults.set(false, forKey: key)
+        XCTAssertTrue(first.preferences.internalControlLocked)
+        let restarted = try externalHandoffLaunchPreferences(for: firstDirectory, protectionDefaults: protection)
+        XCTAssertTrue(restarted.preferences.internalControlLocked)
+        XCTAssertEqual(protection.object(forKey: key) as? Bool, true)
+        first.defaults.removeObject(forKey: key)
+        protection.removeObject(forKey: key)
+
+        try first.preferences.lockInternalControl()
+        XCTAssertEqual(first.defaults.object(forKey: key) as? Bool, true)
+        XCTAssertEqual(protection.object(forKey: key) as? Bool, true)
+        let second = try externalHandoffLaunchPreferences(for: secondDirectory, protectionDefaults: protection)
+        defer { second.defaults.removePersistentDomain(forName: applicationPreferenceSuiteName(for: secondDirectory)) }
+        XCTAssertTrue(second.preferences.internalControlLocked)
+        protection.set(DisplayApplicationMode.internalOnly.rawValue, forKey: "explicitDisplayMode.v1")
+        protection.set(true, forKey: "externalHandoffRequested.v1")
+        var factoryCalls = 0
+        let coordinator = try DisplayModeCoordinator(
+            directory: secondDirectory,
+            preferences: second.preferences,
+            availableModes: [.externalPrimary, .externalOnly, .internalOnly],
+            inputSettings: ExternalDisplayInputSettings(defaults: second.defaults)
+        ) { _, _, _ in
+            factoryCalls += 1
+            throw RecoveryStoreError.ioFailure
+        }
+        coordinator.startApplication(registerEvents: false, recoveryOnly: false) { _ in }
+        coordinator.selectMode(.externalOnly)
+        XCTAssertEqual(factoryCalls, 0)
+        coordinator.selectMode(.externalPrimary)
+        XCTAssertEqual(factoryCalls, 1)
+        XCTAssertEqual(protection.string(forKey: "explicitDisplayMode.v1"), DisplayApplicationMode.internalOnly.rawValue)
+        XCTAssertTrue(protection.bool(forKey: "externalHandoffRequested.v1"))
     }
 
     private func makeTemporaryDirectory() throws -> URL {

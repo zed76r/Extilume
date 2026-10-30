@@ -23,6 +23,8 @@ final class ExternalApplicationControllerTests: XCTestCase {
         var originalMissing = false
         var zeroWhileDisabled = false
         var afterConfigure: (@Sendable () -> Void)?
+        var afterComplete: (@Sendable () -> Void)?
+        var beforeRecoveryCompletion: (@Sendable () -> Void)?
         var blockNextCommit = false
         let commitStarted = DispatchSemaphore(value: 0)
         let continueCommit = DispatchSemaphore(value: 0)
@@ -79,7 +81,7 @@ final class ExternalApplicationControllerTests: XCTestCase {
             lock.withLock { enabled = false; current = snapshot(onlyInternal) }
         }
         func controller(recoveryStore: RecoveryStore? = nil) throws -> ExternalApplicationController {
-            try ExternalApplicationController(directory: directory, recoveryStore: recoveryStore, verificationFactory: { directory, store, check, native in
+            try ExternalApplicationController(directory: directory, recoveryStore: recoveryStore, verificationFactory: { directory, store, check, native, completion in
                 try ExternalDisplayVerification(directory: directory, recoveryStore: store,
                     snapshot: { self.readSnapshot() }, topology: { self.readSnapshot() },
                     external: { _, _ in
@@ -110,7 +112,7 @@ final class ExternalApplicationControllerTests: XCTestCase {
                         }, complete: { _, _ in
                             let block = self.lock.withLock { let result = self.blockNextCommit; self.blockNextCommit = false; return result }
                             if block { self.commitStarted.signal(); _ = self.continueCommit.wait(timeout: .now() + 5) }
-                            return self.lock.withLock {
+                            let result: CGError = self.lock.withLock {
                                 if (self.staged && self.failRecovery) || (!self.staged && self.failDisable) { return .failure }
                                 if !self.staged {
                                     self.preDisable = try? layoutByMakingMain(self.current.layout(), target: self.internalID)
@@ -119,6 +121,8 @@ final class ExternalApplicationControllerTests: XCTestCase {
                                 self.current = self.snapshot(self.enabled ? (self.preDisable ?? self.fullInternal) : self.onlyInternal)
                                 return .success
                             }
+                            if result == .success { self.lock.withLock { self.afterComplete }?() }
+                            return result
                         }, cancel: { _ in .success }, origin: { _, _, _, _ in .success })
                     }, writeOrigins: { origins, validate in
                         try validate()
@@ -130,7 +134,10 @@ final class ExternalApplicationControllerTests: XCTestCase {
                         }
                         let restored = try DisplayLayout(main: main, origins: positions)
                         self.lock.withLock { self.writes += 1; self.current = self.snapshot(restored) }
-                    }, nativeCall: native, checkAccess: check)
+                    }, nativeCall: native, recoveryCompletionCall: { call in
+                        self.lock.withLock { self.beforeRecoveryCompletion }?()
+                        return try completion(call)
+                    }, checkAccess: check)
             })
         }
         func start(_ controller: ExternalApplicationController, recoveryOnly: Bool = false) {
@@ -508,7 +515,8 @@ final class ExternalApplicationControllerTests: XCTestCase {
         let result = await withCheckedContinuation { continuation in
             controller.prepareConnectionRecovery { continuation.resume(returning: $0) }
         }
-        return try XCTUnwrap(result.get())
+        let confirmation = try result.get()
+        return try XCTUnwrap(confirmation)
     }
 
     func testZeroUUIDHoldingAndExplicitConnectionRecovery() async throws {
@@ -527,6 +535,57 @@ final class ExternalApplicationControllerTests: XCTestCase {
         controller.recoverAfterConfirmingConnection(confirmation)
         try await fixture.waitFor(.recoveryIncomplete)
         XCTAssertEqual(fixture.writeCount, writes)
+    }
+
+    func testReconnectedZeroUUIDTargetRequiresFreshExplicitRecovery() async throws {
+        let fixture = try Fixture(); try fixture.seedHeld()
+        fixture.zeroWhileDisabled = true
+        let controller = try fixture.controller(); fixture.start(controller, recoveryOnly: true)
+        try await fixture.waitFor(.applied)
+        let before = try fixture.record()
+
+        fixture.lock.withLock { fixture.originalMissing = true }
+        do {
+            _ = try await prepare(controller)
+            XCTFail("missing target must not offer a recovery confirmation")
+        } catch {
+            XCTAssertEqual(error as? RecoveryError, .identityConflict)
+        }
+        try await fixture.waitFor(.recoveryIncomplete)
+        XCTAssertEqual(fixture.writeCount, 0)
+        XCTAssertEqual(try fixture.record(), before)
+
+        fixture.lock.withLock { fixture.originalMissing = false }
+        controller.recoverApplication()
+        try await fixture.waitFor(.recoveryIncomplete, count: 2)
+        XCTAssertEqual(fixture.writeCount, 0)
+        XCTAssertEqual(try fixture.record(), before)
+
+        let confirmation = try await prepare(controller)
+        XCTAssertEqual(fixture.writeCount, 0)
+        XCTAssertEqual(try fixture.record(), before)
+        controller.recoverAfterConfirmingConnection(confirmation)
+        try await fixture.waitFor(.manualConfiguration)
+        let restored = try fixture.record()
+        XCTAssertTrue(restored.canClear)
+        XCTAssertEqual(restored.externalDisplay?.identity, before.externalDisplay?.identity)
+        XCTAssertEqual(restored.baseline, before.baseline)
+        XCTAssertEqual(try fixture.readSnapshot().layout(), fixture.baseline)
+        XCTAssertTrue(fixture.readExternal().isEnabled)
+    }
+
+    func testConfirmedRecoveryCompletionCallbackCanFinishRestoration() async throws {
+        let fixture = try Fixture(); try fixture.seedHeld()
+        fixture.zeroWhileDisabled = true
+        let controller = try fixture.controller(); fixture.start(controller, recoveryOnly: true)
+        try await fixture.waitFor(.applied)
+        let confirmation = try await prepare(controller)
+        fixture.lock.withLock { fixture.afterComplete = { [weak controller] in controller?.displayChanged() } }
+        controller.recoverAfterConfirmingConnection(confirmation)
+        try await fixture.waitFor(.manualConfiguration)
+        XCTAssertTrue(fixture.lock.withLock { fixture.enabled })
+        XCTAssertFalse(try fixture.record().requiresRecovery)
+        XCTAssertEqual(try fixture.record().phase, .restored)
     }
 
     func testConnectionConfirmationIsRevokedByLifecycleOrAnotherRequest() async throws {
@@ -548,6 +607,52 @@ final class ExternalApplicationControllerTests: XCTestCase {
             }
             XCTAssertEqual(fixture.writeCount, 0)
             XCTAssertTrue(try fixture.record().requiresRecovery)
+        }
+    }
+
+    func testConfirmedRecoveryRevocationAtCompletionEntryPreventsCommit() async throws {
+        for sleeping in [false, true] {
+            let fixture = try Fixture(); try fixture.seedHeld()
+            fixture.zeroWhileDisabled = true
+            let controller = try fixture.controller(); fixture.start(controller, recoveryOnly: true)
+            try await fixture.waitFor(.applied)
+            let confirmation = try await prepare(controller)
+            fixture.lock.withLock {
+                fixture.beforeRecoveryCompletion = { [weak controller] in
+                    if sleeping { controller?.willSleep() }
+                    else { controller?.displayChanged() }
+                }
+            }
+            controller.recoverAfterConfirmingConnection(confirmation)
+            try await fixture.waitFor(.recoveryIncomplete)
+            XCTAssertEqual(fixture.writeCount, 0)
+            XCTAssertTrue(try fixture.record().requiresRecovery)
+        }
+    }
+
+    func testConfirmedRecoveryCompletionStillRequiresPowerAndFullIdentity() async throws {
+        for sleeping in [false, true] {
+            let fixture = try Fixture(); try fixture.seedHeld()
+            fixture.zeroWhileDisabled = true
+            let controller = try fixture.controller(); fixture.start(controller, recoveryOnly: true)
+            try await fixture.waitFor(.applied)
+            let confirmation = try await prepare(controller)
+            fixture.lock.withLock {
+                fixture.afterComplete = { [weak controller, weak fixture] in
+                    guard let fixture else { return }
+                    if sleeping { controller?.willSleep() }
+                    else {
+                        fixture.lock.withLock { fixture.originalMissing = true }
+                        controller?.displayChanged()
+                    }
+                }
+            }
+            controller.recoverAfterConfirmingConnection(confirmation)
+            try await fixture.waitFor(.recoveryIncomplete)
+            XCTAssertEqual(fixture.writeCount, 1)
+            XCTAssertTrue(fixture.lock.withLock { fixture.enabled })
+            XCTAssertTrue(try fixture.record().requiresRecovery)
+            XCTAssertEqual(try fixture.record().phase, .restoring)
         }
     }
 
@@ -602,6 +707,20 @@ final class ExternalApplicationControllerTests: XCTestCase {
         XCTAssertEqual(input.sendCount, 0)
         XCTAssertEqual(fixture.writeCount, 1)
         XCTAssertTrue(try fixture.record().requiresRecovery)
+    }
+
+    func testPreflightFailureWithoutRecordDoesNotLockRecoveryAndCanRetry() async throws {
+        let fixture = try Fixture()
+        fixture.lid = false
+        let controller = try fixture.controller()
+        fixture.start(controller)
+        try await fixture.waitFor(.unsupported("未停用外接屏：请确认开盖、原 HDMI 外屏及非镜像双屏，再重试"))
+        XCTAssertEqual(fixture.writeCount, 0)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.directory.appendingPathComponent("recovery-record.json").path))
+        fixture.lock.withLock { fixture.lid = true }
+        controller.retryApplication()
+        try await fixture.waitFor(.applied)
+        XCTAssertEqual(fixture.writeCount, 1)
     }
 
     func testClosedLidCompensatesOriginalExternalWithoutInputSourceCommand() async throws {
