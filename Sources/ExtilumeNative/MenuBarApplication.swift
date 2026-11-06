@@ -694,24 +694,29 @@ extension MenuBarApplicationDelegate {
     func automationReply(_ request: ApplicationAutomationRequest) -> ApplicationAutomationReply {
         render()
         let available = automationItems
+        func reply(_ result: String) -> ApplicationAutomationReply {
+            ApplicationAutomationReply(result: result, status: stateItem.title, actions: automationItems.map(\.0),
+                sessionState: status, selectedMode: modeSelector?.selectedMode, stateMode: statusMode,
+                requiresExplicitActivation: modeSelector?.requiresExplicitActivation)
+        }
         var result = "status"
         if request.action != "status" {
             guard request.allowDisplayWrite else {
-                return ApplicationAutomationReply(result: "authorization-required", status: stateItem.title, actions: available.map(\.0))
+                return reply("authorization-required")
             }
             guard let item = available.first(where: { $0.0 == request.action })?.1,
                   let action = item.action else {
-                return ApplicationAutomationReply(result: "unavailable", status: stateItem.title, actions: available.map(\.0))
+                return reply("unavailable")
             }
             // Physical connection confirmation remains a human dialog, never an implicit AI assertion.
             if connectionRecoveryController != nil {
-                return ApplicationAutomationReply(result: "human-confirmation-required", status: stateItem.title, actions: available.map(\.0))
+                return reply("human-confirmation-required")
             }
             _ = perform(action, with: item)
             result = "accepted"
         }
         render()
-        return ApplicationAutomationReply(result: result, status: stateItem.title, actions: automationItems.map(\.0))
+        return reply(result)
     }
 
     @objc nonisolated func handleAutomation(_ event: NSAppleEventDescriptor, withReplyEvent reply: NSAppleEventDescriptor) {

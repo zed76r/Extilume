@@ -21,6 +21,7 @@ enum InternalLifecycleStage: String, Encodable {
     case internalOnlineReadStarted, internalOnlineReadFinished, internalActiveReadStarted, internalActiveReadFinished
     case internalCandidateReadStarted, internalCandidateReadFinished
     case disableStarted, disableFinished, disableFailed
+    case wakeTopologyCheckStarted, wakeTopologyWaiting, wakeTopologyReady, wakeTopologyRejected
     case linkReconfigurationStarted, linkReconfigurationCollected, linkReconfigurationVerified, linkReconfigurationFailed
 }
 

@@ -22,7 +22,11 @@ final class MenuBarApplicationTests: XCTestCase {
         XCTAssertEqual(session.selections, [.externalOnly])
         session.emit(.recoveryIncomplete)
         await drainMainQueue()
-        XCTAssertFalse(delegate.automationReply(.init(action: "status")).actions.contains("apply-externalOnly"))
+        let failed = delegate.automationReply(.init(action: "status"))
+        XCTAssertFalse(failed.actions.contains("apply-externalOnly"))
+        XCTAssertEqual(failed.sessionState, .recoveryIncomplete)
+        XCTAssertEqual(failed.selectedMode, .externalOnly)
+        XCTAssertEqual(failed.stateMode, .externalOnly)
     }
 
     func testAutomationInternalActionReflectsRestoreToggle() async throws {
@@ -34,10 +38,30 @@ final class MenuBarApplicationTests: XCTestCase {
         session.emit(.applied)
         await drainMainQueue()
         let reply = delegate.automationReply(.init(action: "status"))
+        XCTAssertEqual(reply.sessionState, .applied)
+        XCTAssertEqual(reply.selectedMode, .internalOnly)
+        XCTAssertEqual(reply.stateMode, .internalOnly)
+        XCTAssertEqual(reply.requiresExplicitActivation, false)
         XCTAssertTrue(reply.actions.contains("restore-external"))
         XCTAssertFalse(reply.actions.contains("disable-external"))
         XCTAssertEqual(delegate.automationReply(.init(action: "disable-external", allowDisplayWrite: true)).result, "unavailable")
         XCTAssertTrue(session.selections.isEmpty)
+    }
+
+    func testAutomationKeepsAppliedModeSeparateFromNewIntent() async throws {
+        let session = ModeSession()
+        session.selectedMode = .externalPrimary
+        let delegate = MenuBarApplicationDelegate(controllerFactory: { session })
+        delegate.startSession()
+        session.emit(.applied)
+        await drainMainQueue()
+        session.selectedMode = .externalOnly
+        session.requiresExplicitActivation = true
+        let reply = delegate.automationReply(.init(action: "status"))
+        XCTAssertEqual(reply.sessionState, .applied)
+        XCTAssertEqual(reply.stateMode, .externalPrimary)
+        XCTAssertEqual(reply.selectedMode, .externalOnly)
+        XCTAssertEqual(reply.requiresExplicitActivation, true)
     }
 
     func testAutomationEventRejectsMalformedAndEncodesStatus() throws {
@@ -53,7 +77,9 @@ final class MenuBarApplicationTests: XCTestCase {
         event.setParam(NSAppleEventDescriptor(string: "{\"action\":\"status\",\"allowDisplayWrite\":false}"), forKeyword: keyDirectObject)
         delegate.handleAutomation(event, withReplyEvent: success)
         let data = try XCTUnwrap(success.paramDescriptor(forKeyword: keyDirectObject)?.stringValue?.data(using: .utf8))
-        XCTAssertEqual(try JSONDecoder().decode(ApplicationAutomationReply.self, from: data).result, "status")
+        let decoded = try JSONDecoder().decode(ApplicationAutomationReply.self, from: data)
+        XCTAssertEqual(decoded.result, "status")
+        XCTAssertNotNil(decoded.sessionState)
     }
 
     func testAutomationNeverConfirmsPhysicalConnection() async throws {

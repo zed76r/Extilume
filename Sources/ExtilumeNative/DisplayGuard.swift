@@ -709,6 +709,7 @@ final class GuardSession: @unchecked Sendable {
         }
         var attemptedWakePreflight = false
         var completedWakePreflight = false
+        var checkingWakeTopology = false
         do {
             if shouldPreflightWake {
                 attemptedWakePreflight = true
@@ -739,6 +740,8 @@ final class GuardSession: @unchecked Sendable {
             }
             if forSleep, authorizationLock.withLock({ lifecycle.resumeAfterWake }), let expected = record,
                topologyWaitingEpoch == epoch || confirmedWakeTopology?.record == expected {
+                checkingWakeTopology = true
+                traceInternalLifecycle(.wakeTopologyCheckStarted)
                 guard let anchor = confirmedWakeTopology, anchor.record == expected else {
                     throw RecoveryError.identityConflict
                 }
@@ -757,9 +760,12 @@ final class GuardSession: @unchecked Sendable {
                 let waiting = try anchor.isWaiting(current: snapshot, internalState: state, record: expected)
                 try checkWakePreflightAccess(expected, epoch: epoch)
                 if waiting {
+                    traceInternalLifecycle(.wakeTopologyWaiting, recoveryTopology: InternalRecoveryTopologyContext(snapshot: snapshot))
                     topologyWaitingEpoch = epoch
                     throw GuardError.externalTopologyPending
                 }
+                traceInternalLifecycle(.wakeTopologyReady, succeeded: true, recoveryTopology: InternalRecoveryTopologyContext(snapshot: snapshot))
+                checkingWakeTopology = false
                 topologyWaitingEpoch = nil
             }
             var restored = try InternalSleepPreparation.restore(checkAccess: { try self.checkRecoveryAccess() }, stopObserving: {
@@ -800,6 +806,9 @@ final class GuardSession: @unchecked Sendable {
             scheduleWakeReapplication()
             return true
         } catch {
+            if checkingWakeTopology, error as? GuardError != .externalTopologyPending {
+                traceInternalLifecycle(.wakeTopologyRejected, succeeded: false, error: error)
+            }
             if error as? InternalPowerGateError == .suspended {
                 print("恢复等待系统完成唤醒；保护、模式意图及责任继续保留。")
                 return false

@@ -2,6 +2,15 @@ import XCTest
 @testable import ExtilumeNative
 
 final class ApplicationAutomationTests: XCTestCase {
+    func testOlderRepliesKeepUnknownStructuredState() throws {
+        let data = Data(#"{"result":"status","status":"旧版状态","actions":[]}"#.utf8)
+        let reply = try JSONDecoder().decode(ApplicationAutomationReply.self, from: data)
+        XCTAssertNil(reply.sessionState)
+        XCTAssertNil(reply.selectedMode)
+        XCTAssertNil(reply.stateMode)
+        XCTAssertNil(reply.requiresExplicitActivation)
+    }
+
     func testStatusNeedsNoWriteAuthorization() throws {
         let options = try ApplicationAutomationOptions(arguments: ["--control", "status"])
         XCTAssertEqual(options.request.action, "status")

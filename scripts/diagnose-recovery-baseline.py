@@ -373,7 +373,8 @@ class Mac:
         bounds = CLOCK.native_bounds(CLOCK.native_sample())
         return bounds[1], bounds[3]
 
-    def pid_path(self, pid):
+    @staticmethod
+    def pid_path(pid):
         library = ctypes.CDLL('/usr/lib/libproc.dylib', use_errno=True)
         library.proc_pidpath.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32]
         library.proc_pidpath.restype = ctypes.c_int

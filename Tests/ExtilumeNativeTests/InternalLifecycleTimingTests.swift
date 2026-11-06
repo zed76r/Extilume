@@ -123,6 +123,32 @@ final class InternalLifecycleTimingTests: XCTestCase {
         }
     }
 
+    func testWakeTopologyMarkersUseFixedStagesAndAnonymousEvidence() throws {
+        for stage in [InternalLifecycleStage.wakeTopologyCheckStarted, .wakeTopologyWaiting,
+                      .wakeTopologyReady, .wakeTopologyRejected] {
+            let line = try internalLifecycleMarker(stage, at: 10, mainThread: false,
+                succeeded: stage == .wakeTopologyReady ? true : nil,
+                recoveryTopology: InternalRecoveryTopologyContext(snapshot: Snapshot(displays: [])))
+            let value = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any])
+            XCTAssertEqual(value["stage"] as? String, stage.rawValue)
+            XCTAssertEqual(value["role"] as? String, "controller")
+            XCTAssertFalse(line.contains("identityUUID"))
+            XCTAssertFalse(line.contains("registryEntryID"))
+        }
+        let failures: [(Error, String)] = [
+            (GuardError.protectionLost, "guard-protection-lost"),
+            (GuardError.suspended, "guard-access-denied"),
+            (InternalPowerGateError.suspended, "power-access-denied")
+        ]
+        for (error, expected) in failures {
+            let line = try internalLifecycleMarker(.wakeTopologyRejected, at: 11, mainThread: false,
+                                                   succeeded: false, error: error)
+            let value = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any])
+            XCTAssertEqual(value["failureCode"] as? String, expected)
+            XCTAssertEqual(value["succeeded"] as? Bool, false)
+        }
+    }
+
     func testUnknownErrorNeverSerializesItsDomainOrDescription() throws {
         let error = NSError(domain: "PRIVATE_DOMAIN_CANARY", code: 7,
                             userInfo: [NSLocalizedDescriptionKey: "PRIVATE_DESCRIPTION_CANARY"])

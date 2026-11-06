@@ -1,4 +1,5 @@
 import AppKit
+import ExtilumeCore
 
 struct ApplicationAutomationRequest: Codable, Sendable {
     let action: String
@@ -9,6 +10,10 @@ struct ApplicationAutomationReply: Codable, Sendable {
     let result: String
     let status: String
     let actions: [String]
+    var sessionState: PrimarySessionStatus? = nil
+    var selectedMode: DisplayApplicationMode? = nil
+    var stateMode: DisplayApplicationMode? = nil
+    var requiresExplicitActivation: Bool? = nil
 }
 
 // Apple Events retain macOS Automation consent; the receiver never launches another controller.

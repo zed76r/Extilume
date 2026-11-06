@@ -184,6 +184,18 @@ func snapshotWitnessFailureCode(_ error: Error) -> String {
         case .invalidTransition: return "recovery-invalid-transition"
         }
     }
+    if let error = error as? GuardError {
+        switch error {
+        case .spawn: return "guard-spawn"
+        case .identity: return "guard-identity"
+        case .missingRecord: return "guard-missing-record"
+        case .protectionLost: return "guard-protection-lost"
+        case .suspended: return "guard-access-denied"
+        case .unstable: return "guard-unstable"
+        case .externalTopologyPending: return "guard-external-topology-pending"
+        }
+    }
+    if error is InternalPowerGateError { return "power-access-denied" }
     if error is RecoveryStoreError { return "recovery-store" }
     if let error = error as? GuardChannelError {
         switch error {
