@@ -6,7 +6,7 @@ enum InternalLifecycleStage: String, Encodable {
     case sleepRequested, sleepWaitFinished, powerAcknowledged, systemHasPoweredOn
     case firstConnectionInvalidation, restorationStarted, internalReadStarted, internalReadFinished
     case enableStarted, enableFinished, layoutReadStarted, layoutReadFinished
-    case originsStarted, originsFinished, restorationVerified, layoutRestoreRejected
+    case originsStarted, originsFinished, restorationVerified, layoutRestoreRejected, recoveryTopologyObserved
     case observerDrainStarted, observerDrainFinished, pauseVerificationStarted, pauseVerificationFinished
     case enableIdentityReadStarted, enableIdentityReadFinished
     case enablePreValidationStarted, enablePreValidationFinished, enableBeginStarted, enableBeginFinished
@@ -53,6 +53,23 @@ struct InternalRecoveryLayoutContext: Encodable, Equatable {
     }
 }
 
+struct InternalRecoveryTopologyContext: Encodable, Equatable {
+    let onlineDisplayCount: Int
+    let activeDisplayCount: Int
+    let activeBuiltInCount: Int
+    let activePhysicalCount: Int
+    let activeOtherCount: Int
+
+    init(snapshot: Snapshot) {
+        let active = snapshot.displays.filter(\.isActive)
+        onlineDisplayCount = snapshot.displays.filter(\.isOnline).count
+        activeDisplayCount = active.count
+        activeBuiltInCount = active.filter { $0.identity == .builtIn }.count
+        activePhysicalCount = active.filter { $0.identity == .physical }.count
+        activeOtherCount = active.count - activeBuiltInCount - activePhysicalCount
+    }
+}
+
 private struct InternalLifecycleMarker: Encodable {
     let type = "internal-lifecycle"
     let clock = "mach_continuous_time/ns"
@@ -68,6 +85,7 @@ private struct InternalLifecycleMarker: Encodable {
     let isNumericHint: Bool?
     let operation: InternalDisplayOperation?
     let recoveryLayout: InternalRecoveryLayoutContext?
+    let recoveryTopology: InternalRecoveryTopologyContext?
 }
 
 func internalLifecycleMarker(
@@ -77,14 +95,15 @@ func internalLifecycleMarker(
     identityFailure: InternalDisplayIdentityFailure? = nil,
     candidateFailure: InternalDisplayCandidateFailure? = nil, isNumericHint: Bool? = nil,
     operation: InternalDisplayOperation? = nil,
-    recoveryLayout: InternalRecoveryLayoutContext? = nil
+    recoveryLayout: InternalRecoveryLayoutContext? = nil,
+    recoveryTopology: InternalRecoveryTopologyContext? = nil
 ) throws -> String {
     String(decoding: try JSONEncoder().encode(InternalLifecycleMarker(
         role: role, stage: stage, continuousNs: timestamp, mainThread: mainThread,
         succeeded: succeeded ?? cgError.map { $0 == .success },
         cgErrorCode: cgError?.rawValue, failureCode: error.map(snapshotWitnessFailureCode),
         identityFailure: identityFailure, candidateFailure: candidateFailure, isNumericHint: isNumericHint,
-        operation: operation, recoveryLayout: recoveryLayout
+        operation: operation, recoveryLayout: recoveryLayout, recoveryTopology: recoveryTopology
     )), as: UTF8.self)
 }
 
@@ -95,7 +114,8 @@ func traceInternalLifecycle(
     identityFailure: InternalDisplayIdentityFailure? = nil,
     candidateFailure: InternalDisplayCandidateFailure? = nil, isNumericHint: Bool? = nil,
     operation: InternalDisplayOperation? = nil,
-    recoveryLayout: InternalRecoveryLayoutContext? = nil
+    recoveryLayout: InternalRecoveryLayoutContext? = nil,
+    recoveryTopology: InternalRecoveryTopologyContext? = nil
 ) {
     do {
         let timestamp = try observedAt ?? ContinuousClock.nanoseconds()
@@ -103,7 +123,7 @@ func traceInternalLifecycle(
                                          mainThread: Thread.isMainThread, succeeded: succeeded,
                                          cgError: cgError, error: error, identityFailure: identityFailure,
                                          candidateFailure: candidateFailure, isNumericHint: isNumericHint,
-                                         operation: operation, recoveryLayout: recoveryLayout))
+                                         operation: operation, recoveryLayout: recoveryLayout, recoveryTopology: recoveryTopology))
     } catch {
         print("内屏生命周期计时不可用；不能据此判定恢复时限通过。")
     }

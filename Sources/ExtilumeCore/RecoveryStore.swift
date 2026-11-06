@@ -19,9 +19,14 @@ public final class RecoveryStore {
     private static let maximumRecordSize = 1_048_576
 
     private let directoryDescriptor: Int32
+    private let synchronizeFile: (Int32) throws -> Void
     private var ownsExclusiveLock = false
 
-    public init(directory: URL) throws {
+    public convenience init(directory: URL) throws {
+        try self.init(directory: directory, synchronize: Self.synchronize)
+    }
+
+    init(directory: URL, synchronize: @escaping (Int32) throws -> Void) throws {
         guard directory.isFileURL, !directory.path.isEmpty else {
             throw RecoveryStoreError.invalidDirectory
         }
@@ -40,6 +45,7 @@ public final class RecoveryStore {
             throw error
         }
         directoryDescriptor = descriptor
+        synchronizeFile = synchronize
     }
 
     deinit {
@@ -51,6 +57,14 @@ public final class RecoveryStore {
             throw RecoveryStoreError.ownershipUnavailable
         }
         ownsExclusiveLock = true
+    }
+
+    public func verifyDirectoryIdentity(device: Int64, inode: UInt64) throws {
+        try Self.validateDirectory(directoryDescriptor)
+        var info = stat()
+        guard fstat(directoryDescriptor, &info) == 0, Int64(info.st_dev) == device, info.st_ino == inode else {
+            throw RecoveryStoreError.insecureDirectory
+        }
     }
 
     public func apply(
@@ -123,6 +137,10 @@ public final class RecoveryStore {
     }
 
     public func save(_ record: RecoveryRecord) throws {
+        try save(record, beforeCommit: {}, rollbackOnSyncFailure: true)
+    }
+
+    private func save(_ record: RecoveryRecord, beforeCommit: () throws -> Void, rollbackOnSyncFailure: Bool) throws {
         guard ownsExclusiveLock else { throw RecoveryStoreError.ownershipUnavailable }
         do {
             try record.validate()
@@ -175,7 +193,7 @@ public final class RecoveryStore {
         }
 
         try Self.writeAll(data, to: descriptor)
-        try Self.synchronize(descriptor)
+        try synchronizeFile(descriptor)
         let closeResult = close(descriptor)
         ownsDescriptor = false
         guard closeResult == 0 else { throw RecoveryStoreError.ioFailure }
@@ -188,39 +206,49 @@ public final class RecoveryStore {
             }
             backupName = name
             backupToCleanup = name
-            try Self.synchronize(directoryDescriptor)
+            try synchronizeFile(directoryDescriptor)
         } else {
             backupName = nil
         }
 
+        try beforeCommit()
         guard renameat(directoryDescriptor, temporaryName, directoryDescriptor, Self.recordName) == 0 else {
             throw RecoveryStoreError.ioFailure
         }
         ownsTemporary = false
         do {
-            try Self.synchronize(directoryDescriptor)
+            try synchronizeFile(directoryDescriptor)
         } catch {
+            if !rollbackOnSyncFailure {
+                // Closeout preserves both the uncertain replacement and the old inode; never retries a record write.
+                backupToCleanup = nil
+                throw RecoveryStoreError.ioFailure
+            }
             if let backupName {
                 if renameat(directoryDescriptor, backupName, directoryDescriptor, Self.recordName) == 0 {
                     backupToCleanup = nil
-                    try? Self.synchronize(directoryDescriptor)
+                    try? synchronizeFile(directoryDescriptor)
                 } else {
                     // 回滚失败时保留旧记录硬链接，避免丢弃未恢复责任。
                     backupToCleanup = nil
                 }
             } else if unlinkat(directoryDescriptor, Self.recordName, 0) == 0 {
-                try? Self.synchronize(directoryDescriptor)
+                try? synchronizeFile(directoryDescriptor)
             }
             throw RecoveryStoreError.ioFailure
         }
 
         if let backupName, unlinkat(directoryDescriptor, backupName, 0) == 0 {
             backupToCleanup = nil
-            try? Self.synchronize(directoryDescriptor)
+            try? synchronizeFile(directoryDescriptor)
         }
     }
 
     public func load() throws -> RecoveryRecord? {
+        try loadWithOriginalBytes()?.record
+    }
+
+    public func loadWithOriginalBytes() throws -> (record: RecoveryRecord, bytes: Data)? {
         try Self.validateDirectory(directoryDescriptor)
         let descriptor = openat(
             directoryDescriptor,
@@ -257,10 +285,39 @@ public final class RecoveryStore {
         do {
             let record = try JSONDecoder().decode(RecoveryRecord.self, from: data)
             try record.validate()
-            return record
+            return (record, data)
         } catch {
             throw RecoveryStoreError.corruptRecord
         }
+    }
+
+    // Only metadata changes; the caller supplies independent read-only verification and durable evidence.
+    public func closeLayoutResponsibility(
+        expectedOriginal: Data,
+        target: DisplayLayout,
+        backup: (Data) throws -> Void,
+        verify: () throws -> Void,
+        beforeSave: () throws -> Void,
+        checkBeforeCommit: () throws -> Void = {}
+    ) throws -> RecoveryRecord {
+        guard ownsExclusiveLock else { throw RecoveryStoreError.ownershipUnavailable }
+        guard let original = try loadWithOriginalBytes(), original.bytes == expectedOriginal else {
+            throw RecoveryStoreError.invalidRecord
+        }
+        let closed = try original.record.confirmingLayoutCloseout(actual: target)
+        try verify()
+        try backup(original.bytes)
+        try verify()
+        try beforeSave()
+        guard let current = try loadWithOriginalBytes(), current.bytes == expectedOriginal,
+              current.record == original.record else { throw RecoveryStoreError.invalidRecord }
+        try save(closed, beforeCommit: {
+            guard try loadWithOriginalBytes()?.bytes == expectedOriginal else { throw RecoveryStoreError.invalidRecord }
+            try checkBeforeCommit()
+        }, rollbackOnSyncFailure: false)
+        guard try load() == closed else { throw RecoveryStoreError.invalidRecord }
+        try verify()
+        return closed
     }
 
     public func clear() throws {

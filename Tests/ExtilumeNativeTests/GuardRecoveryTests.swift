@@ -14,6 +14,82 @@ final class GuardRecoveryTests: XCTestCase {
 
     private enum FixtureError: Error { case injected }
 
+    func testTopologyCountsAndLayoutRelationshipsDistinguishRecoveryFixtures() throws {
+        let record = try confirmedCRecord()
+        let c = record.baseline
+        let b = try externalOnlyLayout()
+        let unknownLayout = try layout(mainExternal: true, internalX: -1900)
+        let full = snapshot(c)
+        let knownB = snapshot(b, internalActive: false)
+        let missingInternal = Snapshot(displays: [makeDisplay(id: 40, identity: .physical, uuid: externalID, layout: b)])
+        let missingExternal = snapshot(c, includeExternal: false)
+        let unknownIdentity = Snapshot(displays: [makeDisplay(id: 40, identity: .unknown, uuid: externalID, layout: b)])
+        let unknown = snapshot(unknownLayout)
+
+        let fullCounts = InternalRecoveryTopologyContext(snapshot: full)
+        XCTAssertEqual(fullCounts.onlineDisplayCount, 2)
+        XCTAssertEqual(fullCounts.activeDisplayCount, 2)
+        XCTAssertEqual(fullCounts.activeBuiltInCount, 1)
+        XCTAssertEqual(fullCounts.activePhysicalCount, 1)
+        XCTAssertEqual(fullCounts.activeOtherCount, 0)
+        let marker = try internalLifecycleMarker(.recoveryTopologyObserved, at: 1, mainThread: false,
+                                                 recoveryTopology: fullCounts)
+        XCTAssertFalse(marker.contains(internalID.uuidString))
+        XCTAssertFalse(marker.contains(externalID.uuidString))
+        XCTAssertFalse(marker.contains("registryEntryID"))
+        XCTAssertFalse(marker.contains("EDID"))
+        XCTAssertTrue(InternalRecoveryLayoutContext(record: record, current: try full.layout()).matchesBaseline)
+        let bCounts = InternalRecoveryTopologyContext(snapshot: knownB)
+        XCTAssertEqual(bCounts.onlineDisplayCount, 2)
+        XCTAssertEqual(bCounts.activeBuiltInCount, 0)
+        XCTAssertEqual(bCounts.activePhysicalCount, 1)
+        XCTAssertTrue(InternalRecoveryLayoutContext(record: record, current: try knownB.layout()).matchesApplied)
+        let missingInternalCounts = InternalRecoveryTopologyContext(snapshot: missingInternal)
+        XCTAssertEqual(missingInternalCounts.onlineDisplayCount, 1)
+        XCTAssertEqual(missingInternalCounts.activeBuiltInCount, 0)
+        XCTAssertEqual(missingInternalCounts.activePhysicalCount, 1)
+        XCTAssertTrue(InternalRecoveryLayoutContext(record: record, current: try missingInternal.layout()).matchesApplied)
+        let missingExternalCounts = InternalRecoveryTopologyContext(snapshot: missingExternal)
+        XCTAssertEqual(missingExternalCounts.activeBuiltInCount, 1)
+        XCTAssertEqual(missingExternalCounts.activePhysicalCount, 0)
+        let missingExternalLayout = InternalRecoveryLayoutContext(record: record, current: try missingExternal.layout())
+        XCTAssertTrue(missingExternalLayout.isBaselineDisplaySubset)
+        XCTAssertFalse(missingExternalLayout.matchesBaseline)
+        XCTAssertFalse(missingExternalLayout.matchesApplied)
+        XCTAssertFalse(missingExternalLayout.matchesPreDisable)
+        XCTAssertFalse(missingExternalLayout.matchesBaselineDisplaySet)
+        XCTAssertFalse(missingExternalLayout.layoutPending)
+        XCTAssertEqual(missingExternalLayout.internalPending, false)
+        XCTAssertFalse(missingExternalLayout.sourceUnresolved)
+        let otherCounts = InternalRecoveryTopologyContext(snapshot: unknownIdentity)
+        XCTAssertEqual(otherCounts.activeOtherCount, 1)
+        XCTAssertEqual(otherCounts.activePhysicalCount, 0)
+        let unknownRelationship = InternalRecoveryLayoutContext(record: record, current: try unknown.layout())
+        XCTAssertFalse(unknownRelationship.matchesBaseline)
+        XCTAssertFalse(unknownRelationship.matchesApplied)
+        XCTAssertFalse(unknownRelationship.matchesPreDisable)
+        XCTAssertEqual(InternalRecoveryTopologyContext(snapshot: unknown), fullCounts)
+    }
+
+    func testEmptySnapshotIsObservedBeforeLayoutRejectsWithoutDisplayWrites() throws {
+        let baseline = try layout()
+        let record = try applyingRecord(baseline: baseline, target: baseline, includesInternal: false)
+        try withStore { store, _ in
+            try store.save(record)
+            var observed: [InternalRecoveryTopologyContext] = []
+            XCTAssertThrowsError(try recoverGuardRecord(
+                store: store, contract: contract(for: record),
+                snapshotReader: { Snapshot(displays: []) },
+                internalReader: { _ in XCTFail("unexpected internal read"); throw FixtureError.injected },
+                enableInternal: { _ in XCTFail("empty snapshot cannot enable") },
+                originWriter: { _, _ in XCTFail("empty snapshot cannot write origins") },
+                topologyObserved: { observed.append($0) }
+            ))
+            XCTAssertEqual(observed, [InternalRecoveryTopologyContext(snapshot: Snapshot(displays: []))])
+            XCTAssertFalse(try XCTUnwrap(store.load()).canClear)
+        }
+    }
+
     func testSleepingRecoveryLeavesResponsibilityAndDoesNotReadOrWriteDisplays() throws {
         let record = try applyingRecord()
         let gate = InternalPowerGate()
@@ -194,6 +270,141 @@ final class GuardRecoveryTests: XCTestCase {
             XCTAssertEqual(restored.generation, record.generation)
             XCTAssertTrue(restored.canClear)
             XCTAssertEqual(try store.load(), restored)
+        }
+    }
+
+    func testRejectedSubsetPreservesLaterExactBRecoveryAfterOwnershipHandoff() throws {
+        let record = try confirmedCRecord()
+        var actual = record.baseline
+        var enabled = true
+        var externalPresent = false
+        var events: [String] = []
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("extilume-recovery-handoff-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false,
+                                              attributes: [.posixPermissions: 0o700])
+        defer { try? FileManager.default.removeItem(at: directory) }
+        var owner: RecoveryStore? = try RecoveryStore(directory: directory)
+        try XCTUnwrap(owner).acquireExclusiveOwnership()
+        try XCTUnwrap(owner).save(record)
+        func recover(using store: RecoveryStore) throws -> RecoveryRecord {
+            try recoverGuardRecord(
+                store: store, contract: contract(for: record),
+                snapshotReader: { self.snapshot(actual, internalActive: enabled, includeExternal: externalPresent) },
+                internalReader: { _ in self.provenInternal(record, active: enabled) },
+                enableInternal: { _ in
+                    events.append("enable")
+                    enabled = true
+                    actual = try XCTUnwrap(record.preDisableLayout)
+                },
+                originWriter: { restoring, _ in
+                    events.append("origins")
+                    XCTAssertEqual(restoring.baseline, record.baseline)
+                    actual = restoring.baseline
+                }
+            )
+        }
+        XCTAssertThrowsError(try recover(using: XCTUnwrap(owner)))
+        XCTAssertTrue(events.isEmpty)
+        XCTAssertEqual(try XCTUnwrap(owner).load(), record)
+        let helper = try RecoveryStore(directory: directory)
+        XCTAssertThrowsError(try helper.acquireExclusiveOwnership())
+        owner = nil
+        try helper.acquireExclusiveOwnership()
+        XCTAssertEqual(try helper.load(), record)
+        actual = try externalOnlyLayout()
+        enabled = false
+        externalPresent = true
+        let restored = try recover(using: helper)
+        XCTAssertEqual(events, ["enable", "origins"])
+        XCTAssertEqual(restored.baseline, record.baseline)
+        XCTAssertEqual(restored.session, record.session)
+        XCTAssertEqual(restored.generation, record.generation)
+        XCTAssertTrue(restored.canClear)
+        XCTAssertEqual(try helper.load(), restored)
+    }
+
+    func testLateEnableAcrossWakeAndIndependentAcknowledgementsRetainsHandoffResponsibility() throws {
+        for fails in [false, true] {
+            let record = try confirmedCRecord()
+            let ownerGate = InternalPowerGate()
+            let helperGate = InternalPowerGate()
+            ownerGate.didRegister()
+            helperGate.didRegister()
+            var lifecycle = InternalSessionLifecycle()
+            var actual = try externalOnlyLayout()
+            var enabled = false
+            var calls = 0
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent("extilume-interleaving-\(UUID().uuidString)")
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false,
+                                                    attributes: [.posixPermissions: 0o700])
+            defer { try? FileManager.default.removeItem(at: directory) }
+            var owner: RecoveryStore? = try RecoveryStore(directory: directory)
+            try XCTUnwrap(owner).acquireExclusiveOwnership()
+            try XCTUnwrap(owner).save(record)
+            let helper = try RecoveryStore(directory: directory)
+
+            func recover(using store: RecoveryStore, gate: InternalPowerGate, enable: (RecoveryRecord) throws -> Void) throws -> RecoveryRecord {
+                try recoverGuardRecord(
+                    store: store, contract: contract(for: record),
+                    snapshotReader: { self.snapshot(actual, internalActive: enabled) },
+                    internalReader: { _ in self.provenInternal(record, active: enabled) },
+                    enableInternal: enable,
+                    originWriter: { restoring, _ in actual = restoring.baseline },
+                    checkAccess: { try gate.check() }
+                )
+            }
+
+            XCTAssertThrowsError(try recover(using: XCTUnwrap(owner), gate: ownerGate) { _ in
+                try ownerGate.perform {
+                    calls += 1
+                    XCTAssertTrue(ownerGate.willSleep())
+                    XCTAssertTrue(helperGate.willSleep())
+                    XCTAssertTrue(lifecycle.willSleep())
+                    if fails { lifecycle.requestPause() } else { lifecycle.requestStop() }
+                    XCTAssertTrue(ownerGate.didWake())
+                    XCTAssertTrue(helperGate.didWake())
+                    lifecycle.didWake()
+                    XCTAssertFalse(lifecycle.permitsRecovery)
+                    if fails { throw FixtureError.injected }
+                    enabled = true
+                    actual = try XCTUnwrap(record.preDisableLayout)
+                }
+            }) { error in
+                if fails {
+                    XCTAssertTrue(error is FixtureError)
+                } else {
+                    XCTAssertEqual(error as? InternalPowerGateError, .suspended)
+                }
+            }
+            XCTAssertEqual(calls, 1)
+            XCTAssertEqual(enabled, !fails)
+            XCTAssertEqual(try XCTUnwrap(owner).load()?.phase, .restoring)
+            XCTAssertThrowsError(try helper.acquireExclusiveOwnership()) {
+                XCTAssertEqual($0 as? RecoveryStoreError, .ownershipUnavailable)
+            }
+            ownerGate.didAcknowledgeSleep(true)
+            lifecycle.finishSleepPreparation(acknowledged: true)
+            XCTAssertTrue(lifecycle.shouldRecoverAfterWake)
+            XCTAssertFalse(lifecycle.shouldResumeAfterWake)
+            XCTAssertThrowsError(try helperGate.check())
+            owner = nil
+            try helper.acquireExclusiveOwnership()
+            XCTAssertThrowsError(try recover(using: helper, gate: helperGate) { _ in XCTFail("unacknowledged helper cannot enable") })
+            helperGate.didAcknowledgeSleep(true)
+            let restored = try recover(using: helper, gate: helperGate) { _ in
+                calls += 1
+                enabled = true
+                actual = try XCTUnwrap(record.preDisableLayout)
+            }
+            lifecycle.didRestore()
+            XCTAssertFalse(lifecycle.shouldResumeAfterWake)
+            XCTAssertEqual(calls, fails ? 2 : 1)
+            XCTAssertEqual(restored.baseline, record.baseline)
+            XCTAssertEqual(restored.session, record.session)
+            XCTAssertEqual(restored.generation, record.generation)
+            XCTAssertEqual(actual, record.baseline)
+            XCTAssertEqual(try helper.load(), restored)
+            XCTAssertTrue(restored.canClear)
         }
     }
 

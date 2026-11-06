@@ -107,6 +107,22 @@ final class InternalLifecycleTimingTests: XCTestCase {
         XCTAssertFalse(line.contains("12345"))
     }
 
+    func testTopologyMarkerEncodesOnlyAnonymousCounts() throws {
+        let context = InternalRecoveryTopologyContext(snapshot: Snapshot(displays: []))
+        for role in [InternalLifecycleRole.controller, .helper, .recoveryEntry] {
+            let line = try internalLifecycleMarker(.recoveryTopologyObserved, role: role, at: 5,
+                                                   mainThread: false, recoveryTopology: context)
+            let value = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any])
+            let topology = try XCTUnwrap(value["recoveryTopology"] as? [String: Int])
+            XCTAssertEqual(Set(topology.keys), ["onlineDisplayCount", "activeDisplayCount", "activeBuiltInCount",
+                                               "activePhysicalCount", "activeOtherCount"])
+            XCTAssertTrue(topology.values.allSatisfy { $0 == 0 })
+            XCTAssertEqual(value["role"] as? String, role.rawValue)
+            XCTAssertEqual(value["stage"] as? String, "recoveryTopologyObserved")
+            XCTAssertEqual(Set(value.keys), ["type", "clock", "role", "stage", "continuousNs", "mainThread", "recoveryTopology"])
+        }
+    }
+
     func testUnknownErrorNeverSerializesItsDomainOrDescription() throws {
         let error = NSError(domain: "PRIVATE_DOMAIN_CANARY", code: 7,
                             userInfo: [NSLocalizedDescriptionKey: "PRIVATE_DESCRIPTION_CANARY"])

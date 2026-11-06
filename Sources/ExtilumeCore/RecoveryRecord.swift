@@ -499,6 +499,23 @@ public struct RecoveryRecord: Codable, Equatable, Sendable {
         phase = .prepared
     }
 
+    public func confirmingLayoutCloseout(actual: DisplayLayout) throws -> RecoveryRecord {
+        try validate()
+        guard phase == .owned, layoutPending, !sourceUnresolved,
+              internalDisplay == nil, externalDisplay == nil,
+              Set(actual.origins.keys) == Set(baseline.origins.keys),
+              actual != applied, actual != preDisableLayout else { throw RecoveryError.unfinishedTransaction }
+        var closed = self
+        try closed.observe(actual, source: .confirmedUser)
+        guard closed.baseline == actual, !closed.layoutPending, !closed.sourceUnresolved else {
+            throw RecoveryError.unresolvedSource
+        }
+        closed.beginRestoration()
+        try closed.confirmRestored(actual: actual)
+        try closed.validate()
+        return closed
+    }
+
     public mutating func beginRestoration() {
         independentGuardVerified = nil
         phase = .restoring

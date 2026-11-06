@@ -64,18 +64,19 @@ final class RecoverySuspensionRecorderState: @unchecked Sendable {
         self.pending = pending
     }
 
-    func didWake() {
+    @discardableResult
+    func didWake() -> RecoveryPowerEventEvidence? {
         lock.lock()
         defer { lock.unlock() }
-        guard !invalidated else { return }
+        guard !invalidated else { return nil }
         guard let pending else {
             invalidateLocked()
-            return
+            return nil
         }
         self.pending = nil
         guard pending.acknowledged else {
             invalidateLocked()
-            return
+            return nil
         }
         do {
             let didWakeAt = try readContinuous()
@@ -89,19 +90,22 @@ final class RecoverySuspensionRecorderState: @unchecked Sendable {
                 pending.before.awakeNanoseconds <= after.awakeNanoseconds
             else {
                 invalidateLocked()
-                return
+                return nil
             }
+            let event = RecoveryPowerEventEvidence(
+                bootSession: bootSession,
+                willSleepAtNanoseconds: pending.willSleepAt,
+                didWakeAtNanoseconds: didWakeAt
+            )
             intervals.append(RecoverySuspensionInterval(
                 before: pending.before,
                 after: after,
-                powerEvent: RecoveryPowerEventEvidence(
-                    bootSession: bootSession,
-                    willSleepAtNanoseconds: pending.willSleepAt,
-                    didWakeAtNanoseconds: didWakeAt
-                )
+                powerEvent: event
             ))
+            return event
         } catch {
             invalidateLocked()
+            return nil
         }
     }
 
@@ -136,7 +140,21 @@ func recordRecoverySuspensionEvidence(to path: String) throws {
         didPrepareForSleep: { accepted, acknowledged in
             state.didPrepareForSleep(accepted: accepted, acknowledged: acknowledged)
         },
-        didWake: { state.didWake() },
+        didWake: {
+            guard let event = state.didWake() else { return }
+            struct Marker: Encodable {
+                let type = "power-event-observation"
+                let clock = "mach_continuous_time/ns"
+                let powerEvent: RecoveryPowerEventEvidence
+            }
+            do {
+                let data = try JSONEncoder().encode(Marker(powerEvent: event))
+                print(String(decoding: data, as: UTF8.self))
+                fflush(stdout)
+            } catch {
+                fputs("电源事件标记编码失败；保留已采集区间。\n", stderr)
+            }
+        },
         onFailure: { state.invalidate() }
     )
     try observer.start()

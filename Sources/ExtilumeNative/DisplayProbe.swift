@@ -567,6 +567,19 @@ private func recordRecoveryConfirmation(to path: String) throws -> Bool {
 
 @MainActor
 public func runDisplayProbe() {
+    if CommandLine.arguments.dropFirst().first == "--closeout-layout-records" {
+        do {
+            guard CommandLine.arguments.count == 4, CommandLine.arguments[2] == "--allow-record-write" else {
+                throw LayoutCloseoutError.authorization
+            }
+            try runLayoutRecordCloseout(requestPath: CommandLine.arguments[3])
+            print("两份布局记录已独立核验结清；未写显示配置，历史失败与现场门槛保持。")
+        } catch {
+            fputs("记录结清未完成（\(layoutCloseoutFailureCode(error))）；保留原件、回执及未决责任，不重试。\n", stderr)
+            exit(EXIT_FAILURE)
+        }
+        return
+    }
     do { if try runExternalDisplayInputProbeIfRequested() { return } }
     catch { exit(EXIT_FAILURE) }
     setlinebuf(stdout) // 辅助进程共享管道时，逐行证据须及时可见。
@@ -581,6 +594,7 @@ public func runDisplayProbe() {
         补偿恢复：extilume-probe --recover-primary <同一状态目录>
         退出后独立核对并清除：extilume-probe --finalize-primary <同一状态目录>
         已手动修改 C、原进程退出后确认来源：extilume-probe --confirm-user-primary <同一状态目录>
+        两份旧布局责任仅记录结清（需另行授权）：extilume-probe --closeout-layout-records --allow-record-write <私有授权清单绝对路径>
         不改显示设置的保护演练：extilume-probe --guard-drill <0700 状态目录>
         内屏恢复合同无写入演练：extilume-probe --guard-drill-internal <0700 状态目录>
         内屏责任独立恢复（记录保留）：extilume-probe --recover-internal <同一状态目录>

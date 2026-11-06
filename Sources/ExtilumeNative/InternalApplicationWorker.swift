@@ -189,6 +189,20 @@ final class InternalApplicationWorkerState: @unchecked Sendable {
         catch { loseChannel() }
     }
 
+    func callbacks(parentPID: Int32) -> InternalApplicationGuardCallbacks {
+        InternalApplicationGuardCallbacks(
+            status: { self.send(.status($0)) },
+            helperStarted: { pid in
+                self.noteHelperStarted()
+                self.send(.helperStarted(pid))
+            },
+            expectation: { self.send(.expectation($0)) },
+            checkAccess: { try self.checkAccess(parentPID: parentPID) },
+            faulted: { self.send(.faulted) },
+            stopped: { self.send(.stopped(faulted: $0)) }
+        )
+    }
+
     func loseChannel() {
         let first = helperLock.withLock {
             if channelLost { return false }
@@ -241,19 +255,7 @@ public func runInternalApplicationWorkerIfRequested() -> Bool {
             challenge: request.challenge, workerPID: getpid(), workerUID: UInt32(getuid())
         )))
 
-        let callbacks = InternalApplicationGuardCallbacks(
-            status: { state.send(.status($0)) },
-            helperStarted: { pid in
-                state.noteHelperStarted()
-                state.send(.helperStarted(pid))
-            },
-            expectation: { state.send(.expectation($0)) },
-            checkAccess: {
-                try state.checkAccess(parentPID: parentPID)
-            },
-            faulted: { state.send(.faulted) },
-            stopped: { state.send(.stopped(faulted: $0)) }
-        )
+        let callbacks = state.callbacks(parentPID: parentPID)
         let parent = DispatchSource.makeProcessSource(identifier: parentPID, eventMask: .exit, queue: .global())
         parent.setEventHandler { state.loseChannel() }
         parent.resume()

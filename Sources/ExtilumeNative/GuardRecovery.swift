@@ -116,6 +116,7 @@ func recoverInternalRecord(directory: URL) throws {
                 },
                 originWriter: { _, origins in try configureOrigins(origins, option: .forSession, nativeCall: { try powerGate.perform($0) }) },
                 layoutRejected: { traceInternalLifecycle(.layoutRestoreRejected, role: .recoveryEntry, succeeded: false, recoveryLayout: $0) },
+                topologyObserved: { traceInternalLifecycle(.recoveryTopologyObserved, role: .recoveryEntry, recoveryTopology: $0) },
                 trace: { traceInternalLifecycle($0, role: .recoveryEntry) },
                 checkAccess: { try powerGate.check() }
             )
@@ -136,6 +137,7 @@ func recoverGuardRecord(
     enableInternal: (RecoveryRecord) throws -> Void,
     originWriter: (RecoveryRecord, [UInt32: DisplayOrigin]) throws -> Void,
     layoutRejected: (InternalRecoveryLayoutContext) -> Void = { _ in },
+    topologyObserved: (InternalRecoveryTopologyContext) -> Void = { _ in },
     trace: (InternalLifecycleStage) -> Void = { _ in },
     checkAccess: () throws -> Void = {}
 ) throws -> RecoveryRecord {
@@ -155,6 +157,7 @@ func recoverGuardRecord(
         let snapshot = try snapshotReader()
         try checkAccess()
         trace(.layoutReadFinished)
+        topologyObserved(InternalRecoveryTopologyContext(snapshot: snapshot))
         return snapshot
     }
     guard var record = try store.load(), contract.accepts(record: record) else {
@@ -195,9 +198,10 @@ func recoverGuardRecord(
     }
 
     if !record.canClear {
-        if record.phase != .restoring {
-            try checkAccess()
-            guard try store.load() == record else { throw RecoveryError.unfinishedTransaction }
+        try checkAccess()
+        guard try store.load() == record else { throw RecoveryError.unfinishedTransaction }
+        // 只读核验失败不能消耗后续精确 B 重新挂责的资格。
+        if record.phase != .restoring, record.requiresRecovery {
             record.beginRestoration()
             try store.save(record)
         }
@@ -254,6 +258,7 @@ func recoverGuardRecord(
             throw RecoveryError.unfinishedTransaction
         }
     } else {
+        record.beginRestoration()
         try record.confirmRestored(actual: layout, internalEnabled: internalEnabled)
         try store.save(record)
     }

@@ -16,14 +16,16 @@ final class RecoverySuspensionRecorderTests: XCTestCase {
 
         XCTAssertTrue(state.prepareForSleep())
         state.didPrepareForSleep(accepted: true, acknowledged: true)
-        state.didWake()
+        let event = state.didWake()
 
         let interval = try XCTUnwrap(state.evidence().intervals.first)
         XCTAssertEqual(state.evidence().intervals.count, 1)
+        XCTAssertEqual(event, interval.powerEvent)
         XCTAssertEqual(interval.before.continuousBeforeNanoseconds, 10)
         XCTAssertEqual(interval.powerEvent.willSleepAtNanoseconds, 10)
         XCTAssertEqual(interval.powerEvent.didWakeAtNanoseconds, 30)
         XCTAssertEqual(interval.after.continuousBeforeNanoseconds, 40)
+        XCTAssertNil(state.didWake())
     }
 
     func testFailedAcknowledgementDuplicateSleepAndUnmatchedWakeYieldNoEvidence() throws {
@@ -32,7 +34,7 @@ final class RecoverySuspensionRecorderTests: XCTestCase {
         let failedState = failedAck.state(session)
         XCTAssertTrue(failedState.prepareForSleep())
         failedState.didPrepareForSleep(accepted: true, acknowledged: false)
-        failedState.didWake()
+        XCTAssertNil(failedState.didWake())
         XCTAssertTrue(failedState.evidence().intervals.isEmpty)
 
         let repeated = FakeReads(samples: [try sample(session, 10, 10, 10)], continuous: [10])
@@ -40,13 +42,13 @@ final class RecoverySuspensionRecorderTests: XCTestCase {
         XCTAssertTrue(repeatedState.prepareForSleep())
         XCTAssertTrue(repeatedState.prepareForSleep())
         repeatedState.didPrepareForSleep(accepted: true, acknowledged: true)
-        repeatedState.didWake()
+        XCTAssertNil(repeatedState.didWake())
         XCTAssertEqual(repeated.sampleReads, 1, "a repeated sleep must not replace the first sample")
         XCTAssertTrue(repeatedState.evidence().intervals.isEmpty)
 
         let unmatched = FakeReads(samples: [], continuous: [])
         let unmatchedState = unmatched.state(session)
-        unmatchedState.didWake()
+        XCTAssertNil(unmatchedState.didWake())
         XCTAssertTrue(unmatchedState.evidence().intervals.isEmpty)
     }
 
@@ -58,8 +60,22 @@ final class RecoverySuspensionRecorderTests: XCTestCase {
 
         XCTAssertTrue(state.prepareForSleep())
         state.didPrepareForSleep(accepted: true, acknowledged: true)
-        state.didWake()
+        XCTAssertNil(state.didWake())
         XCTAssertTrue(state.evidence().intervals.isEmpty)
+    }
+
+    func testWakeReadFailureAndInvalidOrderReturnNil() throws {
+        let session = UUID()
+        for invalidOrder in [false, true] {
+            let samples = invalidOrder
+                ? [try sample(session, 10, 10, 10), try sample(session, 20, 15, 20)]
+                : [try sample(session, 10, 10, 10)]
+            let state = FakeReads(samples: samples, continuous: [10, 30]).state(session)
+            XCTAssertTrue(state.prepareForSleep())
+            state.didPrepareForSleep(accepted: true, acknowledged: true)
+            XCTAssertNil(state.didWake())
+            XCTAssertTrue(state.evidence().intervals.isEmpty)
+        }
     }
 
     func testEvidenceWriterUsesPrivateModesAndNeverOverwrites() throws {

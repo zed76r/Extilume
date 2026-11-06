@@ -1036,6 +1036,7 @@ final class GuardSession: @unchecked Sendable {
                 )
             },
             layoutRejected: { traceInternalLifecycle(.layoutRestoreRejected, succeeded: false, recoveryLayout: $0) },
+            topologyObserved: { traceInternalLifecycle(.recoveryTopologyObserved, recoveryTopology: $0) },
             trace: { traceInternalLifecycle($0) },
             checkAccess: { try self.checkRecoveryAccess() }
         )
@@ -1316,6 +1317,7 @@ final class DisplayGuard: @unchecked Sendable {
                     try configureOrigins(origins, option: .forSession, nativeCall: { try self.powerGate.perform($0) })
                 },
                 layoutRejected: { traceInternalLifecycle(.layoutRestoreRejected, role: .helper, succeeded: false, recoveryLayout: $0) },
+                topologyObserved: { traceInternalLifecycle(.recoveryTopologyObserved, role: .helper, recoveryTopology: $0) },
                 trace: { traceInternalLifecycle($0, role: .helper) },
                 checkAccess: {
                     if self.contract.internalDisplayIdentity != nil { try self.powerGate.check() }

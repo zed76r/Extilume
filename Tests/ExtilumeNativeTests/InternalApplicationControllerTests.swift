@@ -145,6 +145,85 @@ final class InternalApplicationControllerTests: XCTestCase {
         }
     }
 
+    func testNativeCallbacksCarryRecoveryAndLateFaultThroughApplicationProtocol() throws {
+        let directory = try makeControllerDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let recorder = InternalApplicationTestRecorder()
+        let allowFault = DispatchSemaphore(value: 0)
+        defer { allowFault.signal() }
+        let internalID = UUID(uuidString: "00000000-0000-4000-8000-000000000031")!
+        let externalID = UUID(uuidString: "00000000-0000-4000-8000-000000000032")!
+        let c = try DisplayLayout(main: internalID, origins: [
+            internalID: DisplayOrigin(x: 0, y: 0), externalID: DisplayOrigin(x: 1728, y: 0)
+        ])
+        let a = try internalApplicationTargetLayout(for: c, externalIdentity: externalID)
+        let b = try DisplayLayout(main: externalID, origins: [externalID: DisplayOrigin(x: 0, y: 0)])
+        let initial = try RecoveryRecord(baseline: c, target: a,
+            internalDisplay: InternalDisplayResponsibility(identity: internalID, baseline: true, applied: false,
+                hardwareIdentity: InternalDisplayHardwareIdentity(bootSession: UUID(), registryEntryID: 99),
+                numericIDHint: 80))
+        let factory: InternalApplicationProcessFactory = { _, workerChannel in
+            DispatchQueue.global().async {
+                do {
+                    let state = InternalApplicationWorkerState(channel: workerChannel, onFinish: {})
+                    let callbacks = state.callbacks(parentPID: getppid())
+                    let request = try workerChannel.receive(InternalApplicationHandshakeRequest.self)
+                    state.send(.ready(InternalApplicationHandshakeReply(challenge: request.challenge,
+                        workerPID: getpid(), workerUID: UInt32(getuid()))))
+                    XCTAssertEqual(try workerChannel.receive(InternalApplicationCommand.self), .start(recoveryOnly: false))
+                    let store = try RecoveryStore(directory: directory)
+                    try store.acquireExclusiveOwnership()
+                    var record = initial
+                    try record.markApplying()
+                    try record.confirmApplied(b, internalEnabled: false)
+                    try store.save(record)
+                    callbacks.expectation(try InternalApplicationExpectation(record: record))
+                    callbacks.helperStarted(getpid())
+                    XCTAssertTrue(state.hasStartedHelper)
+                    callbacks.status(.applied)
+                    XCTAssertEqual(try workerChannel.receive(InternalApplicationCommand.self), .restore)
+                    record.beginRestoration()
+                    try record.confirmRestored(actual: c, internalEnabled: true)
+                    try record.resumeInternalObservation(current: c, internalEnabled: true)
+                    try store.save(record)
+                    callbacks.status(.manualConfiguration)
+                    XCTAssertEqual(try workerChannel.receive(InternalApplicationCommand.self), .reapply)
+                    try record.prepareReapplication(current: c, target: a)
+                    try record.markApplying()
+                    try record.confirmApplied(b, internalEnabled: false)
+                    try store.save(record)
+                    callbacks.expectation(try InternalApplicationExpectation(record: record))
+                    callbacks.status(.applied)
+                    XCTAssertEqual(allowFault.wait(timeout: .now() + 3), .success)
+                    callbacks.faulted()
+                    callbacks.status(.applied)
+                    callbacks.stopped(false)
+                    recorder.setCommand(try workerChannel.receive(InternalApplicationCommand.self))
+                } catch { XCTFail("protocol fixture failed: \(error)") }
+            }
+            return getpid()
+        }
+        var controller: InternalApplicationController? = try InternalApplicationController(
+            directory: directory, processFactory: factory)
+        controller?.startApplication(registerEvents: false) { recorder.append($0) }
+        XCTAssertTrue(pumpMainRunLoop { recorder.statuses.contains(.applied) })
+        controller?.recoverApplication()
+        XCTAssertTrue(pumpMainRunLoop { recorder.statuses.contains(.manualConfiguration) })
+        controller?.retryApplication()
+        XCTAssertTrue(pumpMainRunLoop { recorder.statuses.filter { $0 == .applied }.count == 2 })
+        allowFault.signal()
+        XCTAssertTrue(pumpMainRunLoop { recorder.command == .stop && recorder.statuses.contains(.recoveryIncomplete) })
+        let faultIndex = try XCTUnwrap(recorder.statuses.firstIndex(of: .recoveryIncomplete))
+        XCTAssertFalse(recorder.statuses[faultIndex...].contains(.applied))
+        let pending = try XCTUnwrap(RecoveryStore(directory: directory).load())
+        XCTAssertEqual(pending.baseline, c)
+        XCTAssertEqual(pending.session, initial.session)
+        XCTAssertEqual(pending.generation, initial.generation + 1)
+        XCTAssertTrue(pending.requiresRecovery)
+        XCTAssertFalse(pending.canClear)
+        controller = nil
+    }
+
     func testFinalProofRejectsDifferentSessionGenerationOrUnrestoredRecord() throws {
         let builtIn = UUID(uuidString: "00000000-0000-4000-8000-000000000021")!
         let external = UUID(uuidString: "00000000-0000-4000-8000-000000000022")!
