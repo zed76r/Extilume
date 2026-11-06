@@ -38,6 +38,28 @@ NS = 1_000_000_000
 DEFAULT_STATE_DIRECTORY = Path.home() / 'Library/Application Support/Extilume'
 
 
+CONFIRM_DIALOG = r'''on run argv
+    set phase to item 1 of argv
+    set secondsLeft to (item 2 of argv) as integer
+    if phase is "before" then
+        set messageText to "确认双屏现在均正常、可操作。确认后将请求一次睡眠。熄屏不代表已经休眠，请勿看到熄屏就立即唤醒；按本轮约定唤醒，实际休眠以时钟证据判定。"
+    else
+        set messageText to "请检查内外两屏实际画面及操作。正常请选择正常；黑屏或抖动请选择异常；已经采取恢复措施请选择救援。超时不会记为正常。"
+    end if
+    try
+        set answer to display dialog messageText with title "Extilume 诊断画面确认" buttons {"异常", "救援", "正常"} default button 1 giving up after secondsLeft
+        if gave up of answer then return "cancel"
+        set choice to button returned of answer
+        if choice is "正常" then return "normal"
+        if choice is "救援" then return "rescue"
+        return "abnormal"
+    on error
+        return "cancel"
+    end try
+end run
+'''
+
+
 def require(value, code):
     if not value:
         raise RuntimeError(code)
@@ -210,7 +232,8 @@ class Session:
         self.report = dict(scope=SCOPE, informationSufficient=False, physicalObservation='unknown',
                            hardwareAcceptance=False, ownerCausality='unknown',
                            processObservation='one-second-polling-with-transient-blind-spots',
-                           newDisableSessions=0, automaticRetry=False, safetyHandoffRequired=False)
+                           newDisableSessions=0, automaticRetry=False, safetyHandoffRequired=False,
+                           confirmationMethod=field.get('confirmationMethod', 'terminal'))
 
     def tick(self, force=False):
         events = self.backend.events()
@@ -303,16 +326,20 @@ class Session:
             self.backend.sleep_once()
             while self.wake is None:
                 self.backend.wait()
-            self.check_C()
-            self.check_C()
-            self.visual('after')
             after = self.backend.capture('after')
             evidence = self.backend.stop_recorder()
             assessment = CLOCK.compare(before, after, evidence)
             require(evidence['intervals'][0]['powerEvent'] == self.wake, 'wake-marker-mismatch')
+            # Preserve timing evidence before topology or human checks can stop this round.
+            self.report['sleepMeasurement'] = assessment
+            self.journal.append(dict(event='machine-measurement', assessment=assessment))
+            self.check_C()
+            self.check_C()
+            self.tick(force=True)
+            self.visual('after')
             require(assessment['measurementSupported'] is True, 'real-sleep-unproved')
             self.tick(force=True)
-            self.report.update(informationSufficient=True, sleepMeasurement=assessment)
+            self.report['informationSufficient'] = True
         except BaseException as error:
             self.report['stopReason'] = str(error) if type(error) is RuntimeError else 'evidence-or-command-failed'
             self.report['safetyHandoffRequired'] = True
@@ -482,10 +509,35 @@ class Mac:
     def confirm(self, phase):
         print(json.dumps(dict(checkpoint=phase, choices=['normal', 'abnormal', 'rescue', 'cancel'])), flush=True)
         self.checkpoint = phase
-        while self.answer is None:
-            self.wait()
-        value, self.answer, self.checkpoint = self.answer, None, None
-        return value
+        try:
+            if self.field.get('confirmationMethod', 'terminal') == 'local-dialog':
+                return self.confirm_dialog(phase)
+            while self.answer is None:
+                self.wait()
+            value, self.answer = self.answer, None
+            return value
+        finally:
+            self.checkpoint = None
+
+    def confirm_dialog(self, phase):
+        self.session.tick()
+        remaining = (self.session.deadline - self.now()[0]) / NS
+        require(remaining > 0, 'collection-deadline')
+        process = subprocess.Popen(
+            ['/usr/bin/osascript', '-e', CONFIRM_DIALOG, phase, str(max(1, min(180, int(remaining))))],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        self.children[process.pid] = (process, '/usr/bin/osascript')
+        try:
+            while process.poll() is None:
+                self.wait()
+            output, _ = process.communicate(timeout=.5)
+            self.session.tick()
+            require(process.returncode == 0 and len(output) <= 32, 'human-dialog-failed')
+            value = output.decode().strip()
+            require(value in ('normal', 'abnormal', 'rescue', 'cancel'), 'invalid-human-input')
+            return value
+        finally:
+            process.stdout.close()
 
     def preflight(self):
         def assertions(command, **_kwargs):
@@ -558,7 +610,8 @@ class Mac:
                 self.session.journal.append(dict(event='human-immediate-stop', value=value,
                                                   observedAtNanoseconds=self.now()[0]))
                 raise RuntimeError('physical-anomaly' if value == 'abnormal' else 'human-rescue')
-            require(value == 'normal' and self.checkpoint is not None and self.answer is None,
+            require(value == 'normal' and self.field.get('confirmationMethod', 'terminal') == 'terminal'
+                    and self.checkpoint is not None and self.answer is None,
                     'human-cancelled-or-unexpected-input')
             self.answer = value
         if self.recorder is None:
@@ -635,6 +688,7 @@ def validate_field(bundle, manifest, field):
             and field['candidate'] == manifest['candidate']
             and field['manifestSHA256'] == digest(bundle / 'manifest.json')
             and field['probeSHA256'] == manifest['files']['bin/extilume-probe'], 'field-authorization-required')
+    require(field.get('confirmationMethod', 'terminal') in ('terminal', 'local-dialog'), 'invalid-confirmation-method')
     require(field['rescueOperator'] == 'user' and isinstance(field['rescueActions'], list)
             and len(field['rescueActions']) > 0
             and field['calibrationApplicable'] is True and field['lidOpenAndUnlocked'] is True,
@@ -681,7 +735,8 @@ def prepare(directory, probe):
         approved=False, scope=SCOPE, candidate=manifest['candidate'], manifestSHA256=digest(directory / 'manifest.json'),
         probeSHA256=manifest['files']['bin/extilume-probe'], macOS=manifest['macOS'], architecture=manifest['architecture'],
         bootSession=None, expectedC=None, internalHardwareIdentity=None, records=[], daily=None,
-        rescueOperator=None, rescueActions=[], calibrationApplicable=False, lidOpenAndUnlocked=False))
+        rescueOperator=None, rescueActions=[], calibrationApplicable=False, lidOpenAndUnlocked=False,
+        confirmationMethod='local-dialog'))
     return dict(scope=SCOPE, prepared=True, fieldReady=False, hardwareAcceptance=False)
 
 

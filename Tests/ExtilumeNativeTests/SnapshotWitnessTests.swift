@@ -5,6 +5,39 @@ import XCTest
 @testable import ExtilumeNative
 
 final class SnapshotWitnessTests: XCTestCase {
+    func testCloseoutScanAcceptsExitedWitnessButPreservesReplyAndExitValidation() throws {
+        for exitCode: Int32 in [0, 1] {
+            var child: pid_t = 0
+            let result = Result {
+                try freshWitness(Int.self, arguments: ["--display-snapshot"], spawn: { arguments, channel in
+                    child = try self.spawnFixture(arguments: arguments, channel: channel,
+                        frame: self.framed(42), exitCode: exitCode, slowExit: false,
+                        readRequest: false, hardwareIdentity: nil, expectedArguments: arguments)
+                    return child
+                }, checkAccess: {
+                    guard child > 0 else { return }
+                    try checkLayoutCloseoutProcesses(currentPID: getpid(), list: { buffer, _ in
+                        buffer?.storeBytes(of: child, as: pid_t.self)
+                        return Int32(MemoryLayout<pid_t>.size)
+                    }, image: { _ in nil }, isGone: layoutCloseoutProcessHasExited,
+                    isOwnWitness: { _, _ in XCTFail("no image"); return false })
+                }, trace: { stage in
+                    guard stage == .witnessSpawnFinished else { return }
+                    var info = siginfo_t()
+                    for _ in 0..<1000 {
+                        XCTAssertEqual(waitid(P_PID, id_t(child), &info, WEXITED | WNOHANG | WNOWAIT), 0)
+                        if info.si_pid == child { break }
+                        usleep(1000)
+                    }
+                    XCTAssertEqual(info.si_pid, child)
+                }, validate: { $0 == 42 })
+            }
+            if exitCode == 0 { XCTAssertEqual(try result.get(), 42) }
+            else { XCTAssertThrowsError(try result.get()) { XCTAssertEqual($0 as? SnapshotWitnessError, .processFailed) } }
+            assertAlreadyReaped(child)
+        }
+    }
+
     private struct BulkRequest: Encodable {
         let payload: String
     }

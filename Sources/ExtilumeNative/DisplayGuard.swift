@@ -5,7 +5,7 @@ import Foundation
 
 private struct GuardReply: Codable { let ready: ProtectionHandshake; var powerReady: Bool? = nil }
 private enum GuardCommand: String, Codable { case quiesce }
-enum GuardError: Error, Equatable { case spawn, identity, missingRecord, protectionLost, suspended, unstable }
+enum GuardError: Error, Equatable { case spawn, identity, missingRecord, protectionLost, suspended, unstable, externalTopologyPending }
 
 func validateInternalGuardReadiness(
     snapshot: Snapshot, record: RecoveryRecord,
@@ -46,7 +46,7 @@ func internalWakeWitnessDeadline(now: UInt64, elapsed: UInt64?) -> UInt64? {
 func internalWakeInformationRetryDelay(
     error: Error, elapsed: UInt64?, lifecycle: InternalSessionLifecycle
 ) -> TimeInterval? {
-    guard error as? SnapshotWitnessError == .internalInformationUnavailable,
+    guard error as? SnapshotWitnessError == .internalInformationUnavailable || error as? GuardError == .externalTopologyPending,
           lifecycle.shouldRecoverAfterWake, lifecycle.resumeAfterWake,
           !lifecycle.faulted, !lifecycle.stopRequested,
           let elapsed, elapsed < internalWakeRecoveryBudgetNanoseconds else { return nil }
@@ -142,6 +142,8 @@ final class GuardSession: @unchecked Sendable {
     private var recoveryEpoch = UUID()
     private var wakePreflightEpoch: UUID?
     private var activeWakeRecoveryEpoch: UUID?
+    private var confirmedWakeTopology: InternalWakeTopologyReadiness?
+    private var topologyWaitingEpoch: UUID?
 
     init(
         directory: URL,
@@ -735,6 +737,31 @@ final class GuardSession: @unchecked Sendable {
                 internalDisplayIDHint = state.id
                 completedWakePreflight = true
             }
+            if forSleep, authorizationLock.withLock({ lifecycle.resumeAfterWake }), let expected = record,
+               topologyWaitingEpoch == epoch || confirmedWakeTopology?.record == expected {
+                guard let anchor = confirmedWakeTopology, anchor.record == expected else {
+                    throw RecoveryError.identityConflict
+                }
+                try checkWakePreflightAccess(expected, epoch: epoch)
+                let snapshot = try readGuardSnapshot(expected)
+                guard clamshellState() == "开盖", let responsibility = expected.internalDisplay,
+                      let id = internalDisplayIDHint,
+                      let deadline = internalWakeWitnessDeadline(
+                        now: try ContinuousClock.nanoseconds(), elapsed: recoveryClock.elapsedNanoseconds()
+                      ) else { throw GuardError.suspended }
+                let state = try freshInternalDisplay(
+                    identity: responsibility.identity, numericIDHint: id,
+                    hardwareIdentity: responsibility.hardwareIdentity, deadlineNanoseconds: deadline,
+                    checkAccess: { try self.checkWakePreflightAccess(expected, epoch: epoch) }
+                )
+                let waiting = try anchor.isWaiting(current: snapshot, internalState: state, record: expected)
+                try checkWakePreflightAccess(expected, epoch: epoch)
+                if waiting {
+                    topologyWaitingEpoch = epoch
+                    throw GuardError.externalTopologyPending
+                }
+                topologyWaitingEpoch = nil
+            }
             var restored = try InternalSleepPreparation.restore(checkAccess: { try self.checkRecoveryAccess() }, stopObserving: {
                 traceInternalLifecycle(.observerDrainStarted)
                 stopConnectionObserver()
@@ -752,6 +779,7 @@ final class GuardSession: @unchecked Sendable {
             guard try store.load() == record else { throw RecoveryError.unfinishedTransaction }
             try store.save(restored)
             record = restored
+            confirmedWakeTopology = try? InternalWakeTopologyReadiness(record: restored, snapshot: snapshot)
             try authorizationLock.withLock {
                 guard lifecycle.permitsRecovery, lifecycle.sleepEpoch == epoch else { throw InternalPowerGateError.suspended }
                 if activeWakeRecoveryEpoch == epoch || wakePreflightEpoch == epoch {
@@ -776,7 +804,7 @@ final class GuardSession: @unchecked Sendable {
                 print("恢复等待系统完成唤醒；保护、模式意图及责任继续保留。")
                 return false
             }
-            let readinessDelay = attemptedWakePreflight && !completedWakePreflight
+            let readinessDelay = (attemptedWakePreflight && !completedWakePreflight) || error as? GuardError == .externalTopologyPending
                 ? authorizationLock.withLock {
                     internalWakeInformationRetryDelay(
                         error: error, elapsed: recoveryClock.elapsedNanoseconds(), lifecycle: lifecycle
@@ -784,7 +812,7 @@ final class GuardSession: @unchecked Sendable {
                 }
                 : nil
             if let delay = readinessDelay {
-                guard let expected = wakePreflightRecord else {
+                guard let expected = wakePreflightRecord ?? (topologyWaitingEpoch == epoch ? confirmedWakeTopology?.record : nil) else {
                     loseProtection()
                     stop()
                     return false
@@ -837,6 +865,7 @@ final class GuardSession: @unchecked Sendable {
         guard authorizationLock.withLock({ lifecycle.permitsControls }) else { throw GuardError.suspended }
         try store.save(observed)
         record = observed
+        confirmedWakeTopology = try? InternalWakeTopologyReadiness(record: observed, snapshot: snapshot)
         stopConnectionObserver()
         authorizationLock.withLock { lifecycle.didConfirmUserConfiguration() }
         print("已确认用户 C；不修改显示设置，后续恢复以 C 为准。")
@@ -981,6 +1010,7 @@ final class GuardSession: @unchecked Sendable {
             recoveryEpoch = UUID()
             recoveryRetryScheduled = false
             wakePreflightEpoch = nil
+            topologyWaitingEpoch = nil
             recoveryClock.reset()
             recoveryFailed = false
         }

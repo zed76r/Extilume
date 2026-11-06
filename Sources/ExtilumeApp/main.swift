@@ -4,7 +4,9 @@ import Foundation
 
 setlinebuf(stdout)
 
-if runInternalApplicationWorkerIfRequested() {
+if runApplicationAutomationIfRequested() {
+    // The client addresses the existing App without starting a session.
+} else if runInternalApplicationWorkerIfRequested() {
     // The private session owner runs independently of the menu process.
 } else if ["--display-snapshot", "--active-display-snapshot", "--internal-display-snapshot", "--external-display-snapshot", "--external-recovery-snapshot", "--external-display-input", "--display-guard"]
     .contains(CommandLine.arguments.dropFirst().first ?? "") {

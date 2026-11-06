@@ -5,6 +5,88 @@ import ExtilumeCore
 
 @MainActor
 final class MenuBarApplicationTests: XCTestCase {
+    func testAutomationStatusAndAuthorizationReuseMenuGuards() async throws {
+        let session = ModeSession()
+        let delegate = MenuBarApplicationDelegate(controllerFactory: { session })
+        delegate.startSession()
+        let status = delegate.automationReply(.init(action: "status"))
+        XCTAssertEqual(status.result, "status")
+        XCTAssertTrue(status.actions.contains("apply-externalOnly"))
+        XCTAssertTrue(session.selections.isEmpty)
+        XCTAssertEqual(delegate.automationReply(.init(action: "apply-externalOnly")).result, "authorization-required")
+        XCTAssertTrue(session.selections.isEmpty)
+        XCTAssertEqual(delegate.automationReply(.init(action: "unknown", allowDisplayWrite: true)).result, "unavailable")
+        XCTAssertEqual(delegate.automationReply(.init(action: "apply-externalOnly", allowDisplayWrite: true)).result, "accepted")
+        XCTAssertEqual(session.selections, [.externalOnly])
+        XCTAssertEqual(delegate.automationReply(.init(action: "apply-externalPrimary", allowDisplayWrite: true)).result, "unavailable")
+        XCTAssertEqual(session.selections, [.externalOnly])
+        session.emit(.recoveryIncomplete)
+        await drainMainQueue()
+        XCTAssertFalse(delegate.automationReply(.init(action: "status")).actions.contains("apply-externalOnly"))
+    }
+
+    func testAutomationInternalActionReflectsRestoreToggle() async throws {
+        let session = ModeSession()
+        session.availableModes = [.externalPrimary, .externalOnly, .internalOnly]
+        session.selectedMode = .internalOnly
+        let delegate = MenuBarApplicationDelegate(controllerFactory: { session })
+        delegate.startSession()
+        session.emit(.applied)
+        await drainMainQueue()
+        let reply = delegate.automationReply(.init(action: "status"))
+        XCTAssertTrue(reply.actions.contains("restore-external"))
+        XCTAssertFalse(reply.actions.contains("disable-external"))
+        XCTAssertEqual(delegate.automationReply(.init(action: "disable-external", allowDisplayWrite: true)).result, "unavailable")
+        XCTAssertTrue(session.selections.isEmpty)
+    }
+
+    func testAutomationEventRejectsMalformedAndEncodesStatus() throws {
+        let delegate = MenuBarApplicationDelegate(controllerFactory: { ModeSession() })
+        delegate.startSession()
+        let event = NSAppleEventDescriptor.appleEvent(withEventClass: applicationAutomationEvent,
+            eventID: applicationAutomationCommand, targetDescriptor: nil, returnID: AEReturnID(kAutoGenerateReturnID), transactionID: AETransactionID(kAnyTransactionID))
+        let reply = event.copy() as! NSAppleEventDescriptor
+        event.setParam(NSAppleEventDescriptor(string: "bad"), forKeyword: keyDirectObject)
+        delegate.handleAutomation(event, withReplyEvent: reply)
+        XCTAssertEqual(reply.paramDescriptor(forKeyword: keyErrorNumber)?.int32Value, -1700)
+        let success = event.copy() as! NSAppleEventDescriptor
+        event.setParam(NSAppleEventDescriptor(string: "{\"action\":\"status\",\"allowDisplayWrite\":false}"), forKeyword: keyDirectObject)
+        delegate.handleAutomation(event, withReplyEvent: success)
+        let data = try XCTUnwrap(success.paramDescriptor(forKeyword: keyDirectObject)?.stringValue?.data(using: .utf8))
+        XCTAssertEqual(try JSONDecoder().decode(ApplicationAutomationReply.self, from: data).result, "status")
+    }
+
+    func testAutomationNeverConfirmsPhysicalConnection() async throws {
+        let session = ConnectionSession()
+        let delegate = MenuBarApplicationDelegate(controllerFactory: { session })
+        delegate.startSession()
+        session.emit(.recoveryIncomplete)
+        await drainMainQueue()
+        XCTAssertEqual(delegate.automationReply(.init(action: "retry-recovery", allowDisplayWrite: true)).result, "human-confirmation-required")
+        XCTAssertTrue(session.preparations.isEmpty)
+        XCTAssertTrue(session.confirmedRecoveries.isEmpty)
+    }
+
+    func testAutomationAppleEventRoundTripWithFakeController() async throws {
+        let delegate = MenuBarApplicationDelegate(controllerFactory: { ModeSession() })
+        delegate.startSession()
+        let manager = NSAppleEventManager.shared()
+        manager.setEventHandler(delegate, andSelector: #selector(MenuBarApplicationDelegate.handleAutomation(_:withReplyEvent:)),
+            forEventClass: applicationAutomationEvent, andEventID: applicationAutomationCommand)
+        defer { manager.removeEventHandler(forEventClass: applicationAutomationEvent, andEventID: applicationAutomationCommand) }
+        let text = try await Task.detached {
+            let event = NSAppleEventDescriptor.appleEvent(withEventClass: applicationAutomationEvent,
+                eventID: applicationAutomationCommand,
+                targetDescriptor: NSAppleEventDescriptor(processIdentifier: ProcessInfo.processInfo.processIdentifier),
+                returnID: AEReturnID(kAutoGenerateReturnID), transactionID: AETransactionID(kAnyTransactionID))
+            event.setParam(NSAppleEventDescriptor(string: "{\"action\":\"status\",\"allowDisplayWrite\":false}"), forKeyword: keyDirectObject)
+            return try event.sendEvent(options: [.waitForReply, .neverInteract], timeout: 3)
+                .paramDescriptor(forKeyword: keyDirectObject)?.stringValue
+        }.value
+        let data = try XCTUnwrap(text?.data(using: .utf8))
+        XCTAssertEqual(try JSONDecoder().decode(ApplicationAutomationReply.self, from: data).result, "status")
+    }
+
     func testOnlyExternalStatePermissionsAndDevelopmentMarker() async throws {
         let states: [PrimarySessionStatus] = [.waiting, .unsupported("条件不符"), .applying, .applied,
             .manualConfiguration, .manualConfigurationForQuit, .applicationFailedRestored, .recoveryIncomplete,

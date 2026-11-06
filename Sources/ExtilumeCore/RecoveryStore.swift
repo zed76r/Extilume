@@ -312,8 +312,8 @@ public final class RecoveryStore {
         guard let current = try loadWithOriginalBytes(), current.bytes == expectedOriginal,
               current.record == original.record else { throw RecoveryStoreError.invalidRecord }
         try save(closed, beforeCommit: {
-            guard try loadWithOriginalBytes()?.bytes == expectedOriginal else { throw RecoveryStoreError.invalidRecord }
             try checkBeforeCommit()
+            guard try loadWithOriginalBytes()?.bytes == expectedOriginal else { throw RecoveryStoreError.invalidRecord }
         }, rollbackOnSyncFailure: false)
         guard try load() == closed else { throw RecoveryStoreError.invalidRecord }
         try verify()

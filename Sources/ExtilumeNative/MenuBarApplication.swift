@@ -171,6 +171,9 @@ final class MenuBarApplicationDelegate: NSObject, NSApplicationDelegate, NSMenuD
             signals.append(source)
             source.resume()
         }
+        NSAppleEventManager.shared().setEventHandler(
+            self, andSelector: #selector(handleAutomation(_:withReplyEvent:)),
+            forEventClass: applicationAutomationEvent, andEventID: applicationAutomationCommand)
         startSession()
     }
 
@@ -669,5 +672,61 @@ final class MenuBarApplicationDelegate: NSObject, NSApplicationDelegate, NSMenuD
             }
         }
         return .terminateLater
+    }
+}
+
+
+extension MenuBarApplicationDelegate {
+    private var automationItems: [(String, NSMenuItem)] {
+        var items = [(String, NSMenuItem)]()
+        for item in modeItems {
+            guard let mode = item.representedObject as? String else { continue }
+            // The internal-only menu item toggles; expose its actual action, not a misleading mode setter.
+            let action = mode == DisplayApplicationMode.internalOnly.rawValue
+                ? (canRestoreForConfiguration ? "restore-external" : "disable-external") : "apply-" + mode
+            items.append((action, item))
+        }
+        items += [("retry", retryItem), ("retry-recovery", recoverItem),
+                  ("restore-for-configuration", restoreForConfigurationItem)]
+        return items.filter { !$0.1.isHidden && $0.1.isEnabled }
+    }
+
+    func automationReply(_ request: ApplicationAutomationRequest) -> ApplicationAutomationReply {
+        render()
+        let available = automationItems
+        var result = "status"
+        if request.action != "status" {
+            guard request.allowDisplayWrite else {
+                return ApplicationAutomationReply(result: "authorization-required", status: stateItem.title, actions: available.map(\.0))
+            }
+            guard let item = available.first(where: { $0.0 == request.action })?.1,
+                  let action = item.action else {
+                return ApplicationAutomationReply(result: "unavailable", status: stateItem.title, actions: available.map(\.0))
+            }
+            // Physical connection confirmation remains a human dialog, never an implicit AI assertion.
+            if connectionRecoveryController != nil {
+                return ApplicationAutomationReply(result: "human-confirmation-required", status: stateItem.title, actions: available.map(\.0))
+            }
+            _ = perform(action, with: item)
+            result = "accepted"
+        }
+        render()
+        return ApplicationAutomationReply(result: result, status: stateItem.title, actions: automationItems.map(\.0))
+    }
+
+    @objc nonisolated func handleAutomation(_ event: NSAppleEventDescriptor, withReplyEvent reply: NSAppleEventDescriptor) {
+        guard let data = event.paramDescriptor(forKeyword: keyDirectObject)?.stringValue?.data(using: .utf8),
+              data.count <= 4096,
+              let request = try? JSONDecoder().decode(ApplicationAutomationRequest.self, from: data) else {
+            reply.setParam(NSAppleEventDescriptor(string: "invalid-request"), forKeyword: keyErrorString)
+            reply.setParam(NSAppleEventDescriptor(int32: -1700), forKeyword: keyErrorNumber)
+            return
+        }
+        // In-process Apple Events may dispatch on the sender thread; UI state stays on the main actor.
+        let result = Thread.isMainThread
+            ? MainActor.assumeIsolated { automationReply(request) }
+            : DispatchQueue.main.sync { automationReply(request) }
+        guard let encoded = try? JSONEncoder().encode(result) else { return }
+        reply.setParam(NSAppleEventDescriptor(string: String(decoding: encoded, as: UTF8.self)), forKeyword: keyDirectObject)
     }
 }

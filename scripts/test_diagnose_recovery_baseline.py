@@ -1,5 +1,6 @@
 """Dg1 离线反例：不运行任何 App、probe、ps、睡眠或原生时钟。"""
 import copy
+import io
 import importlib.util
 import json
 import os
@@ -7,7 +8,7 @@ import stat
 from pathlib import Path
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import patch, Mock
 from types import SimpleNamespace
 
 SPEC = importlib.util.spec_from_file_location('dg1', Path(__file__).with_name('diagnose-recovery-baseline.py'))
@@ -253,6 +254,38 @@ class Dg1Tests(unittest.TestCase):
         self.assertEqual(fake.snapshot_reads, 4)
         self.assertEqual(report['newDisableSessions'], 0)
 
+    def test_human_timeout_preserves_machine_measurement_without_passing(self):
+        session, fake = self.session()
+        original_confirm = fake.confirm
+
+        def delayed_confirm(phase):
+            if phase == 'after':
+                fake.c += 11 * D.NS
+                fake.a += 11 * D.NS
+                session.tick()
+            return original_confirm(phase)
+
+        fake.confirm = delayed_confirm
+        report = session.execute()
+        self.assertEqual(report['stopReason'], 'collection-deadline')
+        self.assertIn('stop-recorder', fake.calls)
+        self.assertTrue(report['sleepMeasurement']['measurementSupported'])
+        self.assertFalse(report['informationSufficient'])
+        self.assertEqual(report['physicalObservation'], 'unknown')
+        self.assertEqual(fake.calls.count('sleep'), 1)
+
+    def test_wake_topology_failure_preserves_measurement_and_still_stops(self):
+        session, fake = self.session()
+        fake.third_snapshot = lambda backend: setattr(backend, 'failure', 'incomplete-C')
+        report = session.execute()
+        self.assertEqual(report['stopReason'], 'incomplete-C')
+        self.assertFalse(report['informationSufficient'])
+        self.assertEqual(report['physicalObservation'], 'unknown')
+        self.assertEqual(fake.snapshot_reads, 3)
+        self.assertEqual(fake.calls.count('sleep'), 1)
+        self.assertIn('stop-recorder', fake.calls)
+        self.assertTrue(report['sleepMeasurement']['measurementSupported'])
+
     def test_failed_sleep_is_consumed_and_restart_or_copy_cannot_reclaim_candidate(self):
         session, fake = self.session()
         fake.failure = 'sleep-request-failed'
@@ -344,7 +377,7 @@ class Dg1Tests(unittest.TestCase):
                 finally:
                     journal.close()
                 self.assertFalse(report['informationSufficient'])
-                self.assertEqual(report['physicalObservation'], 'normal')
+                self.assertEqual(report['physicalObservation'], 'normal' if mutation == 'zero' else 'unknown')
                 self.assertEqual(fake.calls.count('sleep'), 1)
 
     def test_abnormal_or_rescue_is_retained_and_no_restart_or_retry(self):
@@ -471,6 +504,63 @@ class Dg1Tests(unittest.TestCase):
                     backend.internal_state(snapshot(), {})
             self.assertEqual(D.CLOCK.load_private(self.root / f'internal-state-{index}.json'), reply)
 
+    def test_local_dialog_uses_fixed_choices_and_remaining_deadline(self):
+        for choice in ('normal', 'abnormal', 'rescue', 'cancel'):
+            with self.subTest(choice=choice):
+                backend = D.Mac.__new__(D.Mac)
+                backend.children = {}
+                backend.now = lambda: (2 * D.NS, 2 * D.NS)
+                backend.session = SimpleNamespace(deadline=10 * D.NS, tick=Mock())
+                backend.wait = Mock()
+                process = Mock(pid=321, returncode=0, stdout=io.BytesIO())
+                process.poll.side_effect = [None, 0]
+                process.communicate.return_value = ((choice + '\n').encode(), None)
+                with patch.object(D.subprocess, 'Popen', return_value=process) as spawn:
+                    self.assertEqual(backend.confirm_dialog('after'), choice)
+                self.assertEqual(spawn.call_args.args[0], ['/usr/bin/osascript', '-e', D.CONFIRM_DIALOG, 'after', '8'])
+                self.assertEqual(backend.children[321][1], '/usr/bin/osascript')
+                self.assertTrue(process.stdout.closed)
+                backend.wait.assert_called_once()
+                self.assertIn('default button 1', D.CONFIRM_DIALOG)
+
+    def test_local_dialog_timeout_cannot_accept_late_normal(self):
+        backend = D.Mac.__new__(D.Mac)
+        backend.children = {}
+        backend.now = lambda: (0, 0)
+        backend.session = SimpleNamespace(deadline=10 * D.NS,
+            tick=Mock(side_effect=[None, RuntimeError('collection-deadline')]))
+        process = Mock(pid=321, returncode=0, stdout=io.BytesIO())
+        process.poll.return_value = 0
+        process.communicate.return_value = (b'normal\n', None)
+        with patch.object(D.subprocess, 'Popen', return_value=process), self.assertRaisesRegex(RuntimeError, 'collection-deadline'):
+            backend.confirm_dialog('after')
+        self.assertTrue(process.stdout.closed)
+
+    def test_dialog_failure_and_unknown_output_never_mean_normal(self):
+        for output, code in [(b'normal\n', 1), (b'yes\n', 0), (b'x' * 33, 0)]:
+            backend = D.Mac.__new__(D.Mac)
+            backend.children = {}
+            backend.now = lambda: (0, 0)
+            backend.session = SimpleNamespace(deadline=10 * D.NS, tick=lambda: None)
+            process = Mock(pid=321, returncode=code, stdout=io.BytesIO())
+            process.poll.return_value = code
+            process.communicate.return_value = (output, None)
+            with patch.object(D.subprocess, 'Popen', return_value=process), self.assertRaises(RuntimeError):
+                backend.confirm_dialog('after')
+
+    def test_dialog_wait_preserves_immediate_anomaly_stop_and_cleanup_ownership(self):
+        backend = D.Mac.__new__(D.Mac)
+        backend.children = {}
+        backend.now = lambda: (0, 0)
+        backend.session = SimpleNamespace(deadline=10 * D.NS, tick=lambda: None)
+        backend.wait = Mock(side_effect=RuntimeError('physical-anomaly'))
+        process = Mock(pid=321, stdout=io.BytesIO())
+        process.poll.return_value = None
+        with patch.object(D.subprocess, 'Popen', return_value=process), self.assertRaisesRegex(RuntimeError, 'physical-anomaly'):
+            backend.confirm_dialog('after')
+        self.assertIs(backend.children[321][0], process)
+        self.assertTrue(process.stdout.closed)
+
     def test_assertions_wait_handles_stop_instead_of_blocking_five_seconds(self):
         backend = D.Mac.__new__(D.Mac)
         backend.children = {}
@@ -527,6 +617,7 @@ class Dg1Tests(unittest.TestCase):
         field = D.CLOCK.load_private(bundle / 'field.template.json')
         manifest = D.CLOCK.load_private(bundle / 'manifest.json')
         self.assertFalse(field['approved'])
+        self.assertEqual(field['confirmationMethod'], 'local-dialog')
         with self.assertRaisesRegex(RuntimeError, 'field-authorization-required'):
             D.validate_field(bundle, manifest, field)
 
@@ -544,6 +635,9 @@ class Dg1Tests(unittest.TestCase):
                      daily=dict(pid=-1, executable='/fixture/Extilume',
                                 recordSHA256=self.field['records'][-1]['sha256']))
         with self.assertRaisesRegex(RuntimeError, 'invalid-daily-authorization'):
+            D.validate_field(bundle, manifest, field)
+        field['confirmationMethod'] = 'auto-normal'
+        with self.assertRaisesRegex(RuntimeError, 'invalid-confirmation-method'):
             D.validate_field(bundle, manifest, field)
         manifest['budgetDirectory'] = 'relative-budget'
         with self.assertRaisesRegex(RuntimeError, 'absolute-budget-required'):

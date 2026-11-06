@@ -58,10 +58,16 @@ struct LayoutCloseoutRequest: Codable {
     let evidenceDirectory: String
 
     func validate(now: UInt64, probeSHA256 actual: String) throws {
-        guard scope == "legacy-layout-record-closeout-v1", approved, adoptCurrentC, physicalObservationConfirmed,
+        guard scope == "legacy-layout-record-closeout-v1", records.map(\.role) == ["old-1", "old-2"] else {
+            throw LayoutCloseoutError.authorization
+        }
+        try validateEnvironment(now: now, probeSHA256: actual)
+    }
+
+    func validateEnvironment(now: UInt64, probeSHA256 actual: String) throws {
+        guard approved, adoptCurrentC, physicalObservationConfirmed,
               observedAtNanoseconds <= now, now - observedAtNanoseconds <= 600_000_000_000,
-              probeSHA256 == actual, records.count == 2, records.map(\.role) == ["old-1", "old-2"],
-              Set(records.map(\.directory)).count == 2,
+              probeSHA256 == actual, Set(records.map(\.directory)).count == records.count,
               records.allSatisfy({ $0.inode > 0 && $0.generation > 0 && $0.originalSHA256.count == 64 }),
               expectedC.displays.count == 2,
               Set(expectedC.displays.map(\.identity)) == [.builtIn, .physical],
@@ -111,6 +117,19 @@ final class LayoutCloseoutDirectory {
     }
 
     func read(_ name: String) throws -> Data {
+        try readBound(name).bytes
+    }
+
+    func requireAbsent(_ name: String) throws {
+        try verify()
+        var info = stat()
+        guard fstatat(descriptor, name, &info, AT_SYMLINK_NOFOLLOW) == -1, errno == ENOENT else {
+            throw LayoutCloseoutError.storage
+        }
+    }
+
+    func readBound(_ name: String) throws -> (bytes: Data, device: Int64, inode: UInt64) {
+        guard !name.isEmpty, name != ".", name != "..", !name.contains("/") else { throw LayoutCloseoutError.storage }
         try verify()
         let fd = openat(descriptor, name, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
         guard fd >= 0 else { throw LayoutCloseoutError.storage }
@@ -121,7 +140,11 @@ final class LayoutCloseoutDirectory {
               info.st_size >= 0, info.st_size <= 1_048_576 else { throw LayoutCloseoutError.storage }
         let data = try FileHandle(fileDescriptor: fd, closeOnDealloc: false).read(upToCount: 1_048_577) ?? Data()
         guard data.count <= 1_048_576 else { throw LayoutCloseoutError.storage }
-        return data
+        var current = stat()
+        guard fstatat(descriptor, name, &current, AT_SYMLINK_NOFOLLOW) == 0,
+              current.st_dev == info.st_dev, current.st_ino == info.st_ino else { throw LayoutCloseoutError.storage }
+        try verify()
+        return (data, Int64(info.st_dev), info.st_ino)
     }
 
     func write(_ name: String, data: Data) throws {
@@ -159,13 +182,23 @@ func checkLayoutCloseoutProcesses() throws {
             guard length > 0 else { return nil }
             return path.withUnsafeBufferPointer { String(cString: $0.baseAddress!) }
         },
-        isGone: { pid in kill(pid, 0) == -1 && errno == ESRCH },
+        isGone: layoutCloseoutProcessHasExited,
         isOwnWitness: { pid, image in
             var info = proc_bsdinfo()
             return proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, Int32(MemoryLayout<proc_bsdinfo>.size)) == MemoryLayout<proc_bsdinfo>.size
                 && info.pbi_ppid == UInt32(currentPID)
                 && URL(fileURLWithPath: image).resolvingSymlinksInPath() == Bundle.main.executableURL?.resolvingSymlinksInPath()
         })
+}
+
+func layoutCloseoutProcessHasExited(_ pid: pid_t) -> Bool {
+    guard pid > 0 else { return false }
+    if kill(pid, 0) == -1 && errno == ESRCH { return true }
+    // An exited witness can lose its image before waitpid; leave its status for the owner to reap.
+    var info = siginfo_t()
+    return waitid(P_PID, id_t(pid), &info, WEXITED | WNOHANG | WNOWAIT) == 0
+        && info.si_pid == pid
+        && [CLD_EXITED, CLD_KILLED, CLD_DUMPED].contains(info.si_code)
 }
 
 func checkLayoutCloseoutProcesses(
@@ -186,12 +219,13 @@ func checkLayoutCloseoutProcesses(
             throw LayoutCloseoutError.processImageUnavailable
         }
         guard ["Extilume", "extilume-probe", "native-primary-preparation"].contains(URL(fileURLWithPath: path).lastPathComponent) else { continue }
-        guard isOwnWitness(pid, path) else { throw LayoutCloseoutError.controllerPresent }
+        guard isOwnWitness(pid, path) || isGone(pid) else { throw LayoutCloseoutError.controllerPresent }
     }
 }
 
 func performLayoutRecordCloseout(
     request: LayoutCloseoutRequest, requestBytes: Data, executableSHA256: String,
+    residualProof: LayoutResidualCloseoutProof? = nil,
     now: @escaping () throws -> UInt64 = { try ContinuousClock.nanoseconds() },
     boot: @escaping () throws -> UUID = currentBootSession,
     quiet: @escaping () throws -> Void = checkLayoutCloseoutProcesses,
@@ -210,10 +244,19 @@ func performLayoutRecordCloseout(
     }
 ) throws {
     let start = try now()
-    try request.validate(now: start, probeSHA256: executableSHA256)
+    if residualProof != nil {
+        guard request.scope == "legacy-layout-residual-closeout-v1", request.records.map(\.role) == ["old-2"] else {
+            throw LayoutCloseoutError.authorization
+        }
+        try request.validateEnvironment(now: start, probeSHA256: executableSHA256)
+    } else {
+        try request.validate(now: start, probeSHA256: executableSHA256)
+    }
     guard start <= UInt64.max - 30_000_000_000 else { throw LayoutCloseoutError.environment }
     let deadline = start + 30_000_000_000
     let evidence = try LayoutCloseoutDirectory(request.evidenceDirectory)
+    let retainedProof = try residualProof.map { try LayoutResidualCloseoutBinding($0, request: request) }
+    try retainedProof?.verifyEvidenceDirectory(evidence, target: request.records[0])
     try evidence.write("attempt.json", value: ["candidate": request.candidate.uuidString,
                                                "requestSHA256": layoutCloseoutSHA256(requestBytes)])
     var lastCheck = start
@@ -244,6 +287,7 @@ func performLayoutRecordCloseout(
     }
     func verify() throws {
         try checkpoint(force: true)
+        try retainedProof?.verify()
         stage = .snapshotFirst
         let first = try snapshot(deadline, { try checkpoint() })
         stage = .snapshotSecond
@@ -266,6 +310,7 @@ func performLayoutRecordCloseout(
         try evidence.write("observation-\(observation).json", value: second)
         try evidence.write("internal-\(observation).json", value: state)
         try checkpoint(force: true)
+        try retainedProof?.verify()
     }
     do {
         // Hold both owners before the first record can change.
@@ -280,6 +325,7 @@ func performLayoutRecordCloseout(
         func verifySources() throws {
             let callerStage = stage
             stage = .sourceIdentity
+            try retainedProof?.verify()
             for (index, entry) in request.records.enumerated() {
                 try directories[index].verify(device: entry.device, inode: entry.inode)
                 try stores[index].verifyDirectoryIdentity(device: entry.device, inode: entry.inode)
@@ -350,6 +396,8 @@ func performLayoutRecordCloseout(
         stage = .completion
         try evidence.write("complete.json", value: ["verifiedRoles": completed])
         try checkpoint(force: true)
+        try retainedProof?.verify()
+        try checkpoint()
     } catch {
         try? evidence.write("stopped.json", value: LayoutCloseoutStoppedReceipt(
             verifiedRoles: completed, stage: stage, failureCode: layoutCloseoutFailureCode(error)))
@@ -357,12 +405,21 @@ func performLayoutRecordCloseout(
     }
 }
 
-func runLayoutRecordCloseout(requestPath: String) throws {
+func runLayoutRecordCloseout(requestPath: String, residual: Bool = false) throws {
     let url = URL(fileURLWithPath: requestPath)
     guard requestPath.hasPrefix("/"), let executable = Bundle.main.executableURL else { throw LayoutCloseoutError.authorization }
     let input = try LayoutCloseoutDirectory(url.deletingLastPathComponent().path)
     let bytes = try input.read(url.lastPathComponent)
-    let request = try JSONDecoder().decode(LayoutCloseoutRequest.self, from: bytes)
+    let request: LayoutCloseoutRequest
+    let proof: LayoutResidualCloseoutProof?
+    if residual {
+        let input = try JSONDecoder().decode(LayoutResidualCloseoutRequest.self, from: bytes)
+        request = input.authorization
+        proof = input.proof
+    } else {
+        request = try JSONDecoder().decode(LayoutCloseoutRequest.self, from: bytes)
+        proof = nil
+    }
     try performLayoutRecordCloseout(request: request, requestBytes: bytes,
-                                   executableSHA256: layoutCloseoutSHA256(Data(contentsOf: executable)))
+        executableSHA256: layoutCloseoutSHA256(Data(contentsOf: executable)), residualProof: proof)
 }

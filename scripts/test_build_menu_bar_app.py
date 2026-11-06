@@ -31,11 +31,17 @@ class BuildMenuBarAppTests(unittest.TestCase):
             with patch.object(builder, "__file__", str(root / "scripts/build-menu-bar-app.py")), \
                  patch.object(builder.sys, "argv", ["builder", "-c", "release"]), \
                  patch.object(builder.subprocess, "run", side_effect=[subprocess.CompletedProcess([], 0),
-                     subprocess.CompletedProcess([], 0, stdout=str(binary_dir))]) as run:
+                     subprocess.CompletedProcess([], 0, stdout=str(binary_dir)),
+                     subprocess.CompletedProcess([], 0), subprocess.CompletedProcess([], 0)]) as run:
                 builder.main()
             contents = root / "dist-dev/Extilume.app/Contents"
             info = plistlib.loads((contents / "Info.plist").read_bytes())
             self.assertEqual(info["CFBundleIdentifier"], "com.extilume.development")
+            app = (root / "dist-dev/Extilume.app").resolve()
+            self.assertEqual(run.call_args_list[-2].args[0], ["/usr/bin/codesign", "--force", "--sign", "-", str(app)])
+            self.assertEqual(run.call_args_list[-1].args[0], ["/usr/bin/codesign", "--verify", "--deep", "--strict", str(app)])
+            self.assertTrue(run.call_args_list[-2].kwargs["check"])
+            self.assertTrue(run.call_args_list[-1].kwargs["check"])
             self.assertTrue(info["ExtilumeDevelopmentBuild"])
             self.assertEqual(info["CFBundleDisplayName"], "Extilume 开发版")
             self.assertEqual(info["CFBundleShortVersionString"], "0.1.0")
@@ -61,7 +67,8 @@ class BuildMenuBarAppTests(unittest.TestCase):
             with patch.object(builder, "__file__", str(root / "scripts/build-menu-bar-app.py")), \
                  patch.object(builder.sys, "argv", ["builder", "--version", "1.2.3-beta.12", "-c", "release"]), \
                  patch.object(builder.subprocess, "run", side_effect=[subprocess.CompletedProcess([], 0),
-                     subprocess.CompletedProcess([], 0, stdout=str(binary_dir))]) as run:
+                     subprocess.CompletedProcess([], 0, stdout=str(binary_dir)),
+                     subprocess.CompletedProcess([], 0), subprocess.CompletedProcess([], 0)]) as run:
                 builder.main()
             info = plistlib.loads((root / "dist-dev/Extilume.app/Contents/Info.plist").read_bytes())
             self.assertEqual(info["CFBundleDisplayName"], "Extilume Beta")
@@ -70,6 +77,11 @@ class BuildMenuBarAppTests(unittest.TestCase):
             self.assertEqual(info["ExtilumeReleaseVersion"], "1.2.3-beta.12")
             self.assertTrue(info["ExtilumeDevelopmentBuild"])
             self.assertEqual(info["CFBundleIdentifier"], "com.extilume.development")
+            app = (root / "dist-dev/Extilume.app").resolve()
+            self.assertEqual(run.call_args_list[-2].args[0], ["/usr/bin/codesign", "--force", "--sign", "-", str(app)])
+            self.assertEqual(run.call_args_list[-1].args[0], ["/usr/bin/codesign", "--verify", "--deep", "--strict", str(app)])
+            self.assertTrue(run.call_args_list[-2].kwargs["check"])
+            self.assertTrue(run.call_args_list[-1].kwargs["check"])
             self.assertEqual(run.call_args_list[0].args[0][-2:], ["-c", "release"])
             self.assertEqual(run.call_args_list[1].args[0][-2:], ["-c", "release"])
 

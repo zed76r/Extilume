@@ -273,6 +273,102 @@ final class GuardRecoveryTests: XCTestCase {
         }
     }
 
+    func testWakeTopologyWaitRequiresExactConfirmedCAndEnabledInternal() throws {
+        let record = try confirmedCRecord()
+        let full = snapshot(record.baseline)
+        let anchor = try InternalWakeTopologyReadiness(record: record, snapshot: full)
+        let state = provenInternal(record, active: true)
+        XCTAssertTrue(try anchor.isWaiting(current: snapshot(record.baseline, includeExternal: false),
+                                          internalState: state, record: record))
+        XCTAssertFalse(try anchor.isWaiting(current: full, internalState: state, record: record))
+        XCTAssertThrowsError(try anchor.isWaiting(current: snapshot(record.baseline, includeExternal: false),
+                                                  internalState: provenInternal(record, active: false), record: record))
+        XCTAssertThrowsError(try anchor.isWaiting(current: Snapshot(displays: []), internalState: state, record: record))
+        XCTAssertThrowsError(try anchor.isWaiting(current: snapshot(try layout(mainExternal: true)),
+                                                  internalState: state, record: record))
+        XCTAssertThrowsError(try anchor.isWaiting(current: snapshot(record.baseline, internalActive: false),
+                                                  internalState: state, record: record))
+        for key in ["id", "originX", "rotation", "mode"] {
+            var object = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(full)) as? [String: Any])
+            var displays = try XCTUnwrap(object["displays"] as? [[String: Any]])
+            if key == "mode" {
+                var mode = try XCTUnwrap(displays[1]["mode"] as? [String: Any])
+                mode["refreshRate"] = 30
+                displays[1]["mode"] = mode
+            } else {
+                displays[0][key] = 999
+            }
+            object["displays"] = displays
+            let different = try JSONDecoder().decode(Snapshot.self, from: JSONSerialization.data(withJSONObject: object))
+            XCTAssertThrowsError(try anchor.isWaiting(current: different, internalState: state, record: record), key)
+        }
+        var changed = record
+        changed.beginRestoration()
+        XCTAssertThrowsError(try anchor.isWaiting(current: full, internalState: state, record: changed))
+        XCTAssertThrowsError(try InternalWakeTopologyReadiness(record: applyingRecord(), snapshot: full))
+        XCTAssertThrowsError(try InternalWakeTopologyReadiness(record: confirmedCRecord(hardware: false), snapshot: full))
+        XCTAssertThrowsError(try InternalWakeTopologyReadiness(record: record,
+                                                               snapshot: snapshot(record.baseline, includeExternal: false)))
+    }
+
+    func testWakeTopologyWaitUsesOriginalDeadlineAndRejectsFaultOrStop() {
+        var state = InternalSessionLifecycle()
+        XCTAssertTrue(state.willSleep())
+        state.finishSleepPreparation(acknowledged: true)
+        state.didWake()
+        let error = GuardError.externalTopologyPending
+        XCTAssertEqual(internalWakeInformationRetryDelay(error: error, elapsed: 0, lifecycle: state), 0.3)
+        XCTAssertEqual(internalWakeInformationRetryDelay(error: error, elapsed: 9_900_000_000, lifecycle: state), 0.1)
+        XCTAssertNil(internalWakeInformationRetryDelay(error: error, elapsed: 10_000_000_000, lifecycle: state))
+        XCTAssertNil(internalWakeInformationRetryDelay(error: error, elapsed: nil, lifecycle: state))
+        var paused = state
+        paused.requestPause()
+        XCTAssertNil(internalWakeInformationRetryDelay(error: error, elapsed: 0, lifecycle: paused))
+        var stopped = state
+        stopped.requestStop()
+        XCTAssertNil(internalWakeInformationRetryDelay(error: error, elapsed: 0, lifecycle: stopped))
+        state.fail()
+        XCTAssertNil(internalWakeInformationRetryDelay(error: error, elapsed: 0, lifecycle: state))
+    }
+
+    func testTransientMissingExternalRetainsRecordUntilExactCReturnsWithoutDisplayWrites() throws {
+        let record = try confirmedCRecord()
+        var externalPresent = false
+        var lifecycle = InternalSessionLifecycle()
+        XCTAssertTrue(lifecycle.willSleep())
+        lifecycle.finishSleepPreparation(acknowledged: true)
+        lifecycle.didWake()
+        try withStore { store, directory in
+            try store.save(record)
+            let path = directory.appendingPathComponent("recovery-record.json")
+            let before = try Data(contentsOf: path)
+            func recover() throws -> RecoveryRecord {
+                try recoverGuardRecord(
+                    store: store, contract: contract(for: record),
+                    snapshotReader: { self.snapshot(record.baseline, includeExternal: externalPresent) },
+                    internalReader: { _ in self.provenInternal(record, active: true) },
+                    enableInternal: { _ in XCTFail("already enabled internal must not be written") },
+                    originWriter: { _, _ in XCTFail("missing external or exact C must not write origins") }
+                )
+            }
+            XCTAssertThrowsError(try recover()) { error in
+                XCTAssertEqual(error as? RecoveryError, .unresolvedSource)
+                XCTAssertNil(internalWakeVerificationRetryDelay(error: error, attempt: 0, lifecycle: lifecycle))
+            }
+            XCTAssertEqual(try Data(contentsOf: path), before)
+            XCTAssertEqual(try store.load(), record)
+            XCTAssertTrue(lifecycle.wakeRecoveryRequired)
+            XCTAssertFalse(lifecycle.permitsControls)
+            externalPresent = true
+            let restored = try recover()
+            XCTAssertTrue(restored.canClear)
+            XCTAssertEqual(restored.baseline, record.baseline)
+            XCTAssertEqual(restored.session, record.session)
+            XCTAssertEqual(restored.generation, record.generation)
+            XCTAssertEqual(try store.load(), restored)
+        }
+    }
+
     func testRejectedSubsetPreservesLaterExactBRecoveryAfterOwnershipHandoff() throws {
         let record = try confirmedCRecord()
         var actual = record.baseline

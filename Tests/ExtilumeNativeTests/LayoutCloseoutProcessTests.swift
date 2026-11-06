@@ -6,6 +6,46 @@ final class LayoutCloseoutProcessTests: XCTestCase {
     private let selfPID: pid_t = 101
     private let otherPID: pid_t = 202
 
+    func testExitedChildWithMissingImageDoesNotBlockOrConsumeExitStatus() throws {
+        for executable in ["/usr/bin/true", "/usr/bin/false"] {
+            let argument = strdup(executable)!
+            defer { free(argument) }
+            var arguments: [UnsafeMutablePointer<CChar>?] = [argument, nil]
+            var child: pid_t = 0
+            let spawned = arguments.withUnsafeMutableBufferPointer {
+                posix_spawn(&child, argument, nil, nil, $0.baseAddress!, nil)
+            }
+            XCTAssertEqual(spawned, 0)
+            guard spawned == 0 else { return }
+            var status: Int32 = 0
+            defer { _ = waitpid(child, &status, 0) }
+            var info = siginfo_t()
+            for _ in 0..<1000 {
+                XCTAssertEqual(waitid(P_PID, id_t(child), &info, WEXITED | WNOHANG | WNOWAIT), 0)
+                if info.si_pid == child { break }
+                usleep(1000)
+            }
+            XCTAssertEqual(info.si_pid, child)
+            try checkLayoutCloseoutProcesses(currentPID: getpid(), list: list([child]),
+                image: { _ in nil }, isGone: layoutCloseoutProcessHasExited,
+                isOwnWitness: { _, _ in XCTFail("no image"); return false })
+            try checkLayoutCloseoutProcesses(currentPID: getpid(), list: list([child]),
+                image: { _ in "/synthetic/extilume-probe" }, isGone: layoutCloseoutProcessHasExited,
+                isOwnWitness: { _, _ in false })
+            var retained = siginfo_t()
+            XCTAssertEqual(waitid(P_PID, id_t(child), &retained, WEXITED | WNOHANG | WNOWAIT), 0)
+            XCTAssertEqual(retained.si_pid, child, "The witness owner must still receive the exit status")
+            XCTAssertEqual(retained.si_status, executable == "/usr/bin/true" ? 0 : 1)
+        }
+    }
+
+    func testExitObservationDoesNotAcceptLiveOrInvalidProcesses() {
+        XCTAssertFalse(layoutCloseoutProcessHasExited(getpid()))
+        XCTAssertFalse(layoutCloseoutProcessHasExited(getppid()))
+        XCTAssertFalse(layoutCloseoutProcessHasExited(0))
+        XCTAssertFalse(layoutCloseoutProcessHasExited(-1))
+    }
+
     func testListFailuresHaveDistinctCodesAndDoNotReadImages() {
         for sizing: Int32 in [0, -1] {
             XCTAssertThrowsError(try checkLayoutCloseoutProcesses(currentPID: selfPID, list: { _, _ in sizing }, image: { _ in
@@ -74,7 +114,7 @@ final class LayoutCloseoutProcessTests: XCTestCase {
                 let check = {
                     try checkLayoutCloseoutProcesses(currentPID: self.selfPID, list: self.list([self.otherPID]), image: { _ in
                         "/synthetic/\(name)"
-                    }, isGone: { _ in XCTFail("image is available"); return false }, isOwnWitness: { _, _ in
+                    }, isGone: { _ in XCTAssertFalse(own); return false }, isOwnWitness: { _, _ in
                         checks += 1
                         return own
                     })

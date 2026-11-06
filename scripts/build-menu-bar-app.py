@@ -63,12 +63,16 @@ def main():
         "LSMinimumSystemVersion": "13.0",
         "LSUIElement": True,
         "NSHighResolutionCapable": True,
+        "NSAppleEventsUsageDescription": "通过命令行查询和控制已运行的 Extilume，显示操作沿用应用保护检查。",
     }
     with (contents / "Info.plist").open("wb") as output:
         plistlib.dump(info, output)
     assert plistlib.loads((contents / "Info.plist").read_bytes()) == info
     assert os.access(contents / "MacOS/Extilume", os.X_OK)
     assert (contents / "MacOS/Extilume").read_bytes() == binary.read_bytes()
+    # Seal the completed bundle: copying a signed executable does not sign its resources.
+    subprocess.run(["/usr/bin/codesign", "--force", "--sign", "-", str(app)], check=True)
+    subprocess.run(["/usr/bin/codesign", "--verify", "--deep", "--strict", str(app)], check=True)
     print(app)
 
 
