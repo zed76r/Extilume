@@ -5,6 +5,117 @@ import ExtilumeCore
 @testable import ExtilumeNative
 
 final class ApplicationLaunchTests: XCTestCase {
+    func testRecoveryBatchArgumentsRequireAbsoluteDirectoryWithoutCreatingIt() throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let missing = root.appendingPathComponent("missing", isDirectory: true)
+        var supportCalls = 0
+        let options = try applicationLaunchOptions(arguments: ["--recovery-batch", "--state-directory", missing.path]) {
+            supportCalls += 1
+            return root
+        }
+        XCTAssertEqual(options.stateDirectory, missing)
+        XCTAssertTrue(options.recoveryBatch)
+        XCTAssertFalse(options.verifiesExternalHandoff)
+        for arguments in [
+            ["--recovery-batch"],
+            ["--recovery-batch", "--state-directory", "relative"],
+            ["--recovery-batch", "--state-directory", missing.path, "extra"]
+        ] {
+            XCTAssertThrowsError(try applicationLaunchOptions(arguments: arguments) {
+                supportCalls += 1
+                return root
+            }) { XCTAssertEqual($0 as? ApplicationLaunchError, .invalidArguments) }
+        }
+        XCTAssertEqual(supportCalls, 0)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: missing.path))
+    }
+
+    @MainActor
+    func testRecoveryBatchOverridesSavedModesWithoutStartingController() throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let suite = "ExtilumeBatchTests.\(UUID().uuidString)"
+        let protectionSuite = "ExtilumeProtectionTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        let protection = try XCTUnwrap(UserDefaults(suiteName: protectionSuite))
+        defer {
+            defaults.removePersistentDomain(forName: suite)
+            protection.removePersistentDomain(forName: protectionSuite)
+        }
+        for (index, mode) in [DisplayApplicationMode.externalPrimary, .internalOnly].enumerated() {
+            let directory = try makeDirectory(in: root, name: "state-\(index)", mode: 0o700)
+            let saved = DisplayModePreferences(defaults: defaults, protectionDefaults: protection)
+            try saved.select(mode)
+            try saved.setExternalHandoffRequested(mode == .internalOnly)
+            let preferences = try recoveryBatchLaunchPreferences(for: directory, defaults: defaults, protectionDefaults: protection)
+            XCTAssertEqual(preferences.selectedMode, .externalOnly)
+            var factoryCalls = 0
+            let coordinator = try DisplayModeCoordinator(
+                directory: directory, preferences: preferences,
+                inputSettings: ExternalDisplayInputSettings(defaults: defaults)
+            ) { _, _, _ in
+                factoryCalls += 1
+                throw RecoveryStoreError.ioFailure
+            }
+            coordinator.startApplication(registerEvents: false, recoveryOnly: false) { _ in }
+            XCTAssertEqual(coordinator.selectedMode, .externalOnly)
+            XCTAssertTrue(coordinator.requiresExplicitActivation)
+            XCTAssertEqual(factoryCalls, 0)
+        }
+    }
+
+    @MainActor
+    func testRecoveryBatchRejectsProtectionLockAndExistingResponsibilities() throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let suite = "ExtilumeBatchTests.\(UUID().uuidString)"
+        let protectionSuite = "ExtilumeProtectionTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        let protection = try XCTUnwrap(UserDefaults(suiteName: protectionSuite))
+        defer {
+            defaults.removePersistentDomain(forName: suite)
+            protection.removePersistentDomain(forName: protectionSuite)
+        }
+        let lockKey = "internalControlFailure.v1"
+        protection.set(true, forKey: lockKey)
+        XCTAssertThrowsError(try recoveryBatchLaunchPreferences(for: root, defaults: defaults, protectionDefaults: protection))
+        XCTAssertEqual(protection.object(forKey: lockKey) as? Bool, true)
+        protection.removeObject(forKey: lockKey)
+
+        for name in ["recovery-record.json", "internal-session"] {
+            let directory = try makeDirectory(in: root, name: "case-\(name)", mode: 0o700)
+            let existing = directory.appendingPathComponent(name)
+            let contents = Data("existing".utf8)
+            if name == "internal-session" {
+                try FileManager.default.createDirectory(at: existing, withIntermediateDirectories: false)
+            }
+            let sentinel = name == "internal-session" ? existing.appendingPathComponent("keep") : existing
+            try contents.write(to: sentinel)
+            XCTAssertThrowsError(try recoveryBatchLaunchPreferences(for: directory, defaults: defaults, protectionDefaults: protection))
+            XCTAssertEqual(try Data(contentsOf: sentinel), contents)
+        }
+    }
+
+    @MainActor
+    func testAutomaticStartCanBeDisabledEvenForSavedPrimaryMode() throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let suite = "ExtilumeBatchTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let preferences = DisplayModePreferences(defaults: defaults)
+        try preferences.select(.externalPrimary)
+        var starts = 0
+        let coordinator = try DisplayModeCoordinator(directory: root, preferences: preferences,
+            allowsAutomaticStart: false, inputSettings: ExternalDisplayInputSettings(defaults: defaults)) { _, _, _ in
+                starts += 1
+                throw RecoveryStoreError.ioFailure
+            }
+        coordinator.startApplication(registerEvents: false, recoveryOnly: false) { _ in }
+        XCTAssertEqual(starts, 0)
+    }
+
     func testExplicitDirectorySkipsSupportLookupAndCreation() throws {
         let root = try makeTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }

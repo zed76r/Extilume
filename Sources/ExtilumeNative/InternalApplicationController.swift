@@ -13,6 +13,7 @@ final class InternalApplicationController: PrimaryApplicationControlling {
     private let processFactory: InternalApplicationProcessFactory
     private let restorationVerifier: InternalApplicationRestorationVerifier
     private let now: @Sendable () throws -> UInt64
+    private let restorationReceipt: ((RecoveryRecord, InternalApplicationExpectation) throws -> Void)?
     var persistFailureForExit: (@MainActor () -> Bool)?
     private var statusHandler: (@Sendable (PrimarySessionStatus) -> Void)?
     private var quitCompletion: (@Sendable (Bool) -> Void)?
@@ -49,13 +50,15 @@ final class InternalApplicationController: PrimaryApplicationControlling {
         restorationVerifier: @escaping InternalApplicationRestorationVerifier = {
             try verifyInternalApplicationRestoration(directory: $0, expectation: $1, requiresGuardProof: $2, expectedRecord: $3)
         },
-        now: @escaping @Sendable () throws -> UInt64 = ContinuousClock.nanoseconds
+        now: @escaping @Sendable () throws -> UInt64 = ContinuousClock.nanoseconds,
+        restorationReceipt: ((RecoveryRecord, InternalApplicationExpectation) throws -> Void)? = nil
     ) throws {
         _ = try RecoveryStore(directory: directory)
         self.directory = directory
         self.processFactory = processFactory
         self.restorationVerifier = restorationVerifier
         self.now = now
+        self.restorationReceipt = restorationReceipt
     }
 
     func startApplication(
@@ -517,7 +520,19 @@ final class InternalApplicationController: PrimaryApplicationControlling {
         let store = try RecoveryStore(directory: directory)
         try store.acquireExclusiveOwnership()
         guard try store.load() == record, quitIsCurrent(request) else { throw RecoveryError.unfinishedTransaction }
+        if record != nil, restorationReceipt != nil {
+            guard let record, let expected, workerExited,
+                  helperExited || (recoveryOnly && helperPID == nil && orderlyFinished), channelDrained,
+                  orderlyFinished || finalization.stoppedNormally, !transportFailed,
+                  expected.matchesRestoredRecord(record), record.independentGuardVerified == true,
+                  quitIsCurrent(request) else { throw RecoveryError.unfinishedTransaction }
+        }
         if record != nil { try store.clear() }
+        if let restorationReceipt, let record, let expected {
+            guard try store.load() == nil, quitIsCurrent(request) else { throw RecoveryError.unfinishedTransaction }
+            try restorationReceipt(record, expected)
+            guard quitIsCurrent(request) else { throw RecoveryError.unfinishedTransaction }
+        }
         if verifiedExitRecord != nil { print("故障门禁保持；只读终验完成，允许结束本次退出。") }
     }
 

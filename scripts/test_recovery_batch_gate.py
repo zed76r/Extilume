@@ -1,8 +1,11 @@
 import importlib.util
+import io
 import json
 import os
 import subprocess
 import sys
+import time
+from types import SimpleNamespace
 from unittest.mock import patch
 from pathlib import Path
 import tempfile
@@ -32,6 +35,261 @@ class BatchGateTests(unittest.TestCase):
 
     def events(self):
         return [json.loads(x) for x in (self.root/(self.candidate+'.jsonl')).read_text().splitlines()]
+
+    def launch_fixture(self):
+        self.gate.roles.clear()
+        state = self.root/'state'
+        state.mkdir(mode=0o700)
+        reader, writer = os.pipe()
+        process = SimpleNamespace(pid=10, stdout=os.fdopen(reader, 'rb'), fixture_writer=writer)
+        def cleanup():
+            if process.fixture_writer is not None:
+                os.close(process.fixture_writer)
+            if self.gate.stream:
+                self.gate.stream.thread.join(timeout=1)
+            self.gate.close()
+            process.stdout.close()
+        self.addCleanup(cleanup)
+        def spawn(args, **kwargs):
+            self.assertEqual(args, [str(self.exe), '--recovery-batch', '--state-directory', str(state)])
+            self.assertEqual(kwargs['stdout'], subprocess.PIPE)
+            self.assertEqual(kwargs['stderr'], subprocess.DEVNULL)
+            self.assertTrue(kwargs['start_new_session'])
+            self.assertEqual(Path(kwargs['env']['EXTILUME_RECOVERY_BATCH_DIRECTORY']), self.gate.native_budget_directory)
+            self.assertEqual(self.events()[-1]['event'], 'consume-before-application-launch')
+            return process
+        self.gate.launch_application(state, str(uuid.uuid4()), spawn)
+        return process
+
+    def register_fixture(self, role, pid):
+        value = {key: self.processes[pid][key] for key in ('pid', 'startSeconds', 'startMicroseconds')}
+        G.D.save_new(self.gate.native_budget_directory/(role+'-process.json'), value)
+
+    def test_launch_binds_own_pipe_and_waits_for_native_registration_and_standby(self):
+        process = self.launch_fixture()
+        self.assertIs(self.gate.application_process, process)
+        self.assertEqual(self.gate.roles['app']['pid'], 10)
+        self.register_fixture('app', 10)
+        calls = []
+        def run(args, **kwargs):
+            calls.append(args)
+            self.assertEqual(args[1:3], ['--control', 'status'])
+            self.assertNotIn('--allow-display-write', args)
+            return SimpleNamespace(returncode=0, stdout=json.dumps(dict(result='status', sessionState={'waiting': {}},
+                selectedMode='externalOnly', stateMode='externalOnly', requiresExplicitActivation=True)).encode())
+        self.gate.wait_for_standby(wait=lambda: self.fail('already ready'), run=run)
+        self.assertEqual(len(calls), 1)
+        self.assertFalse((self.gate.native_budget_directory/'initial-authorized.json').exists())
+
+    def test_native_owner_registration_requires_parent_and_start_identity(self):
+        self.launch_fixture()
+        self.register_fixture('owner', 11)
+        self.gate.bind_registered_process('owner')
+        self.register_fixture('helper', 12)
+        self.processes[12]['startMicroseconds'] += 1
+        with self.assertRaisesRegex(RuntimeError, 'stale-process-registration'):
+            self.gate.bind_registered_process('helper')
+        self.assertNotIn('helper', self.gate.roles)
+
+    def test_existing_state_blocks_launch_before_spawn(self):
+        self.gate.roles.clear()
+        state = self.root/'state'
+        state.mkdir(mode=0o700)
+        (state/'keep').write_text('keep')
+        with self.assertRaisesRegex(RuntimeError, 'batch-state-not-empty'):
+            self.gate.launch_application(state, str(uuid.uuid4()), lambda *a, **k: self.fail('must not launch'))
+        self.assertIsNone(self.gate.application_process)
+        self.assertEqual((state/'keep').read_text(), 'keep')
+
+    def test_launch_failure_is_consumed_and_not_retried(self):
+        self.gate.roles.clear()
+        state = self.root/'state'
+        state.mkdir(mode=0o700)
+        with self.assertRaises(OSError):
+            self.gate.launch_application(state, str(uuid.uuid4()), lambda *a, **k: (_ for _ in ()).throw(OSError()))
+        with self.assertRaisesRegex(RuntimeError, 'batch-stopped'):
+            self.gate.launch_application(state, str(uuid.uuid4()), lambda *a, **k: self.fail('must not retry'))
+        self.assertEqual(sum(x['event']=='consume-before-application-launch' for x in self.events()), 1)
+
+    def test_confirmation_and_quit_use_consumed_action_transport(self):
+        calls = []
+        for action in G.ACTIONS:
+            def send():
+                if action == 'confirm-user':
+                    self.gate.configuration_visual_at = self.time
+                if action not in ('confirm-user', 'stop'):
+                    return True
+                def run(args, **kwargs):
+                    calls.append(args[2])
+                    self.assertIn('--allow-display-write', args)
+                    return SimpleNamespace(returncode=0, stdout=b'{"result":"accepted"}')
+                return self.gate.control_application(action, run)['result'] == 'accepted'
+            self.gate.request(action, send, lambda: True)
+        self.assertEqual(calls, ['confirm-configuration', 'quit'])
+
+    def dialog_fixture(self, answer=b'normal', wait=False):
+        process = SimpleNamespace(returncode=0, stdout=io.BytesIO(answer))
+        process.poll = lambda: None if wait else 0
+        process.communicate = lambda **kwargs: (answer, None)
+        process.terminate = lambda: setattr(process, 'poll', lambda: 0)
+        process.wait = lambda **kwargs: 0
+        return process
+
+    def test_confirmation_requires_current_human_answer_and_is_once_only(self):
+        for action in ('start', 'restore'):
+            self.gate.request(action, lambda: True, lambda: True)
+        process = self.dialog_fixture()
+        self.assertTrue(self.gate.confirm_configuration_visual(spawn=lambda *a, **k: process))
+        self.assertTrue(process.stdout.closed)
+        self.assertEqual(self.gate.configuration_visual_at, self.time)
+        with self.assertRaisesRegex(RuntimeError, 'visual-confirmation-order'):
+            self.gate.confirm_configuration_visual(spawn=lambda *a, **k: self.fail('must not repeat'))
+
+    def test_abnormal_confirmation_stops_before_saving_layout(self):
+        for action in ('start', 'restore'):
+            self.gate.request(action, lambda: True, lambda: True)
+        with self.assertRaisesRegex(RuntimeError, 'configuration-not-visually-confirmed'):
+            self.gate.confirm_configuration_visual(spawn=lambda *a, **k: self.dialog_fixture(b'abnormal'))
+        self.assertIsNone(self.gate.configuration_visual_at)
+        with self.assertRaisesRegex(RuntimeError, 'batch-stopped'):
+            self.gate.request('confirm-user', lambda: self.fail('must not send'), lambda: True)
+
+    def test_dialog_timeout_reaps_only_dialog_and_never_grants_confirmation(self):
+        for action in ('start', 'restore'):
+            self.gate.request(action, lambda: True, lambda: True)
+        process = self.dialog_fixture(wait=True)
+        def wait():
+            self.time = self.gate.deadline
+        with self.assertRaisesRegex(RuntimeError, 'batch-deadline'):
+            self.gate.confirm_configuration_visual(spawn=lambda *a, **k: process, wait=wait)
+        self.assertEqual(process.poll(), 0)
+        self.assertTrue(process.stdout.closed)
+        self.assertIsNone(self.gate.configuration_visual_at)
+
+    def test_quit_reply_allows_app_exit_before_independent_verifier(self):
+        for action in G.ACTIONS[:-1]:
+            self.gate.request(action, lambda: True, lambda: True)
+        def send():
+            def run(*args, **kwargs):
+                del self.processes[10]
+                return SimpleNamespace(returncode=0, stdout=b'{"result":"accepted"}')
+            return self.gate.control_application('stop', run)['result'] == 'accepted'
+        verified = []
+        self.gate.request('stop', send, lambda: verified.append(True) or True)
+        self.assertEqual(verified, [True])
+
+    def test_bound_launch_control_confirmation_and_exit_share_one_pipe_and_budget(self):
+        process = self.launch_fixture()
+        self.register_fixture('app', 10)
+        phase = 'standby'
+        def emit(stages):
+            events = []
+            for stage in stages:
+                self.time += 1
+                event = dict(type='internal-lifecycle', role='controller', clock='mach_continuous_time/ns',
+                             continuousNs=self.time, stage=stage, succeeded=True)
+                if stage.startswith('disable'):
+                    event['operation'] = 'disable'
+                events.append(event)
+            os.write(process.fixture_writer, b''.join((json.dumps(event)+'\n').encode() for event in events))
+            deadline = time.monotonic()+1
+            while time.monotonic() < deadline:
+                with self.gate.stream.lock:
+                    if len(self.gate.stream.pending) >= len(events):
+                        return
+                time.sleep(.001)
+            self.fail('fixture pipe did not drain')
+        def run(args, **kwargs):
+            if args[2] == 'status':
+                if phase == 'standby':
+                    reply = dict(result='status', sessionState={'waiting': {}}, selectedMode='externalOnly',
+                                 stateMode='externalOnly', requiresExplicitActivation=True)
+                else:
+                    reply, _ = application_evidence(phase)
+                return SimpleNamespace(returncode=0, stdout=json.dumps(reply).encode())
+            if phase == 'start':
+                for role, pid in (('owner', 11), ('helper', 12)):
+                    self.register_fixture(role, pid)
+                    self.gate.bind_registered_process(role)
+                emit(('disableStarted', 'disableFinished'))
+            elif phase == 'restore':
+                emit(('restorationStarted', 'restorationVerified', 'pauseVerificationStarted', 'pauseVerificationFinished'))
+            elif phase == 'confirm-user':
+                emit(('configurationConfirmationStarted', 'configurationConfirmationFinished'))
+            elif phase == 'stop':
+                self.processes.clear()
+                os.close(process.fixture_writer)
+                process.fixture_writer = None
+                self.gate.stream.thread.join(timeout=1)
+            return SimpleNamespace(returncode=0, stdout=b'{"result":"accepted"}')
+        self.gate.wait_for_standby(run=run)
+        for phase in G.ACTIONS:
+            if phase == 'confirm-user':
+                self.gate.confirm_configuration_visual(spawn=lambda *a, **k: self.dialog_fixture())
+            def send():
+                if phase == 'sleep':
+                    emit(('sleepRequested', 'systemHasPoweredOn', 'disableStarted', 'disableFinished'))
+                    return True
+                return self.gate.control_application(phase, run)['result'] == 'accepted'
+            def verify():
+                if phase == 'stop':
+                    return not self.processes and self.gate.stream.eof
+                if phase == 'sleep':
+                    return self.gate.wake is not None and self.gate.native_disable_count == 2
+                return self.gate.verify_application(phase, self.gate.control_application('status', run))
+            self.gate.request(phase, send, verify)
+        self.assertEqual(self.gate.confirmed_requests, 5)
+        self.assertEqual(self.gate.native_disable_count, 2)
+        self.assertFalse(self.gate.native_disable_pending)
+        self.gate.close()
+        self.assertIsNone(self.gate.stream.fd)
+
+    def test_native_budget_is_bound_to_original_window_and_stop_is_durable(self):
+        self.gate.roles.clear()
+        boot = str(uuid.uuid4())
+        environment = self.gate.prepare_native_budget(boot)
+        directory = Path(environment['EXTILUME_RECOVERY_BATCH_DIRECTORY'])
+        self.assertEqual(directory.stat().st_mode & 0o777, 0o700)
+        policy = directory / 'policy.json'
+        self.assertEqual(policy.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(json.loads(policy.read_text()), dict(bootSession=boot, started=0, deadline=180*G.D.NS))
+        self.time = 180*G.D.NS
+        with self.assertRaisesRegex(RuntimeError, 'batch-deadline'):
+            self.gate.tick()
+        self.assertTrue((directory/'stopped').exists())
+
+    def test_native_permits_follow_durable_requests(self):
+        roles = dict(self.gate.roles)
+        self.gate.roles.clear()
+        self.gate.prepare_native_budget(str(uuid.uuid4()))
+        self.gate.roles = roles
+        directory = self.gate.native_budget_directory
+        self.assertFalse((directory/'initial-authorized.json').exists())
+        self.assertFalse((directory/'wake-authorized.json').exists())
+        for action in G.ACTIONS:
+            def send():
+                if action in ('start', 'sleep'):
+                    name = 'initial-authorized.json' if action == 'start' else 'wake-authorized.json'
+                    self.assertEqual(json.loads((directory/name).read_text()), self.gate.requested_at)
+                    self.assertEqual(self.events()[-1], dict(event='consume-before-request', action=action))
+                return True
+            self.gate.request(action, send, lambda: True)
+
+    def test_native_budget_cannot_be_reprepared_or_added_to_running_app(self):
+        with self.assertRaisesRegex(RuntimeError, 'native-budget-order'):
+            self.gate.prepare_native_budget(str(uuid.uuid4()))
+        self.assertIsNone(self.gate.native_budget_directory)
+
+    def test_native_budget_preparation_is_single_use_and_close_stops_native_attempts(self):
+        self.gate.roles.clear()
+        self.gate.prepare_native_budget(str(uuid.uuid4()))
+        directory = self.gate.native_budget_directory
+        original = (directory/'policy.json').read_bytes()
+        with self.assertRaisesRegex(RuntimeError, 'native-budget-order'):
+            self.gate.prepare_native_budget(str(uuid.uuid4()))
+        self.gate.close()
+        self.assertEqual((directory/'policy.json').read_bytes(), original)
+        self.assertTrue((directory/'stopped').exists())
 
     def test_full_sequence_consumes_before_every_dispatch(self):
         for action in G.ACTIONS:
@@ -179,6 +437,194 @@ class BatchGateTests(unittest.TestCase):
         self.assertEqual(set(self.gate.roles), set(G.ROLES))
         self.assertEqual(end['controllerCleanup'], 'requires-bound-safety-handoff')
 
+    def test_bound_control_adapter_dispatches_once_then_reads_status(self):
+        calls = []
+        reply, events = application_evidence('start')
+        self.time = 100
+        def run(args, **kwargs):
+            calls.append(args)
+            self.assertEqual(args[0], str(self.exe))
+            self.assertEqual(args[-2:], ['--target-process', '10:10:1'])
+            self.assertLessEqual(kwargs['timeout'], 10)
+            self.assertTrue(kwargs['capture_output'])
+            if args[2] == 'status':
+                self.assertNotIn('--allow-display-write', args)
+                return subprocess.CompletedProcess(args, 0, json.dumps(reply).encode())
+            self.assertEqual(args[2:4], ['apply-externalOnly', '--allow-display-write'])
+            return subprocess.CompletedProcess(args, 0, b'{"result":"accepted"}')
+        def verify():
+            self.time = 200
+            return self.gate.verify_application('start', self.gate.control_application('status', run), events)
+        self.gate.request('start', lambda: self.gate.control_application('start', run)['result'] == 'accepted', verify)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(self.gate.confirmed_requests, 1)
+
+    def test_bound_control_cannot_run_outside_consumed_request(self):
+        with self.assertRaisesRegex(RuntimeError, 'control-outside-request'):
+            self.gate.control_application('start', lambda *a, **k: self.fail('must not dispatch'))
+
+    def test_control_timeout_is_unconfirmed_and_never_retried(self):
+        calls = []
+        def run(args, **kwargs):
+            calls.append(args)
+            raise subprocess.TimeoutExpired(args, 1, output=b'PRIVATE_OUTPUT', stderr=b'PRIVATE_ERROR')
+        with self.assertRaisesRegex(RuntimeError, '^application-control-unconfirmed$'):
+            self.gate.request('start', lambda: self.gate.control_application('start', run), lambda: True)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(self.gate.next_action, 1)
+        self.assertEqual(self.gate.confirmed_requests, 0)
+        self.assertTrue(self.gate.stopped)
+
+    def test_wrong_target_reply_is_not_accepted(self):
+        def run(args, **kwargs):
+            return subprocess.CompletedProcess(args, 0, b'{"result":"target-mismatch"}')
+        with self.assertRaisesRegex(RuntimeError, 'application-control-unconfirmed'):
+            self.gate.request('start', lambda: self.gate.control_application('start', run), lambda: True)
+        self.assertEqual(self.gate.confirmed_requests, 0)
+
+    def test_two_control_calls_cannot_reuse_one_request_budget(self):
+        calls = []
+        def run(args, **kwargs):
+            calls.append(args)
+            self.assertEqual(self.events()[-1], dict(event='control-dispatch', action='start'))
+            return subprocess.CompletedProcess(args, 0, b'{"result":"accepted"}')
+        def send():
+            self.gate.control_application('start', run)
+            self.gate.control_application('start', run)
+            return True
+        with self.assertRaisesRegex(RuntimeError, 'control-already-dispatched'):
+            self.gate.request('start', send, lambda: True)
+        self.assertEqual(len(calls), 1)
+
+    def test_verification_cannot_issue_another_write(self):
+        with self.assertRaisesRegex(RuntimeError, 'control-outside-request'):
+            self.gate.request('start', lambda: True,
+                lambda: self.gate.control_application('start', lambda *a, **k: self.fail('must not dispatch')))
+
+    def install_event_queue(self):
+        queue = []
+        def take():
+            events = queue[:]
+            queue.clear()
+            return events, False, None
+        self.gate.stream = SimpleNamespace(take=take, close=lambda: None)
+        return queue
+
+    def test_collected_events_supply_completion_without_caller_override(self):
+        queue = self.install_event_queue()
+        reply, events = application_evidence('start')
+        self.time = 100
+        def send():
+            self.time = 200
+            queue.extend(events)
+            return True
+        self.gate.request('start', send, lambda: self.gate.verify_application('start', reply))
+        self.assertEqual(self.gate.native_disable_count, 1)
+        self.assertFalse(self.gate.native_disable_pending)
+
+    def test_unfinished_native_disable_cannot_complete_even_if_verifier_returns_true(self):
+        queue = self.install_event_queue()
+        self.time = 100
+        def send():
+            self.time = 200
+            queue.append(application_evidence('start')[1][0])
+            return True
+        with self.assertRaisesRegex(RuntimeError, 'native-disable-incomplete'):
+            self.gate.request('start', send, lambda: True)
+        self.assertTrue(self.gate.native_disable_pending)
+        self.assertEqual(self.gate.confirmed_requests, 0)
+
+    def test_third_disable_is_recorded_then_stops_batch(self):
+        queue = self.install_event_queue()
+        self.time = 100
+        def initial_send():
+            self.time = 200
+            queue.extend(application_evidence('start')[1])
+            return True
+        self.gate.request('start', initial_send, lambda: True)
+        for action in ('restore', 'confirm-user'):
+            self.gate.request(action, lambda: True, lambda: True)
+        def verify_sleep():
+            self.time = 300
+            self.gate.observe_wake(300)
+            self.time = 400
+            queue.extend(dict(event, continuousNs=310+i) for i,event in enumerate(application_evidence('start')[1]))
+            return True
+        self.gate.request('sleep', lambda: True, verify_sleep)
+        self.assertEqual(self.gate.native_disable_count, 2)
+        queue.append(dict(application_evidence('start')[1][0], continuousNs=350))
+        with self.assertRaisesRegex(RuntimeError, 'native-disable-outside-budget'): self.gate.tick()
+        self.assertTrue(self.gate.stopped)
+        self.assertEqual(self.gate.native_disable_count, 3)
+        self.assertTrue(self.gate.native_disable_pending)
+        self.assertEqual(self.events()[-1], dict(event='native-disable-observed', count=3))
+
+    def test_unexpected_eof_stops_before_any_dispatch(self):
+        self.gate.stream = SimpleNamespace(take=lambda: ([], True, None), close=lambda: None)
+        with self.assertRaisesRegex(RuntimeError, 'lifecycle-unexpected-eof'):
+            self.gate.request('start', lambda: self.fail('must not dispatch'), lambda: True)
+
+    def test_native_wake_precedes_automatic_reapplication_in_same_drain(self):
+        queue = self.install_event_queue()
+        self.time = 100
+        def initial_send():
+            self.time = 200
+            queue.extend(application_evidence('start')[1])
+            return True
+        self.gate.request('start', initial_send, lambda: True)
+        for action in ('restore', 'confirm-user'):
+            self.gate.request(action, lambda: True, lambda: True)
+        def send_sleep():
+            self.time = 400
+            queue.append(dict(application_evidence('start')[1][0], stage='systemHasPoweredOn', continuousNs=300))
+            queue.extend(dict(event, continuousNs=310+i) for i,event in enumerate(application_evidence('start')[1]))
+            return True
+        self.gate.request('sleep', send_sleep, lambda: True)
+        self.assertEqual(self.gate.wake, 300)
+        self.assertEqual(self.gate.deadline, 300 + 10 * G.D.NS)
+        self.assertEqual(self.gate.native_disable_count, 2)
+
+    def test_live_completion_rejects_caller_supplied_event_list(self):
+        queue = self.install_event_queue()
+        reply, events = application_evidence('start')
+        self.time = 100
+        def send():
+            self.time = 200
+            queue.extend(events)
+            return True
+        with self.assertRaisesRegex(RuntimeError, 'lifecycle-input-override'):
+            self.gate.request('start', send, lambda: self.gate.verify_application('start', reply, events))
+
+    def test_unknown_stage_is_not_persisted(self):
+        queue = self.install_event_queue()
+        self.time = 200
+        queue.append(dict(application_evidence('start')[1][0], stage='PRIVATE_CANARY'))
+        with self.assertRaisesRegex(RuntimeError, 'invalid-lifecycle-event'): self.gate.tick()
+        self.assertNotIn('PRIVATE_CANARY', json.dumps(self.events()))
+
+    def test_standalone_tick_timeout_latches_stop(self):
+        self.time = 180 * G.D.NS
+        with self.assertRaisesRegex(RuntimeError, 'batch-deadline'): self.gate.tick()
+        self.assertTrue(self.gate.stopped)
+
+    def test_gate_close_keeps_active_pipe_draining_until_eof(self):
+        read, write = os.pipe()
+        reader, writer = os.fdopen(read, 'rb', buffering=0), os.fdopen(write, 'wb', buffering=0)
+        self.addCleanup(reader.close)
+        self.addCleanup(writer.close)
+        self.gate.attach_stream(reader.fileno())
+        collector = self.gate.stream
+        self.addCleanup(collector.close)
+        self.gate.close()
+        self.assertEqual(self.events()[-1]['readerCleanup'], 'retained-until-eof')
+        self.assertTrue(collector.thread.is_alive())
+        writer.write(b'recovery output still drains\n')
+        writer.close()
+        collector.thread.join(timeout=2)
+        self.assertFalse(collector.thread.is_alive())
+        self.gate.close()
+        self.assertIsNone(collector.fd)
+
     def test_close_is_idempotent_and_does_not_dispatch_cleanup(self):
         self.gate.close();self.gate.close()
         self.assertEqual(self.events()[-1]['controllerCleanup'],'requires-bound-safety-handoff')
@@ -250,6 +696,16 @@ class ApplicationCheckpointTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, 'completion-event-order'):
             self.assess('start', reply, events)
 
+    def test_disable_transaction_begin_is_not_a_restoration(self):
+        reply, events = application_evidence('start')
+        begin = dict(events[0], stage='enableBeginStarted', operation='disable')
+        events.insert(1, begin)
+        self.assertTrue(self.assess('start', reply, events))
+        for operation in ('enable', None):
+            begin['operation'] = operation
+            with self.assertRaisesRegex(RuntimeError, 'unexpected-restoration'):
+                self.assess('start', reply, events)
+
     def test_restore_rejects_any_new_disable(self):
         reply, events = application_evidence('restore')
         events.append(dict(events[-1], stage='disableStarted', continuousNs=150))
@@ -257,13 +713,119 @@ class ApplicationCheckpointTests(unittest.TestCase):
             self.assess('restore', reply, events)
 
     def test_human_confirmation_sleep_and_exit_need_separate_proof(self):
-        for action in ('confirm-user', 'sleep', 'stop'):
+        for action in ('sleep', 'stop'):
             with self.assertRaisesRegex(RuntimeError, 'unsupported-application-checkpoint'):
                 self.assess(action, *application_evidence('start'))
+
+    def test_configuration_needs_new_successful_markers_not_prior_manual_state(self):
+        reply, _ = application_evidence('restore')
+        events = [dict(type='internal-lifecycle', role='controller', clock='mach_continuous_time/ns',
+                       continuousNs=110+i, stage=stage, succeeded=True)
+                  for i, stage in enumerate(('configurationConfirmationStarted', 'configurationConfirmationFinished'))]
+        self.assertTrue(G.application_checkpoint('confirm-user', reply, events, 100, 200, 300))
+        for incomplete in ([], events[:1], [dict(events[0], continuousNs=90), events[1]],
+                           [events[0], dict(events[1], succeeded=False)]):
+            with self.assertRaises(RuntimeError):
+                G.application_checkpoint('confirm-user', reply, incomplete, 100, 200, 300)
 
     def test_deadline_cannot_be_used_as_a_success_endpoint(self):
         with self.assertRaisesRegex(RuntimeError, 'invalid-completion-window'):
             G.application_checkpoint('start', *application_evidence('start'), 100, 300, 300)
+
+
+class LifecyclePipeTests(unittest.TestCase):
+    def pipe(self):
+        read, write = os.pipe()
+        reader, writer = os.fdopen(read, 'rb', buffering=0), os.fdopen(write, 'wb', buffering=0)
+        self.addCleanup(reader.close)
+        self.addCleanup(writer.close)
+        collector = G.LifecyclePipe(reader.fileno())
+        self.addCleanup(collector.close)
+        return reader, writer, collector
+
+    def collect(self, collector, count=0, eof=False):
+        events = []
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            batch, ended, error = collector.take()
+            events.extend(batch)
+            if error or (ended if eof else len(events) >= count):
+                return events, ended, error
+            time.sleep(0.005)
+        self.fail('collector did not deliver bounded input')
+
+    def test_fragmented_json_and_non_json_output(self):
+        _, writer, collector = self.pipe()
+        event = application_evidence('start')[1][0]
+        payload = json.dumps(event).encode() + b'\n'
+        writer.write(b'ordinary diagnostic\n' + payload[:20])
+        writer.write(payload[20:])
+        events, _, error = self.collect(collector, count=1)
+        self.assertEqual(events, [event])
+        self.assertIsNone(error)
+
+    def test_truncated_eof_is_not_complete(self):
+        _, writer, collector = self.pipe()
+        writer.write(b'{"type":"internal-lifecycle"')
+        writer.close()
+        _, ended, error = self.collect(collector, eof=True)
+        self.assertTrue(ended)
+        self.assertEqual(error, 'lifecycle-truncated')
+
+    def test_malformed_line_fails_without_exporting_content(self):
+        _, writer, collector = self.pipe()
+        writer.write(b'{PRIVATE_CANARY}\n')
+        _, _, error = self.collect(collector, eof=True)
+        self.assertEqual(error, 'lifecycle-reader-failed')
+
+    def test_oversized_line_is_bounded(self):
+        _, writer, collector = self.pipe()
+        writer.write(b'x' * 8193 + b'\n')
+        _, _, error = self.collect(collector, eof=True)
+        self.assertEqual(error, 'lifecycle-reader-failed')
+
+    def test_complete_eof_retains_last_event(self):
+        _, writer, collector = self.pipe()
+        event = application_evidence('start')[1][0]
+        writer.write(json.dumps(event).encode() + b'\n')
+        writer.close()
+        events, ended, error = self.collect(collector, eof=True)
+        self.assertEqual(events, [event])
+        self.assertTrue(ended)
+        self.assertIsNone(error)
+
+    def test_close_releases_only_owned_descriptor(self):
+        reader, writer, collector = self.pipe()
+        collector.close()
+        collector.close()
+        self.assertFalse(collector.thread.is_alive())
+        writer.write(b'x')
+        self.assertEqual(os.read(reader.fileno(), 1), b'x')
+
+    def test_pending_event_queue_is_bounded_and_keeps_existing_evidence(self):
+        _, writer, collector = self.pipe()
+        line = json.dumps(application_evidence('start')[1][0]).encode() + b'\n'
+        writer.write(line * 4097)
+        # Reading the queue early frees capacity and defeats the overflow this test intends to create.
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            with collector.lock:
+                if collector.error is not None:
+                    break
+            time.sleep(.001)
+        events, _, error = self.collect(collector, eof=True)
+        self.assertEqual(len(events), 4096)
+        self.assertEqual(error, 'lifecycle-reader-failed')
+
+    def test_write_end_is_rejected_before_starting_reader(self):
+        _, writer, _ = self.pipe()
+        with self.assertRaisesRegex(RuntimeError, 'lifecycle-not-readable'):
+            G.LifecyclePipe(writer.fileno())
+
+    def test_regular_file_is_not_accepted_as_live_pipe(self):
+        with tempfile.TemporaryFile() as file:
+            with self.assertRaisesRegex(RuntimeError, 'lifecycle-not-pipe'):
+                G.LifecyclePipe(file.fileno())
 
 
 class KernelIdentityTests(unittest.TestCase):
@@ -311,8 +873,10 @@ class KernelIdentityTests(unittest.TestCase):
             self.assertEqual(first['uid'], os.getuid())
             self.assertEqual(Path(first['executable']).resolve(), Path('/bin/cat').resolve())
             self.assertEqual(G.read_process_identity(child.pid), first)
+            self.assertFalse(G.process_has_exited(first))
             child.stdin.close()
             child.wait(timeout=5)
+            self.assertTrue(G.process_has_exited(first))
             with self.assertRaisesRegex(RuntimeError, 'process-info-unavailable|process-exited-or-changed'):
                 G.read_process_identity(child.pid)
 

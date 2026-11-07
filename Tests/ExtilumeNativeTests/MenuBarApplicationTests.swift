@@ -5,6 +5,46 @@ import ExtilumeCore
 
 @MainActor
 final class MenuBarApplicationTests: XCTestCase {
+    func testAutomationConfigurationConfirmationUsesExistingBusyAndStateGuards() async throws {
+        let session = ModeSession()
+        session.selectedMode = .externalOnly
+        let delegate = MenuBarApplicationDelegate(controllerFactory: { session })
+        delegate.startSession()
+        XCTAssertEqual(delegate.automationReply(.init(action: "confirm-configuration", allowDisplayWrite: true)).result, "unavailable")
+        session.emit(.manualConfiguration)
+        await drainMainQueue()
+        XCTAssertEqual(delegate.automationReply(.init(action: "confirm-configuration")).result, "authorization-required")
+        XCTAssertEqual(session.confirmations, 0)
+        XCTAssertEqual(delegate.automationReply(.init(action: "confirm-configuration", allowDisplayWrite: true)).result, "accepted")
+        XCTAssertEqual(session.confirmations, 1)
+        XCTAssertEqual(delegate.automationReply(.init(action: "confirm-configuration", allowDisplayWrite: true)).result, "unavailable")
+        XCTAssertEqual(session.confirmations, 1)
+    }
+
+    func testAutomationQuitRequestsNormalTerminationOnlyAfterAuthorization() async throws {
+        let session = ModeSession()
+        var terminations = 0
+        let delegate = MenuBarApplicationDelegate(controllerFactory: { session }, requestTermination: { terminations += 1 })
+        delegate.startSession()
+        session.emit(.applied)
+        await drainMainQueue()
+        XCTAssertEqual(delegate.automationReply(.init(action: "quit")).result, "authorization-required")
+        XCTAssertEqual(terminations, 0)
+        XCTAssertEqual(delegate.automationReply(.init(action: "quit", allowDisplayWrite: true)).result, "accepted")
+        XCTAssertEqual(terminations, 1)
+    }
+
+    func testBatchReadinessFailureRequestsNormalTermination() {
+        let session = ModeSession()
+        var terminations = 0
+        let delegate = MenuBarApplicationDelegate(controllerFactory: { session },
+            batchReady: { throw ApplicationLaunchError.invalidArguments }, requestTermination: { terminations += 1 })
+        delegate.startSession()
+        XCTAssertEqual(session.starts.count, 1)
+        XCTAssertTrue(session.selections.isEmpty)
+        XCTAssertEqual(terminations, 1)
+    }
+
     func testAutomationStatusAndAuthorizationReuseMenuGuards() async throws {
         let session = ModeSession()
         let delegate = MenuBarApplicationDelegate(controllerFactory: { session })
@@ -27,6 +67,19 @@ final class MenuBarApplicationTests: XCTestCase {
         XCTAssertEqual(failed.sessionState, .recoveryIncomplete)
         XCTAssertEqual(failed.selectedMode, .externalOnly)
         XCTAssertEqual(failed.stateMode, .externalOnly)
+    }
+
+    func testAutomationReceiverRejectsTargetMismatchBeforeMutation() throws {
+        let session = ModeSession()
+        let delegate = MenuBarApplicationDelegate(controllerFactory: { session })
+        delegate.startSession()
+        let current = try ApplicationAutomationTarget.read(pid: ProcessInfo.processInfo.processIdentifier)
+        XCTAssertEqual(delegate.automationReply(.init(action: "status", target: current)).result, "status")
+        let stale = ApplicationAutomationTarget(pid: current.pid, startSeconds: current.startSeconds + 1,
+                                                startMicroseconds: current.startMicroseconds)
+        XCTAssertEqual(delegate.automationReply(.init(action: "apply-externalOnly", allowDisplayWrite: true, target: stale)).result,
+                       "target-mismatch")
+        XCTAssertTrue(session.selections.isEmpty)
     }
 
     func testAutomationInternalActionReflectsRestoreToggle() async throws {
@@ -84,7 +137,7 @@ final class MenuBarApplicationTests: XCTestCase {
 
     func testAutomationNeverConfirmsPhysicalConnection() async throws {
         let session = ConnectionSession()
-        let delegate = MenuBarApplicationDelegate(controllerFactory: { session })
+        let delegate = MenuBarApplicationDelegate(controllerFactory: { session }, lidIsOpen: { true })
         delegate.startSession()
         session.emit(.recoveryIncomplete)
         await drainMainQueue()
@@ -105,7 +158,10 @@ final class MenuBarApplicationTests: XCTestCase {
                 eventID: applicationAutomationCommand,
                 targetDescriptor: NSAppleEventDescriptor(processIdentifier: ProcessInfo.processInfo.processIdentifier),
                 returnID: AEReturnID(kAutoGenerateReturnID), transactionID: AETransactionID(kAnyTransactionID))
-            event.setParam(NSAppleEventDescriptor(string: "{\"action\":\"status\",\"allowDisplayWrite\":false}"), forKeyword: keyDirectObject)
+            let request = ApplicationAutomationRequest(action: "status",
+                target: try ApplicationAutomationTarget.read(pid: ProcessInfo.processInfo.processIdentifier))
+            let payload = String(decoding: try JSONEncoder().encode(request), as: UTF8.self)
+            event.setParam(NSAppleEventDescriptor(string: payload), forKeyword: keyDirectObject)
             return try event.sendEvent(options: [.waitForReply, .neverInteract], timeout: 3)
                 .paramDescriptor(forKeyword: keyDirectObject)?.stringValue
         }.value

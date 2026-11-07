@@ -11,6 +11,7 @@ final class DisplayModeCoordinator: PrimaryApplicationControlling, DisplayModeSe
     private let preferences: any DisplayModePreferenceStoring
     private let factory: ControllerFactory
     private let inputSettings: ExternalDisplayInputSettings
+    private let allowsAutomaticStart: Bool
     let availableModes: [DisplayApplicationMode]
     private var controller: (any PrimaryApplicationControlling)?
     private var activeMode: DisplayApplicationMode?
@@ -41,6 +42,7 @@ final class DisplayModeCoordinator: PrimaryApplicationControlling, DisplayModeSe
     }
 
     init(directory: URL, preferences: any DisplayModePreferenceStoring = DisplayModePreferences(),
+         allowsAutomaticStart: Bool = true,
          availableModes: [DisplayApplicationMode] = [.externalPrimary, .externalOnly],
          inputSettings: ExternalDisplayInputSettings = ExternalDisplayInputSettings(),
          factory: @escaping ControllerFactory = { mode, directory, store in
@@ -52,6 +54,7 @@ final class DisplayModeCoordinator: PrimaryApplicationControlling, DisplayModeSe
          }) throws {
         self.directory = directory
         self.preferences = preferences
+        self.allowsAutomaticStart = allowsAutomaticStart
         self.availableModes = availableModes
         self.inputSettings = inputSettings
         self.factory = factory
@@ -98,6 +101,10 @@ final class DisplayModeCoordinator: PrimaryApplicationControlling, DisplayModeSe
         self.onStatus = onStatus
         self.registerEvents = registerEvents
         if conflictingResponsibilities { publish(.recoveryIncomplete); return }
+        if !allowsAutomaticStart {
+            publish(pendingStartupRecovery == nil ? .waiting : .recoveryIncomplete)
+            return
+        }
         if let pendingStartupRecovery {
             start(pendingStartupRecovery, recoveryOnly: true)
         } else if !recoveryOnly, selectedMode == .externalPrimary {

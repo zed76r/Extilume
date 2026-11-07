@@ -11,6 +11,7 @@ enum ApplicationLaunchError: Error, Equatable {
 struct ApplicationLaunchOptions: Equatable {
     let stateDirectory: URL
     let verifiesExternalHandoff: Bool
+    var recoveryBatch: Bool = false
 }
 
 @MainActor
@@ -34,6 +35,12 @@ func applicationLaunchOptions(
     arguments: [String],
     applicationSupportDirectory: () throws -> URL
 ) throws -> ApplicationLaunchOptions {
+    if arguments.first == "--recovery-batch" {
+        guard arguments.count == 3, arguments[1] == "--state-directory",
+              arguments[2].hasPrefix("/") else { throw ApplicationLaunchError.invalidArguments }
+        return ApplicationLaunchOptions(stateDirectory: URL(fileURLWithPath: arguments[2], isDirectory: true),
+                                        verifiesExternalHandoff: false, recoveryBatch: true)
+    }
     if !arguments.isEmpty {
         if arguments.first == "--verify-external-handoff" {
             guard arguments.count == 4,
@@ -83,4 +90,17 @@ func externalHandoffLaunchPreferences(for directory: URL, protectionDefaults: Us
     // Carry directory-only failures forward so changing profiles cannot bypass them.
     if preferences.internalControlLocked { try preferences.lockInternalControl() }
     return (defaults, preferences)
+}
+
+@MainActor
+func recoveryBatchLaunchPreferences(for directory: URL, defaults: UserDefaults,
+                                    protectionDefaults: UserDefaults = .standard) throws -> DisplayModePreferences {
+    let state = try LayoutCloseoutDirectory(directory.path)
+    try state.requireAbsent("recovery-record.json")
+    try state.requireAbsent("internal-session")
+    let preferences = DisplayModePreferences(defaults: defaults, protectionDefaults: protectionDefaults)
+    guard !preferences.internalControlLocked else { throw ApplicationLaunchError.invalidArguments }
+    // External-only already waits for explicit activation; never start the saved automatic mode.
+    try preferences.select(.externalOnly)
+    return preferences
 }

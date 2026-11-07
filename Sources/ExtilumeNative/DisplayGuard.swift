@@ -114,6 +114,8 @@ final class GuardSession: @unchecked Sendable {
     private let store: RecoveryStore
     private let operation: GuardSessionOperation
     private let enableTransaction: DisplayEnableTransaction?
+    private let disableBatchBudget: InternalDisableBatchBudget?
+    private var batchWakeAt: UInt64?
     private let queue = DispatchQueue(label: "Extilume.guard-drill")
     private let queueKey = DispatchSpecificKey<Bool>()
     private var record: RecoveryRecord?
@@ -154,11 +156,13 @@ final class GuardSession: @unchecked Sendable {
         self.operation = operation
         self.applicationCallbacks = applicationCallbacks
         guard applicationCallbacks == nil || operation == .disableInternal else { throw GuardError.protectionLost }
+        disableBatchBudget = operation == .disableInternal ? try InternalDisableBatchBudget.configured() : nil
         enableTransaction = operation == .disableInternal ? try DisplayEnableTransaction() : nil
         store = try RecoveryStore(directory: directory)
         reapplication = PrimaryReapplicationScheduler(ownerQueue: queue)
         try store.acquireExclusiveOwnership()
         queue.setSpecific(key: queueKey, value: true)
+        if applicationCallbacks != nil { try disableBatchBudget?.registerProcess(role: "owner", pid: getpid()) }
     }
 
     deinit {
@@ -354,6 +358,7 @@ final class GuardSession: @unchecked Sendable {
             let parentChannel: GuardChannel = try {
                 let pair = try GuardChannel.pair()
                 child = try spawnProbe(["--display-guard", directory.path], channel: pair.1)
+                try disableBatchBudget?.registerProcess(role: "helper", pid: child)
                 applicationCallbacks?.helperStarted(child)
                 return pair.0
             }()
@@ -396,6 +401,7 @@ final class GuardSession: @unchecked Sendable {
         if let enableTransaction {
             guard let observer = connectionObserver else { throw GuardError.protectionLost }
             let sleepEpoch = authorizationLock.withLock { lifecycle.sleepEpoch }
+            try disableBatchBudget?.consume(wakeAt: authorizationLock.withLock { batchWakeAt })
             try translateProtectedInternalLayout(
                 record: durable, loadRecord: { try self.store.load() },
                 snapshotReader: { try self.readGuardSnapshot(durable) },
@@ -505,13 +511,16 @@ final class GuardSession: @unchecked Sendable {
                 self.pauseForConfiguration(forSleep: false)
             case "confirm-user" where self.operation == .disableInternal:
                 self.reapplication.cancel()
+                traceInternalLifecycle(.configurationConfirmationStarted)
                 do {
                     try self.confirmUserConfiguration()
                     if let record = self.record {
                         self.applicationCallbacks?.expectation(try InternalApplicationExpectation(record: record))
                     }
+                    traceInternalLifecycle(.configurationConfirmationFinished, succeeded: true)
                     self.applicationCallbacks?.status(.manualConfiguration)
                 } catch {
+                    traceInternalLifecycle(.configurationConfirmationFailed, succeeded: false, error: error)
                     self.applicationCallbacks?.status(.confirmationFailed)
                     print("用户配置未获确认；原基准及恢复责任保留。")
                 }
@@ -953,6 +962,7 @@ final class GuardSession: @unchecked Sendable {
         recoveryClock.start(at: timestamp)
         let wake = authorizationLock.withLock { () -> (UUID, Bool) in
             lifecycle.didWake()
+            if batchWakeAt == nil { batchWakeAt = timestamp ?? 0 }
             return (lifecycle.sleepEpoch, lifecycle.wakeRecoveryRequired && !lifecycle.sleeping &&
                     !lifecycle.faulted && !lifecycle.stopRequested)
         }

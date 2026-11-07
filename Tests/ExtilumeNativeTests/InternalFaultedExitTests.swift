@@ -92,6 +92,52 @@ private struct FaultedExitRun {
 
 @MainActor
 final class InternalFaultedExitTests: XCTestCase {
+    func testRecoveryOnlyQuitWithoutNewHelperCanPublishPreviouslyVerifiedRestoration() throws {
+        let directory = try makeDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let record = try restoredRecord(session: UUID())
+        try saveRecord(record, to: directory)
+        let recordURL = directory.appendingPathComponent("recovery-record.json")
+        let expectationURL = directory.appendingPathComponent("expectation.json")
+        let receiptURL = directory.appendingPathComponent("receipt.json")
+        try write(InternalApplicationEvent.expectation(InternalApplicationExpectation(record: record)), to: expectationURL)
+        let unused = directory.appendingPathComponent("unused").path
+        let results = FaultedExitResults()
+        let controller = try InternalApplicationController(directory: directory, processFactory: { _, channel in
+            try Self.spawnPeer(["recovery-only", unused, unused, recordURL.path, expectationURL.path,
+                unused, unused, unused, unused, unused, unused,
+                directory.appendingPathComponent("peer-exit").path, unused,
+                directory.appendingPathComponent("peer-diagnostic.json").path], channel: channel)
+        }, restorationVerifier: { directory, expectation, _, _ in
+            let loaded = try Self.loadRecord(from: directory)
+            guard let loaded, expectation?.matchesRestoredRecord(loaded) == true else {
+                throw RecoveryError.unfinishedTransaction
+            }
+            return loaded
+        }, restorationReceipt: { restored, expectation in
+            guard !FileManager.default.fileExists(atPath: recordURL.path),
+                  expectation.matchesRestoredRecord(restored) else { throw RecoveryError.unfinishedTransaction }
+            try JSONEncoder().encode(restored).write(to: receiptURL)
+        })
+        controller.quitApplication { results.complete($0) }
+        XCTAssertTrue(pump { results.completion != nil })
+        XCTAssertEqual(results.completion, true)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: recordURL.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: receiptURL.path))
+    }
+
+    func testNormalStoppedEventPublishesBatchReceiptAfterClearAndPeerExit() throws {
+        let run = try makeRun(secondPeer: .success, persistFailure: true, normalStop: true)
+        defer { try? FileManager.default.removeItem(at: run.directory) }
+        XCTAssertEqual(run.results.completion, true, diagnostics(run))
+        XCTAssertEqual(run.factoryState.calls, 1)
+        XCTAssertTrue(run.persistState.calls.isEmpty)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: run.recordURL.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: run.helperExitURL.path))
+        let bytes = try Data(contentsOf: run.directory.appendingPathComponent("batch-restoration.json"))
+        XCTAssertEqual(try JSONDecoder().decode(RecoveryRecord.self, from: bytes), run.restoredRecord)
+    }
+
     func testQuitAfterFaultAddsReadOnlyPeerAndClearsOnlyAfterExactProof() throws {
         let run = try makeRun(secondPeer: .success, persistFailure: true)
         defer { try? FileManager.default.removeItem(at: run.directory) }
@@ -102,6 +148,7 @@ final class InternalFaultedExitTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: run.faultPersistedURL.path))
         XCTAssertTrue(FileManager.default.fileExists(atPath: run.helperExitURL.path))
         XCTAssertFalse(FileManager.default.fileExists(atPath: run.recordURL.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: run.directory.appendingPathComponent("batch-restoration.json").path))
         XCTAssertEqual(try command(in: run.firstCommandURL, key: "initial"), .start(recoveryOnly: false))
         XCTAssertEqual(try command(in: run.firstCommandURL, key: "stop"), .stop)
         XCTAssertEqual(try command(in: run.secondCommandURL), .verifyRestored(run.restoredRecord))
@@ -196,7 +243,8 @@ final class InternalFaultedExitTests: XCTestCase {
         secondPeer: SecondPeerBehavior,
         persistFailure: Bool,
         advanceAfterFinalVerifier: Bool = false,
-        changeExpectationAfterFault: Bool = false
+        changeExpectationAfterFault: Bool = false,
+        normalStop: Bool = false
     ) throws -> FaultedExitRun {
         let directory = try makeDirectory()
         let recordURL = directory.appendingPathComponent("recovery-record.json")
@@ -231,7 +279,7 @@ final class InternalFaultedExitTests: XCTestCase {
         try write(InternalApplicationEvent.expectation(faultedMismatch), to: faultedMismatchExpectationEventURL)
         try write(InternalApplicationEvent.status(.applied), to: appliedEventURL)
         try write(InternalApplicationEvent.faulted, to: faultedEventURL)
-        try write(InternalApplicationEvent.stopped(faulted: true), to: stoppedEventURL)
+        try write(InternalApplicationEvent.stopped(faulted: !normalStop), to: stoppedEventURL)
 
         let results = FaultedExitResults()
         let factoryState = FaultedExitFactoryState()
@@ -242,6 +290,7 @@ final class InternalFaultedExitTests: XCTestCase {
             state: factoryState,
             behavior: secondPeer,
             changeExpectationAfterFault: changeExpectationAfterFault,
+            normalStop: normalStop,
             ownedURL: ownedURL,
             restoredURL: restoredURL,
             recordURL: recordURL,
@@ -274,7 +323,13 @@ final class InternalFaultedExitTests: XCTestCase {
             directory: directory,
             processFactory: factory,
             restorationVerifier: verifier,
-            now: { clock.now() }
+            now: { clock.now() },
+            restorationReceipt: { record, expected in
+                guard !FileManager.default.fileExists(atPath: recordURL.path),
+                      expected.matchesRestoredRecord(record),
+                      Self.allPeersReaped(factoryState.pids) else { throw RecoveryError.unfinishedTransaction }
+                try self.write(record, to: directory.appendingPathComponent("batch-restoration.json"))
+            }
         )
         let persist: @MainActor () -> Bool = {
             persistState.append(persistFailure)
@@ -340,6 +395,7 @@ final class InternalFaultedExitTests: XCTestCase {
         state: FaultedExitFactoryState,
         behavior: SecondPeerBehavior,
         changeExpectationAfterFault: Bool,
+        normalStop: Bool,
         ownedURL: URL,
         restoredURL: URL,
         recordURL: URL,
@@ -360,7 +416,7 @@ final class InternalFaultedExitTests: XCTestCase {
         { _, channel in
             let index = state.nextIndex()
             let scriptArguments = [
-                index == 0 ? (changeExpectationAfterFault ? "owner-changed" : "owner") : behavior.rawValue,
+                index == 0 ? (normalStop ? "owner-normal" : (changeExpectationAfterFault ? "owner-changed" : "owner")) : behavior.rawValue,
                 ownedURL.path,
                 restoredURL.path,
                 recordURL.path,
@@ -421,6 +477,13 @@ final class InternalFaultedExitTests: XCTestCase {
             note_step(step)
             send({'ready': {'_0': {'challenge': request['challenge'], 'workerPID': os.getpid(), 'workerUID': os.getuid(), 'version': 1}}})
             command = receive()
+            if mode == 'recovery-only':
+                assert command == {'start': {'recoveryOnly': True}}
+                send_file(expectation)
+                send({'status': {'_0': {'applicationFailedRestored': {}}}})
+                send({'finished': {}})
+                touch(peer_exit)
+                os._exit(0)
             if mode.startswith('owner'):
                 step = 'start-received'
                 note_step(step)
@@ -449,8 +512,9 @@ final class InternalFaultedExitTests: XCTestCase {
                 stop = receive()
                 with open(command_log, 'w') as output: json.dump({'initial': command, 'stop': stop}, output)
                 assert stop == {'stop': {}}
-                send_file(faulted)
-                assert receive() == {'stop': {}}
+                if mode != 'owner-normal':
+                    send_file(faulted)
+                    assert receive() == {'stop': {}}
                 step = 'faulted-acknowledged'
                 note_step(step)
                 if mode == 'owner-changed':

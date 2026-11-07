@@ -23,7 +23,22 @@ public func runMenuBarApplication() throws {
         )
     }
     let controller: DisplayModeCoordinator
-    if launchOptions.verifiesExternalHandoff {
+    let batch = try InternalDisableBatchBudget.configured()
+    guard (batch != nil) == launchOptions.recoveryBatch else { throw ApplicationLaunchError.invalidArguments }
+    if launchOptions.recoveryBatch {
+        guard let batch else { throw ApplicationLaunchError.invalidArguments }
+        guard let defaults = UserDefaults(suiteName: applicationPreferenceSuiteName(for: launchOptions.stateDirectory)) else {
+            throw ApplicationLaunchError.invalidArguments
+        }
+        let preferences = try recoveryBatchLaunchPreferences(for: launchOptions.stateDirectory, defaults: defaults)
+        controller = try DisplayModeCoordinator(directory: launchOptions.stateDirectory, preferences: preferences,
+                                               allowsAutomaticStart: false, availableModes: [.externalOnly],
+                                               factory: { _, directory, _ in
+            try InternalApplicationController(directory: directory, restorationReceipt: { record, expectation in
+                try batch.recordRestoration(record, expectation: expectation)
+            })
+        })
+    } else if launchOptions.verifiesExternalHandoff {
         let launchPreferences = try externalHandoffLaunchPreferences(for: launchOptions.stateDirectory)
         controller = try DisplayModeCoordinator(
             directory: launchOptions.stateDirectory,
@@ -35,7 +50,9 @@ public func runMenuBarApplication() throws {
         controller = try DisplayModeCoordinator(directory: launchOptions.stateDirectory)
     }
     let application = NSApplication.shared
-    let delegate = MenuBarApplicationDelegate(controllerFactory: { controller }, developmentBuild: true)
+    let delegate = MenuBarApplicationDelegate(controllerFactory: { controller },
+        batchReady: batch.map { budget in { try budget.registerProcess(role: "app", pid: getpid()) } },
+        developmentBuild: true)
     application.delegate = delegate
     application.setActivationPolicy(.accessory)
     withExtendedLifetime((delegate, applicationLease)) { application.run() }
@@ -46,6 +63,7 @@ final class MenuBarApplicationDelegate: NSObject, NSApplicationDelegate, NSMenuD
     let menu = NSMenu()
     private let controllerFactory: () throws -> any PrimaryApplicationControlling
     private let requestTermination: () -> Void
+    private let batchReady: (() throws -> Void)?
     private let replyTermination: (Bool) -> Void
     private let openSettings: (URL) -> Void
     private let lidIsOpen: () -> Bool
@@ -77,6 +95,7 @@ final class MenuBarApplicationDelegate: NSObject, NSApplicationDelegate, NSMenuD
 
     init(
         controllerFactory: @escaping () throws -> any PrimaryApplicationControlling,
+        batchReady: (() throws -> Void)? = nil,
         lidIsOpen: @escaping () -> Bool = { clamshellState() == "开盖" },
         developmentBuild: Bool = false,
         requestTermination: @escaping () -> Void = { NSApplication.shared.terminate(nil) },
@@ -95,6 +114,7 @@ final class MenuBarApplicationDelegate: NSObject, NSApplicationDelegate, NSMenuD
         }
     ) {
         self.controllerFactory = controllerFactory
+        self.batchReady = batchReady
         self.requestTermination = requestTermination
         self.replyTermination = replyTermination
         self.openSettings = openSettings
@@ -179,6 +199,8 @@ final class MenuBarApplicationDelegate: NSObject, NSApplicationDelegate, NSMenuD
 
     func startSession() {
         startController(recoveryOnly: false)
+        do { try batchReady?() }
+        catch { requestTermination() }
     }
 
     private func startController(recoveryOnly: Bool) {
@@ -687,7 +709,8 @@ extension MenuBarApplicationDelegate {
             items.append((action, item))
         }
         items += [("retry", retryItem), ("retry-recovery", recoverItem),
-                  ("restore-for-configuration", restoreForConfigurationItem)]
+                  ("restore-for-configuration", restoreForConfigurationItem),
+                  ("confirm-configuration", confirmItem), ("quit", quitItem)]
         return items.filter { !$0.1.isHidden && $0.1.isEnabled }
     }
 
@@ -698,6 +721,9 @@ extension MenuBarApplicationDelegate {
             ApplicationAutomationReply(result: result, status: stateItem.title, actions: automationItems.map(\.0),
                 sessionState: status, selectedMode: modeSelector?.selectedMode, stateMode: statusMode,
                 requiresExplicitActivation: modeSelector?.requiresExplicitActivation)
+        }
+        if let target = request.target, (try? ApplicationAutomationTarget.read(pid: getpid())) != target {
+            return reply("target-mismatch")
         }
         var result = "status"
         if request.action != "status" {
