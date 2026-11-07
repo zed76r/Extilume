@@ -34,6 +34,8 @@ CLOCK = load_tool('calibrate-recovery-clock')
 WIRE = load_tool('verify-guard-interleavings')
 SCOPE = 'Dg1-passive-dual-C'
 NS = 1_000_000_000
+# Two pre-sleep reads, at most 34 pending reads at 0.3s, and two final reads.
+MAX_DISPLAY_SNAPSHOTS = 38
 # shortcut: absence covers only the default profile; extend after custom-profile ownership is verified.
 DEFAULT_STATE_DIRECTORY = Path.home() / 'Library/Application Support/Extilume'
 
@@ -277,7 +279,7 @@ class Session:
         require(value == 'normal', 'physical-anomaly' if value == 'abnormal'
                 else 'human-rescue' if value == 'rescue' else 'human-cancelled')
 
-    def check_C(self):
+    def check_C(self, *, allow_pending_external=False):
         self.tick(force=True)
         snapshot = self.backend.snapshot()
         displays = snapshot['displays']
@@ -294,10 +296,18 @@ class Session:
             activePhysical=sum(d.get('isActive') is True and role == 'physical' for d, role in zip(displays, roles)))
         self.journal.append(dict(event='topology-observation', counts=self.report['lastTopology'],
                                  observedAtNanoseconds=self.backend.now()[0]))
-        actual = signature(snapshot)
-        require(actual == signature(self.field['expectedC']), 'C-or-mode-mismatch')
+        expected_inner = [d for d in self.field['expectedC']['displays']
+                          if WIRE.identity_case(d['identity']) == 'builtIn']
+        pending = (allow_pending_external and len(expected_inner) == 1
+                   and displays == expected_inner)
+        if not pending:
+            actual = signature(snapshot)
+            require(actual == signature(self.field['expectedC']), 'C-or-mode-mismatch')
         self.backend.internal_state(snapshot, self.field['internalHardwareIdentity'])
-        self.tick()
+        self.tick(force=allow_pending_external)
+        if pending:
+            self.journal.append(dict(event='external-topology-pending', observedAtNanoseconds=self.backend.now()[0]))
+        return not pending
 
     def execute(self):
         try:
@@ -333,8 +343,15 @@ class Session:
             # Preserve timing evidence before topology or human checks can stop this round.
             self.report['sleepMeasurement'] = assessment
             self.journal.append(dict(event='machine-measurement', assessment=assessment))
-            self.check_C()
-            self.check_C()
+            consecutive = 0
+            while consecutive < 2:
+                ready = self.check_C(allow_pending_external=True)
+                consecutive = consecutive + 1 if ready else 0
+                if consecutive < 2:
+                    next_read = min(self.deadline, self.backend.now()[0] + 300_000_000)
+                    while self.backend.now()[0] < next_read:
+                        self.backend.wait()
+                    self.tick(force=True)
             self.tick(force=True)
             self.visual('after')
             require(assessment['measurementSupported'] is True, 'real-sleep-unproved')
@@ -469,7 +486,7 @@ class Mac:
 
     def snapshot(self):
         self.snapshot_count += 1
-        require(self.snapshot_count <= 4, 'snapshot-quota-exhausted')
+        require(self.snapshot_count <= MAX_DISPLAY_SNAPSHOTS, 'snapshot-quota-exhausted')
         result = self.witness('--display-snapshot')
         save_new(self.bundle / ('snapshot-' + str(self.snapshot_count) + '.json'), result)
         return result

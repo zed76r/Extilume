@@ -102,6 +102,8 @@ class Fake:
             self.c = 181 * D.NS
 
     def wait(self):
+        self.c += 50_000_000
+        self.a += 50_000_000
         self.session.tick()
 
     def stop_recorder(self):
@@ -276,7 +278,15 @@ class Dg1Tests(unittest.TestCase):
 
     def test_wake_topology_failure_preserves_measurement_and_still_stops(self):
         session, fake = self.session()
-        fake.third_snapshot = lambda backend: setattr(backend, 'failure', 'incomplete-C')
+        original = fake.snapshot
+
+        def snapshot():
+            value = original()
+            if fake.snapshot_reads >= 3:
+                value['displays'].clear()
+            return value
+
+        fake.snapshot = snapshot
         report = session.execute()
         self.assertEqual(report['stopReason'], 'incomplete-C')
         self.assertFalse(report['informationSufficient'])
@@ -285,6 +295,102 @@ class Dg1Tests(unittest.TestCase):
         self.assertEqual(fake.calls.count('sleep'), 1)
         self.assertIn('stop-recorder', fake.calls)
         self.assertTrue(report['sleepMeasurement']['measurementSupported'])
+
+    def test_exact_pending_external_waits_for_two_consecutive_full_C_reads(self):
+        session, fake = self.session()
+        original = fake.snapshot
+        pending_reads = {3, 5}
+
+        def snapshot():
+            value = original()
+            if fake.snapshot_reads in pending_reads:
+                value['displays'].pop()
+            return value
+
+        fake.snapshot = snapshot
+        report = session.execute()
+        self.assertTrue(report['informationSufficient'])
+        self.assertEqual(report['physicalObservation'], 'normal')
+        self.assertEqual(fake.snapshot_reads, 7)
+        self.assertEqual(fake.calls.count('sleep'), 1)
+        events = [json.loads(line) for line in session.journal.path.read_text().splitlines()]
+        self.assertEqual(sum(e.get('event') == 'external-topology-pending' for e in events), 2)
+        observations = [e['observedAtNanoseconds'] for e in events if e.get('event') == 'topology-observation'][2:]
+        self.assertTrue(all(b - a >= 300_000_000 for a, b in zip(observations, observations[1:])))
+
+    def test_pending_external_keeps_original_wake_deadline(self):
+        session, fake = self.session()
+        fake.third_snapshot = lambda backend: setattr(backend, 'failure', 'incomplete-C')
+        report = session.execute()
+        self.assertEqual(report['stopReason'], 'collection-deadline')
+        self.assertEqual(session.deadline, fake.evidence_event['didWakeAtNanoseconds'] + 10 * D.NS)
+        self.assertFalse(report['informationSufficient'])
+        self.assertTrue(report['sleepMeasurement']['measurementSupported'])
+        self.assertEqual(fake.calls.count('sleep'), 1)
+        self.assertLessEqual(fake.snapshot_reads, D.MAX_DISPLAY_SNAPSHOTS)
+
+    def test_changed_internal_display_during_pending_is_rejected(self):
+        for mutation in ('mode', 'origin', 'identity', 'other-display'):
+            with self.subTest(mutation=mutation):
+                fake = Fake(self.field)
+                original = fake.snapshot
+
+                def snapshot():
+                    value = original()
+                    if fake.snapshot_reads >= 3:
+                        value['displays'].pop()
+                        inner = value['displays'][0]
+                        if mutation == 'mode': inner['mode']['width'] += 1
+                        elif mutation == 'origin': inner['originX'] += 1
+                        elif mutation == 'identity': inner['identityUUID'] = BOOT
+                        else: inner['identity'] = {'unknown': {}}
+                    return value
+
+                fake.snapshot = snapshot
+                # Use a fresh fixture ledger without reclaiming a production candidate.
+                with tempfile.TemporaryDirectory() as other:
+                    ledger = Path(other); ledger.chmod(0o700)
+                    journal = D.Journal(ledger, BOOT, 'a' * 64)
+                    try: report = D.Session(fake, self.field, journal).execute()
+                    finally: journal.close()
+                self.assertFalse(report['informationSufficient'])
+                self.assertEqual(fake.snapshot_reads, 3)
+
+    def test_pending_external_still_requires_internal_hardware_proof(self):
+        session, fake = self.session()
+        fake.third_snapshot = lambda backend: setattr(backend, 'failure', 'incomplete-C')
+        def internal_state(*_):
+            if fake.snapshot_reads >= 3:
+                raise RuntimeError('internal-identity-unverified')
+
+        fake.internal_state = internal_state
+        report = session.execute()
+        self.assertEqual(report['stopReason'], 'internal-identity-unverified')
+        self.assertEqual(fake.snapshot_reads, 3)
+
+    def test_pending_external_keeps_immediate_rescue_and_record_checks(self):
+        for failure in ('human-rescue', 'responsibility-changed'):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as other:
+                fake = Fake(self.field)
+                fake.third_snapshot = lambda backend: setattr(backend, 'failure', 'incomplete-C')
+                original_wait = fake.wait
+
+                def wait():
+                    if fake.snapshot_reads >= 3:
+                        if failure == 'human-rescue':
+                            fake.session.report['physicalObservation'] = 'rescue'
+                            raise RuntimeError('human-rescue')
+                        Path(self.field['records'][0]['path']).write_text('{}')
+                    original_wait()
+
+                fake.wait = wait
+                ledger = Path(other); ledger.chmod(0o700)
+                journal = D.Journal(ledger, BOOT, 'a' * 64)
+                try: report = D.Session(fake, self.field, journal).execute()
+                finally: journal.close()
+                self.assertEqual(report['stopReason'], failure)
+                self.assertFalse(report['informationSufficient'])
+                self.assertEqual(fake.snapshot_reads, 3)
 
     def test_failed_sleep_is_consumed_and_restart_or_copy_cannot_reclaim_candidate(self):
         session, fake = self.session()
@@ -485,6 +591,16 @@ class Dg1Tests(unittest.TestCase):
         with patch.object(D.subprocess, 'run', return_value=SimpleNamespace(stdout=output)), \
                 patch.object(backend, 'pid_path', return_value='/fixture/python'):
             backend.check_processes(None)
+
+    def test_snapshot_quota_stops_before_extra_witness(self):
+        backend = D.Mac.__new__(D.Mac)
+        backend.bundle = self.root
+        backend.snapshot_count = D.MAX_DISPLAY_SNAPSHOTS - 1
+        with patch.object(backend, 'witness', return_value=snapshot()) as witness:
+            backend.snapshot()
+            with self.assertRaisesRegex(RuntimeError, 'snapshot-quota-exhausted'):
+                backend.snapshot()
+            self.assertEqual(witness.call_count, 1)
 
     def test_internal_witness_must_match_numeric_and_reported_identity_and_be_saved(self):
         for index, change in enumerate(({}, {'id': 999}, {'reportedIdentityUUID': BOOT}), 1):
