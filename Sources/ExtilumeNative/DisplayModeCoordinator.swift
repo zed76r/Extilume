@@ -43,7 +43,7 @@ final class DisplayModeCoordinator: PrimaryApplicationControlling, DisplayModeSe
 
     init(directory: URL, preferences: any DisplayModePreferenceStoring = DisplayModePreferences(),
          allowsAutomaticStart: Bool = true,
-         availableModes: [DisplayApplicationMode] = [.externalPrimary, .externalOnly],
+         availableModes: [DisplayApplicationMode] = [.externalPrimary, .externalOnly, .internalOnly],
          inputSettings: ExternalDisplayInputSettings = ExternalDisplayInputSettings(),
          factory: @escaping ControllerFactory = { mode, directory, store in
              switch mode {

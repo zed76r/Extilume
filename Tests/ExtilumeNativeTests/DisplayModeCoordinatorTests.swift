@@ -117,7 +117,7 @@ final class DisplayModeCoordinatorTests: XCTestCase {
         XCTAssertEqual(calls, 1)
     }
 
-    func testNewModeIsHiddenAndCannotBeSelectedByDefault() throws {
+    func testExternalHandoffIsAvailableByDefaultAndRequiresSelection() throws {
         let root = try directory()
         defer { try? FileManager.default.removeItem(at: root) }
         let preferences = Preferences()
@@ -127,11 +127,19 @@ final class DisplayModeCoordinatorTests: XCTestCase {
             return Session()
         }
 
-        XCTAssertEqual(coordinator.availableModes, [.externalPrimary, .externalOnly])
-        coordinator.selectMode(.internalOnly)
+        XCTAssertEqual(coordinator.availableModes, [.externalPrimary, .externalOnly, .internalOnly])
+        let application = MenuBarApplicationDelegate(controllerFactory: { coordinator }, lidIsOpen: { true })
+        application.startSession()
+        let action = try XCTUnwrap(application.menu.item(withTitle: "停用外接屏"))
+        XCTAssertFalse(action.isHidden)
+        XCTAssertTrue(action.isEnabled)
         XCTAssertNil(coordinator.selectedMode)
         XCTAssertFalse(preferences.externalHandoffRequested)
         XCTAssertEqual(calls, 0)
+        coordinator.selectMode(.internalOnly)
+        XCTAssertEqual(coordinator.selectedMode, .internalOnly)
+        XCTAssertTrue(preferences.externalHandoffRequested)
+        XCTAssertEqual(calls, 1)
     }
 
     func testSavedHandoffResumesAfterCoordinatorRecreation() throws {
@@ -276,7 +284,7 @@ final class DisplayModeCoordinatorTests: XCTestCase {
             external.handler?(.applied)
             await drain()
 
-            XCTAssertEqual(coordinator.availableModes, [.externalPrimary, .externalOnly])
+            XCTAssertEqual(coordinator.availableModes, [.externalPrimary, .externalOnly, .internalOnly])
             XCTAssertEqual(modes, [.internalOnly])
             XCTAssertEqual(target, root)
             XCTAssertEqual(external.starts, 1)
