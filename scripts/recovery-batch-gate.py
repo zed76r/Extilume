@@ -36,6 +36,18 @@ wakeTopologyRejected linkReconfigurationStarted linkReconfigurationCollected lin
 """.split())
 
 
+NATIVE_FAILURE_CODES = frozenset("""
+connection-confirmation-required enable-symbol-unavailable enable-invalid-display enable-begin-failed
+enable-configure-failed enable-complete-failed enable-unsafe-topology online-list active-list display-read
+identity-conflict recovery-invalid-record recovery-unresolved-source recovery-unfinished-transaction
+recovery-invalid-transition guard-spawn guard-identity guard-missing-record guard-protection-lost
+guard-access-denied guard-unstable guard-external-topology-pending power-access-denied recovery-store
+channel-timeout channel-closed channel-system-call channel-invalid witness-spawn witness-communication
+witness-timeout witness-invalid-state witness-unavailable witness-exit witness-cleanup
+internal-state-changed internal-information-unavailable external-state-changed unclassified
+""".split())
+
+
 def process_key(value):
     D.require(isinstance(value, dict) and set(value) == {
         'pid', 'uid', 'parentPID', 'startSeconds', 'startMicroseconds', 'executable'}, 'invalid-process-binding')
@@ -239,7 +251,9 @@ class LifecyclePipe:
 
 
 class RecoveryBatchGate:
-    def __init__(self, budget_directory, candidate, field_digest, binaries, now, read_process=None):
+    def __init__(self, budget_directory, candidate, field_digest, binaries, now, read_process=None, normal_wake_readiness=False):
+        D.require(type(normal_wake_readiness) is bool, 'invalid-normal-wake-readiness')
+        self.normal_wake_readiness = normal_wake_readiness
         D.require(set(binaries) == set(ROLES), 'missing-role-binary')
         self.binaries = {role: dict(binding) for role, binding in binaries.items()}
         for binding in self.binaries.values():
@@ -409,7 +423,10 @@ class RecoveryBatchGate:
             path.mkdir(mode=0o700)
             self.native_budget_directory = path
             with D.CLOCK.private_file(path / 'policy.json', create=True) as output:
-                json.dump(dict(bootSession=boot_session, started=self.started, deadline=self.deadline), output)
+                policy = dict(bootSession=boot_session, started=self.started, deadline=self.deadline)
+                if self.normal_wake_readiness:
+                    policy['normalWakeReadiness'] = True
+                json.dump(policy, output)
                 output.flush()
                 os.fsync(output.fileno())
             for directory in (path, path.parent):
@@ -460,6 +477,9 @@ class RecoveryBatchGate:
                   'invalid-lifecycle-event')
         D.require(len(self.native_events) < 4096, 'lifecycle-overflow')
         observed = dict(event='native-observed', role=event['role'], stage=stage, continuousNs=at)
+        if 'failureCode' in event:
+            code = event['failureCode']
+            observed['failureCode'] = code if type(code) is str and code in NATIVE_FAILURE_CODES else 'unclassified'
         if 'recoveryTopology' in event:
             counts = event['recoveryTopology']
             D.require(isinstance(counts, dict) and set(counts) == {
@@ -478,7 +498,8 @@ class RecoveryBatchGate:
                       and at >= self.sleep_request_at, 'unexpected-native-wake')
             if self.wake is None:
                 self.wake = at
-                self.deadline = min(self.deadline, at + 10 * D.NS)
+                if not self.normal_wake_readiness:
+                    self.deadline = min(self.deadline, at + 10 * D.NS)
                 self.journal.append(dict(event='wake-boundary', continuousNs=at))
             else:
                 D.require(at >= self.wake, 'invalid-wake-boundary')
@@ -642,7 +663,8 @@ class RecoveryBatchGate:
                       and type(at) is int and self.sleep_request_at <= at <= self.last_time,
                       'invalid-wake-boundary')
             self.wake = at
-            self.deadline = min(self.deadline, at + 10 * D.NS)
+            if not self.normal_wake_readiness:
+                self.deadline = min(self.deadline, at + 10 * D.NS)
             self.journal.append(dict(event='wake-boundary', continuousNs=at))
             self.tick()
         except BaseException:
@@ -659,7 +681,8 @@ class RecoveryBatchGate:
             D.require(str(uuid.UUID(event['bootSession'])) == str(uuid.UUID(boot_session))
                       and self.sleep_request_at <= sleep < wake <= self.last_time, 'invalid-power-event')
             self.power_event = event
-            self.deadline = min(self.deadline, wake + 10 * D.NS)
+            if not self.normal_wake_readiness:
+                self.deadline = min(self.deadline, wake + 10 * D.NS)
             self.journal.append(dict(event='power-pair-observed', sleepAt=sleep, wakeAt=wake))
             self.tick()
         except BaseException:
@@ -682,8 +705,9 @@ class RecoveryBatchGate:
             D.require(reply.get('result') == 'status' and reply.get('sessionState') == {'applied': {}}
                       and reply.get('selectedMode') == reply.get('stateMode') == 'externalOnly'
                       and reply.get('requiresExplicitActivation') is False, 'wake-reapplication-unconfirmed')
-            required = iter(('sleepRequested', 'systemHasPoweredOn', 'restorationStarted',
-                             'restorationVerified', 'disableStarted', 'disableFinished'))
+            readiness = ('wakeTopologyReady', 'pauseVerificationFinished') if self.normal_wake_readiness else (
+                'restorationStarted', 'restorationVerified')
+            required = iter(('sleepRequested', 'systemHasPoweredOn', *readiness, 'disableStarted', 'disableFinished'))
             stage = next(required)
             for event in self.native_events[self.request_event_start:]:
                 if event['role'] == 'controller' and event['stage'] == stage:

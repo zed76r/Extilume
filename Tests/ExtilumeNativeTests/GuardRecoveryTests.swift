@@ -311,6 +311,33 @@ final class GuardRecoveryTests: XCTestCase {
                                                                snapshot: snapshot(record.baseline, includeExternal: false)))
     }
 
+    func testNormalWakeReapplicationRejectsChangedConfigurationAndSleepEpoch() throws {
+        let record = try confirmedCRecord()
+        let full = snapshot(record.baseline)
+        let epoch = UUID()
+        let readiness = InternalNormalWakeReapplication(epoch: epoch,
+            topology: try InternalWakeTopologyReadiness(record: record, snapshot: full), verifiedAt: 30_000_000_000)
+        XCTAssertNoThrow(try readiness.verify(current: full, record: record, epoch: epoch))
+        XCTAssertThrowsError(try readiness.verify(current: full, record: record, epoch: UUID()))
+        for changed in [snapshot(record.baseline, includeExternal: false),
+                        snapshot(record.baseline, internalActive: false), snapshot(try layout(mainExternal: true))] {
+            XCTAssertThrowsError(try readiness.verify(current: changed, record: record, epoch: epoch))
+        }
+        let prepared = try prepareProtectedInternalReapplication(record: record, snapshot: full)
+        XCTAssertNoThrow(try readiness.verifyPrepared(prepared, epoch: epoch))
+        XCTAssertThrowsError(try readiness.verifyPrepared(prepared, epoch: UUID()))
+        XCTAssertThrowsError(try readiness.verifyPrepared(record, epoch: epoch))
+        XCTAssertThrowsError(try readiness.verify(current: full, record: prepared, epoch: epoch))
+        var object = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(full)) as? [String: Any])
+        var displays = try XCTUnwrap(object["displays"] as? [[String: Any]])
+        var mode = try XCTUnwrap(displays[1]["mode"] as? [String: Any])
+        mode["refreshRate"] = 30
+        displays[1]["mode"] = mode
+        object["displays"] = displays
+        let changedMode = try JSONDecoder().decode(Snapshot.self, from: JSONSerialization.data(withJSONObject: object))
+        XCTAssertThrowsError(try readiness.verify(current: changedMode, record: record, epoch: epoch))
+    }
+
     func testWakeTopologyWaitUsesOriginalDeadlineAndRejectsFaultOrStop() {
         var state = InternalSessionLifecycle()
         XCTAssertTrue(state.willSleep())

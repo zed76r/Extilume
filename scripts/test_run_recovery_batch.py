@@ -64,7 +64,7 @@ class BatchEvidenceTests(unittest.TestCase):
             time.sleep(.001)
         self.fail('fixture pipe not drained')
 
-    def sleep_round(self, mutate=lambda before, after, evidence, stages: None):
+    def sleep_round(self, mutate=lambda before, after, evidence, stages: None, completed_at=1600):
         for action in G.ACTIONS[:3]:
             self.gate.request(action, lambda: True, lambda: True)
         self.gate.stream = self.pipe
@@ -75,7 +75,7 @@ class BatchEvidenceTests(unittest.TestCase):
                   (1421, 'restorationVerified'), (1430, 'disableStarted'), (1440, 'disableFinished')]
         mutate(before, after, evidence, stages)
         def send():
-            self.time = 1600
+            self.time = completed_at
             self.emit(stages)
             self.gate.observe_power(evidence['intervals'][0]['powerEvent'], FIX.SESSION)
             return True
@@ -88,6 +88,34 @@ class BatchEvidenceTests(unittest.TestCase):
         self.assertEqual(self.gate.confirmed_requests, 4)
         self.assertEqual(self.gate.native_disable_count, 2)
         self.assertEqual(self.gate.deadline, 1410 + 10*G.D.NS)
+
+    def test_normal_readiness_verifies_delayed_reapplication_without_resetting_wake_or_quota(self):
+        self.gate.normal_wake_readiness = True
+        def delayed(before, after, evidence, stages):
+            stages[2:] = [(11*G.D.NS, 'wakeTopologyReady'), (11*G.D.NS + 1, 'pauseVerificationFinished'),
+                          (11*G.D.NS + 2, 'disableStarted'), (11*G.D.NS + 3, 'disableFinished')]
+        self.sleep_round(delayed, completed_at=12*G.D.NS)
+        self.assertEqual(self.gate.wake, 1415)
+        self.assertEqual(self.gate.deadline, 180*G.D.NS)
+        self.assertEqual((self.gate.confirmed_requests, self.gate.native_disable_count), (4, 2))
+
+    def test_normal_readiness_rejects_old_restoration_events(self):
+        self.gate.normal_wake_readiness = True
+        with self.assertRaisesRegex(RuntimeError, 'wake-reapplication-endpoint-missing'):
+            self.sleep_round()
+
+    def test_normal_readiness_requires_pause_verification_after_topology(self):
+        self.gate.normal_wake_readiness = True
+        def missing_pause(before, after, evidence, stages):
+            stages[2:4] = [(1420, 'wakeTopologyReady')]
+        with self.assertRaisesRegex(RuntimeError, 'wake-reapplication-endpoint-missing'):
+            self.sleep_round(missing_pause)
+
+    def test_default_mode_rejects_delayed_reapplication(self):
+        def delayed(before, after, evidence, stages):
+            stages[-2:] = [(11*G.D.NS, 'disableStarted'), (11*G.D.NS + 1, 'disableFinished')]
+        with self.assertRaisesRegex(RuntimeError, 'batch-deadline'):
+            self.sleep_round(delayed, completed_at=12*G.D.NS)
 
     def test_power_notification_without_positive_sleep_cannot_confirm(self):
         def mutate(before, after, evidence, stages):
@@ -391,6 +419,7 @@ class NativeWitnessTests(unittest.TestCase):
                             startMicroseconds=1, executable='/candidate with spaces/Extilume')
         self.backend = R.BatchMac.__new__(R.BatchMac)
         self.backend.children = {}
+        self.backend.bundle = Path('/candidate with spaces')
         self.roles_checked = []
         self.backend.gate = SimpleNamespace(roles={'owner': dict(pid=11, executable=self.binding['executable'])},
             check_roles=lambda roles: self.roles_checked.append(roles))
@@ -420,6 +449,96 @@ class NativeWitnessTests(unittest.TestCase):
     def test_reused_witness_pid_is_rejected(self):
         with self.assertRaisesRegex(RuntimeError, 'native-witness-unbound'):
             self.scan(identities=[self.binding, dict(self.binding, startMicroseconds=2)])
+
+    def test_starting_owner_is_bound_before_native_registration(self):
+        self.backend.gate.roles = {'app': dict(pid=11, executable=self.binding['executable'])}
+        self.backend.gate.next_action = 1
+        self.backend.gate.dispatched_controls = {'start'}
+        self.backend.gate.bind = lambda role, value: self.backend.gate.roles.update({role: value})
+        args = self.binding['executable'] + ' --internal-app-session /candidate with spaces/state/internal-session 11 198'
+        self.scan(args)
+        self.assertEqual(self.backend.gate.roles['owner'], self.binding)
+        self.assertEqual(self.backend.children[20], (None, self.binding['executable']))
+
+    def test_starting_helper_is_bound_to_expected_owner(self):
+        self.backend.gate.next_action = 1
+        self.backend.gate.dispatched_controls = {'start'}
+        self.backend.gate.bind = lambda role, value: self.backend.gate.roles.update({role: value})
+        self.scan(self.binding['executable'] + ' --display-guard /candidate with spaces/state/internal-session 198')
+        self.assertEqual(self.backend.gate.roles['helper'], self.binding)
+
+    def test_starting_helper_row_before_owner_is_validated_after_owner(self):
+        image = self.binding['executable']
+        helper = dict(self.binding, pid=21, parentPID=20)
+        witness = dict(self.binding, pid=22, parentPID=21)
+        self.backend.gate.roles = {'app': dict(pid=11, executable=image)}
+        self.backend.gate.next_action = 1
+        self.backend.gate.dispatched_controls = {'start'}
+        self.backend.gate.bind = lambda role, value: self.backend.gate.roles.update({role: value})
+        output = (f"22 21 {os.getuid()} S {image} --display-snapshot 198\n"
+                  f"21 20 {os.getuid()} S {image} --display-guard /candidate with spaces/state/internal-session 198\n"
+                  f"20 11 {os.getuid()} S {image} --internal-app-session /candidate with spaces/state/internal-session 11 198\n")
+        with patch.object(R.subprocess, 'run', return_value=SimpleNamespace(stdout=output)), \
+             patch.object(self.backend, 'pid_path', return_value=image), \
+             patch.object(G, 'read_process_identity', side_effect=lambda pid: {20:self.binding,21:helper,22:witness}[pid]):
+            self.backend.check_processes(None)
+        self.assertEqual(self.backend.gate.roles['owner'], self.binding)
+        self.assertEqual(self.backend.gate.roles['helper'], helper)
+
+    def test_helper_published_after_owner_probe_binds_parent_first(self):
+        calls = []
+        gate = self.backend.gate
+        gate.roles = {'app': dict(pid=11, executable=self.binding['executable'])}
+        gate.next_action = 1
+        gate.native_budget_directory = self.backend.bundle
+        gate.tick = lambda: None
+        def bind(role):
+            if role == 'helper':
+                self.assertIn('owner', gate.roles)
+            calls.append(role)
+            gate.roles[role] = dict(pid=20 if role == 'owner' else 21, executable=self.binding['executable'])
+        gate.bind_registered_process = bind
+        backend = self.backend
+        backend.registered_roles = set()
+        backend.safety_deadline = None
+        backend.last_scan = 0
+        backend.events = lambda: []
+        backend.now = lambda: (0,0)
+        with patch.object(Path, 'exists', side_effect=[False,True]):
+            backend.tick()
+        self.assertEqual(calls, ['owner','helper'])
+        self.assertEqual(backend.registered_roles, {'owner','helper'})
+
+    def test_starting_owner_wrong_path_or_without_start_permit_is_rejected(self):
+        args = self.binding['executable'] + ' --internal-app-session /wrong/state 11 198'
+        self.backend.gate.roles = {'app': dict(pid=11, executable=self.binding['executable'])}
+        self.backend.gate.next_action = 1
+        self.backend.gate.dispatched_controls = {'start'}
+        with self.assertRaisesRegex(RuntimeError, 'unexpected-controller'):
+            self.scan(args)
+        self.backend.gate.dispatched_controls.clear()
+        args = self.binding['executable'] + ' --internal-app-session /candidate with spaces/state/internal-session 11 198'
+        with self.assertRaisesRegex(RuntimeError, 'unexpected-controller'):
+            self.scan(args)
+
+    def test_starting_owner_reused_pid_is_rejected(self):
+        self.backend.gate.roles = {'app': dict(pid=11, executable=self.binding['executable'])}
+        self.backend.gate.next_action = 1
+        self.backend.gate.dispatched_controls = {'start'}
+        args = self.binding['executable'] + ' --internal-app-session /candidate with spaces/state/internal-session 11 198'
+        with self.assertRaisesRegex(RuntimeError, 'native-witness-unbound'):
+            self.scan(args, identities=[self.binding, dict(self.binding, startMicroseconds=2)])
+
+    def test_early_bound_roles_cannot_complete_action_without_native_registrations(self):
+        self.backend.registered_roles = {'owner'}
+        self.backend.tick = lambda: None
+        self.backend.wait = lambda: (_ for _ in ()).throw(RuntimeError('still-waiting'))
+        self.backend.gate.request_event_start = 0
+        self.backend.gate.native_events = [dict(role='controller', stage='disableFinished')]
+        self.backend.gate.roles = {role: {} for role in G.ROLES}
+        self.backend.gate.control_application = lambda _: dict(sessionState={'applied': {}})
+        with self.assertRaisesRegex(RuntimeError, 'still-waiting'):
+            self.backend.wait_application('start')
 
     def test_close_never_terminates_bound_native_roles(self):
         reader = SimpleNamespace()
@@ -471,7 +590,7 @@ class FieldBindingTests(unittest.TestCase):
             expectedC=SNAP.snapshot(), daily=None, calibrationApplicable=True, lidOpenAndUnlocked=True,
             rescueOperator='user', rescueActions=['normal-quit-once', 'user-takes-over'],
             actions=list(G.ACTIONS), maximumNativeDisableAttempts=2, maximumSleepRequests=1,
-            confirmationMethod='local-dialog', records=[
+            confirmationMethod='local-dialog', normalWakeReadiness=True, records=[
                 dict(role='old-1', path=str(self.bundle / 'old-1.json'), sha256=digest),
                 dict(role='old-2', path=str(self.bundle / 'old-2.json'), sha256=digest),
                 dict(role='daily', path=str(G.D.DEFAULT_STATE_DIRECTORY / 'recovery-record.json'), absent=True,
@@ -490,6 +609,16 @@ class FieldBindingTests(unittest.TestCase):
         self.field['maximumSleepRequests'] = 2
         with self.assertRaisesRegex(RuntimeError, 'field-handoff-or-limits-missing'):
             R.validate_field(self.bundle, self.manifest, self.field)
+
+    def test_missing_or_false_normal_readiness_is_rejected(self):
+        for value in (None, False):
+            with self.subTest(value=value):
+                if value is None:
+                    self.field.pop('normalWakeReadiness', None)
+                else:
+                    self.field['normalWakeReadiness'] = value
+                with self.assertRaisesRegex(RuntimeError, 'field-handoff-or-limits-missing'):
+                    R.validate_field(self.bundle, self.manifest, self.field)
 
     def test_changed_frozen_tool_is_rejected(self):
         (self.bundle / 'scripts/recovery-batch-gate.py').write_bytes(b'changed')

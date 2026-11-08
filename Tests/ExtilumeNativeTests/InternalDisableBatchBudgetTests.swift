@@ -25,6 +25,96 @@ final class InternalDisableBatchBudgetTests: XCTestCase {
     private func exists(_ name: String) -> Bool {
         FileManager.default.fileExists(atPath: root.appendingPathComponent(name).path)
     }
+    private func enableNormalWakeReadiness() throws {
+        let policy = InternalDisableBatchBudget.Policy(
+            bootSession: boot, started: 100, deadline: 180_000_000_100, normalWakeReadiness: true
+        )
+        try JSONEncoder().encode(policy).write(to: root.appendingPathComponent("policy.json"))
+    }
+
+    func testReadyTimeAllowsLateWakeAndStillRejectsThirdAttempt() throws {
+        try enableNormalWakeReadiness()
+        let gate = try budget()
+        try gate.consume(wakeAt: nil)
+        time = 11_000_000_200
+        try gate.consume(wakeAt: 150, configurationReadyAt: time - 1)
+        let original = try LayoutCloseoutDirectory(root.path).read("wake-consumed.json")
+        XCTAssertThrowsError(try gate.consume(wakeAt: 150, configurationReadyAt: time))
+        XCTAssertEqual(try LayoutCloseoutDirectory(root.path).read("wake-consumed.json"), original)
+        XCTAssertTrue(exists("stopped"))
+    }
+
+    func testReadyTimeRequiresPolicyOptIn() throws {
+        let gate = try budget()
+        try gate.consume(wakeAt: nil)
+        time = 200
+        XCTAssertThrowsError(try gate.consume(wakeAt: 150, configurationReadyAt: 200))
+        XCTAssertFalse(exists("wake-consumed.json"))
+    }
+
+    func testOptInWithoutReadyTimeRetainsRawWakeDeadline() throws {
+        try enableNormalWakeReadiness()
+        let gate = try budget()
+        try gate.consume(wakeAt: nil)
+        time = 10_000_000_150
+        XCTAssertThrowsError(try gate.consume(wakeAt: 150))
+        XCTAssertFalse(exists("wake-consumed.json"))
+    }
+
+    func testInitialAttemptRejectsReadyTime() throws {
+        try enableNormalWakeReadiness()
+        XCTAssertThrowsError(try budget().consume(wakeAt: nil, configurationReadyAt: 100))
+        XCTAssertFalse(exists("initial-consumed.json"))
+    }
+
+    func testReadyTimeBeforeWakeIsRejected() throws {
+        try enableNormalWakeReadiness()
+        let gate = try budget()
+        try gate.consume(wakeAt: nil)
+        time = 200
+        XCTAssertThrowsError(try gate.consume(wakeAt: 160, configurationReadyAt: 159))
+        XCTAssertFalse(exists("wake-consumed.json"))
+    }
+
+    func testReadyTimeBeforePermitIsRejected() throws {
+        try enableNormalWakeReadiness()
+        let gate = try budget()
+        try gate.consume(wakeAt: nil)
+        time = 200
+        XCTAssertThrowsError(try gate.consume(wakeAt: 120, configurationReadyAt: 149))
+        XCTAssertFalse(exists("wake-consumed.json"))
+    }
+
+    func testFutureReadyTimeIsRejected() throws {
+        try enableNormalWakeReadiness()
+        let gate = try budget()
+        try gate.consume(wakeAt: nil)
+        time = 200
+        XCTAssertThrowsError(try gate.consume(wakeAt: 150, configurationReadyAt: 201))
+        XCTAssertFalse(exists("wake-consumed.json"))
+    }
+
+    func testSlowWakeConsumptionCannotCrossReadyWindow() throws {
+        try enableNormalWakeReadiness()
+        var reads = 0
+        let gate = try InternalDisableBatchBudget(path: root.path, now: {
+            reads += 1
+            return reads <= 2 ? 100 : (reads == 3 ? 200 : 10_000_000_200)
+        }, boot: { self.boot })
+        try gate.consume(wakeAt: nil)
+        XCTAssertThrowsError(try gate.consume(wakeAt: 150, configurationReadyAt: 200))
+        XCTAssertTrue(exists("wake-consumed.json"))
+        XCTAssertTrue(exists("stopped"))
+    }
+
+    func testReadyTimeCannotExtendPolicyDeadline() throws {
+        try enableNormalWakeReadiness()
+        let gate = try budget()
+        try gate.consume(wakeAt: nil)
+        time = 180_000_000_100
+        XCTAssertThrowsError(try gate.consume(wakeAt: 150, configurationReadyAt: time - 1))
+        XCTAssertFalse(exists("wake-consumed.json"))
+    }
     func testProcessRegistrationUsesCurrentKernelIdentityAndIsExclusive() throws {
         let gate = try budget()
         try gate.registerProcess(role: "app", pid: getpid())

@@ -125,6 +125,7 @@ enum InternalApplicationEvent: Codable, Sendable {
     case helperStarted(Int32)
     case expectation(InternalApplicationExpectation)
     case status(PrimarySessionStatus)
+    case wakeReadinessWaiting
     case finished
     case failed
     case faulted
@@ -138,6 +139,7 @@ struct InternalApplicationGuardCallbacks: Sendable {
     let checkAccess: @Sendable () throws -> Void
     let faulted: @Sendable () -> Void
     let stopped: @Sendable (Bool) -> Void
+    var wakeReadinessWaiting: (@Sendable () -> Void)? = nil
 }
 
 final class InternalApplicationWorkerState: @unchecked Sendable {
@@ -199,7 +201,8 @@ final class InternalApplicationWorkerState: @unchecked Sendable {
             expectation: { self.send(.expectation($0)) },
             checkAccess: { try self.checkAccess(parentPID: parentPID) },
             faulted: { self.send(.faulted) },
-            stopped: { self.send(.stopped(faulted: $0)) }
+            stopped: { self.send(.stopped(faulted: $0)) },
+            wakeReadinessWaiting: { self.send(.wakeReadinessWaiting) }
         )
     }
 

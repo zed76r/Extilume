@@ -91,6 +91,34 @@ class BatchGateTests(unittest.TestCase):
             self.gate.bind_registered_process('helper')
         self.assertNotIn('helper', self.gate.roles)
 
+    def test_late_registration_must_match_already_bound_owner(self):
+        self.launch_fixture()
+        self.gate.bind('owner', self.processes[11])
+        self.register_fixture('owner', 11)
+        self.gate.bind_registered_process('owner')
+        self.processes[11]['startMicroseconds'] = 2
+        path = self.gate.native_budget_directory / 'owner-process.json'
+        path.write_text(json.dumps({k:self.processes[11][k] for k in ('pid','startSeconds','startMicroseconds')}))
+        with self.assertRaisesRegex(RuntimeError, 'process-reused-or-changed'):
+            self.gate.bind_registered_process('owner')
+
+    def test_native_fault_code_is_persisted_before_rejection(self):
+        for code in ('guard-access-denied', 'identity-conflict', 'witness-timeout'):
+            with self.subTest(code=code):
+                event = dict(type='internal-lifecycle', clock='mach_continuous_time/ns', role='controller',
+                             stage='wakeTopologyRejected', continuousNs=0, failureCode=code)
+                with self.assertRaisesRegex(RuntimeError, 'native-fault'):
+                    self.gate._record_lifecycle(event)
+                self.assertEqual(self.events()[-1]['failureCode'], code)
+
+    def test_unknown_native_fault_detail_is_not_persisted(self):
+        event = dict(type='internal-lifecycle', clock='mach_continuous_time/ns', role='controller',
+                     stage='wakeTopologyRejected', continuousNs=0, failureCode='private-raw-detail')
+        with self.assertRaisesRegex(RuntimeError, 'native-fault'):
+            self.gate._record_lifecycle(event)
+        self.assertEqual(self.events()[-1]['failureCode'], 'unclassified')
+        self.assertNotIn('private-raw-detail', json.dumps(self.events()))
+
     def test_existing_state_blocks_launch_before_spawn(self):
         self.gate.roles.clear()
         state = self.root/'state'
@@ -257,6 +285,35 @@ class BatchGateTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, 'batch-deadline'):
             self.gate.tick()
         self.assertTrue((directory/'stopped').exists())
+
+    def test_normal_readiness_policy_is_explicit(self):
+        self.gate.normal_wake_readiness = True
+        self.gate.roles.clear()
+        directory = Path(self.gate.prepare_native_budget(str(uuid.uuid4()))['EXTILUME_RECOVERY_BATCH_DIRECTORY'])
+        self.assertIs(json.loads((directory/'policy.json').read_text())['normalWakeReadiness'], True)
+
+    def test_normal_readiness_keeps_original_wake_and_absolute_deadline(self):
+        self.gate.normal_wake_readiness = True
+        for action in G.ACTIONS[:4]: self.gate.request(action, lambda: True, lambda: True)
+        self.time = 20*G.D.NS
+        self.gate.observe_wake(self.time)
+        self.time = 31*G.D.NS
+        self.gate.tick()
+        self.assertEqual(self.gate.wake, 20*G.D.NS)
+        self.assertEqual(self.gate.deadline, 180*G.D.NS)
+        self.assertEqual(self.gate.next_action, 4)
+        self.time = 180*G.D.NS
+        with self.assertRaisesRegex(RuntimeError, 'batch-deadline'):
+            self.gate.tick()
+
+    def test_normal_readiness_native_fault_stops_immediately(self):
+        self.gate.normal_wake_readiness = True
+        queue = self.install_event_queue()
+        queue.append(dict(type='internal-lifecycle', clock='mach_continuous_time/ns', role='controller',
+                          stage='wakeTopologyRejected', continuousNs=0, failureCode='guard-access-denied'))
+        with self.assertRaisesRegex(RuntimeError, 'native-fault'):
+            self.gate.tick()
+        self.assertTrue(self.gate.stopped)
 
     def test_native_permits_follow_durable_requests(self):
         roles = dict(self.gate.roles)

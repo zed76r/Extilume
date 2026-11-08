@@ -31,13 +31,18 @@ func validateInternalGuardReadiness(
 
 func internalWakeVerificationRetryDelay(error: Error, attempt: Int, lifecycle: InternalSessionLifecycle) -> TimeInterval? {
     guard error as? GuardError == .unstable || error as? SnapshotWitnessError == .internalStateChanged,
-          attempt < 2, lifecycle.shouldRecoverAfterWake, !lifecycle.faulted, !lifecycle.stopRequested else { return nil }
+          !lifecycle.normalWakeReadiness, attempt < 2, lifecycle.shouldRecoverAfterWake,
+          !lifecycle.faulted, !lifecycle.stopRequested else { return nil }
     return 0.3
 }
 
 private let internalWakeRecoveryBudgetNanoseconds: UInt64 = 10_000_000_000
 
-func internalWakeWitnessDeadline(now: UInt64, elapsed: UInt64?) -> UInt64? {
+func internalWakeWitnessDeadline(now: UInt64, elapsed: UInt64?, normalReadiness: Bool = false) -> UInt64? {
+    if normalReadiness {
+        let (deadline, overflow) = now.addingReportingOverflow(5_000_000_000)
+        return overflow ? nil : deadline
+    }
     guard let elapsed, elapsed < internalWakeRecoveryBudgetNanoseconds else { return nil }
     let (deadline, overflow) = now.addingReportingOverflow(internalWakeRecoveryBudgetNanoseconds - elapsed)
     return overflow ? nil : deadline
@@ -46,6 +51,12 @@ func internalWakeWitnessDeadline(now: UInt64, elapsed: UInt64?) -> UInt64? {
 func internalWakeInformationRetryDelay(
     error: Error, elapsed: UInt64?, lifecycle: InternalSessionLifecycle
 ) -> TimeInterval? {
+    if lifecycle.normalWakeReadiness {
+        guard error as? GuardError == .externalTopologyPending,
+              lifecycle.shouldRecoverAfterWake, lifecycle.resumeAfterWake,
+              !lifecycle.faulted, !lifecycle.stopRequested else { return nil }
+        return 0.3
+    }
     guard error as? SnapshotWitnessError == .internalInformationUnavailable || error as? GuardError == .externalTopologyPending,
           lifecycle.shouldRecoverAfterWake, lifecycle.resumeAfterWake,
           !lifecycle.faulted, !lifecycle.stopRequested,
@@ -64,6 +75,7 @@ func internalWakeRecoveryDeadlineDecision(
 ) -> InternalWakeRecoveryDeadlineDecision {
     guard lifecycle.sleepEpoch == epoch, lifecycle.wakeRecoveryRequired, !lifecycle.sleeping,
           !lifecycle.faulted, !lifecycle.stopRequested else { return .stale }
+    if lifecycle.normalWakeReadiness { return .stale }
     guard let elapsed, elapsed < internalWakeRecoveryBudgetNanoseconds else {
         lifecycle.fail()
         return .expired
@@ -145,6 +157,8 @@ final class GuardSession: @unchecked Sendable {
     private var wakePreflightEpoch: UUID?
     private var activeWakeRecoveryEpoch: UUID?
     private var confirmedWakeTopology: InternalWakeTopologyReadiness?
+    private var normalWakeReapplication: InternalNormalWakeReapplication?
+    private var batchWakeEpoch: UUID?
     private var topologyWaitingEpoch: UUID?
 
     init(
@@ -318,11 +332,11 @@ final class GuardSession: @unchecked Sendable {
         command("stop")
     }
 
-    private func applyPrepared(_ prepared: RecoveryRecord) throws {
+    private func applyPrepared(_ prepared: RecoveryRecord, wakeReadiness: InternalNormalWakeReapplication? = nil) throws {
         do {
             if operation == .disableInternal {
                 if let applied = try applyProtectedInternalRecord(
-                    store: store, prepared: prepared, operation: { try self.applyDurable($0) },
+                    store: store, prepared: prepared, operation: { try self.applyDurable($0, wakeReadiness: wakeReadiness) },
                     recoverOnFailure: { [self] durable, error in
                         record = durable
                         if authorizationLock.withLock({ lifecycle.pauseAfterFailure(error, protectionReady: authorization.ready) }) {
@@ -347,7 +361,7 @@ final class GuardSession: @unchecked Sendable {
         }
     }
 
-    private func applyDurable(_ durable: RecoveryRecord) throws -> (layout: DisplayLayout, internalEnabled: Bool?) {
+    private func applyDurable(_ durable: RecoveryRecord, wakeReadiness: InternalNormalWakeReapplication? = nil) throws -> (layout: DisplayLayout, internalEnabled: Bool?) {
         if operation == .disableInternal { try powerGate.check() }
         if child == 0 {
             let contract = try ProtectionHandshake(
@@ -401,7 +415,14 @@ final class GuardSession: @unchecked Sendable {
         if let enableTransaction {
             guard let observer = connectionObserver else { throw GuardError.protectionLost }
             let sleepEpoch = authorizationLock.withLock { lifecycle.sleepEpoch }
-            try disableBatchBudget?.consume(wakeAt: authorizationLock.withLock { batchWakeAt })
+            let budgetTimes = try authorizationLock.withLock { () throws -> (UInt64?, UInt64?) in
+                if disableBatchBudget != nil, batchWakeEpoch != nil {
+                    guard batchWakeEpoch == lifecycle.sleepEpoch else { throw GuardError.suspended }
+                }
+                try wakeReadiness?.verifyPrepared(durable, epoch: lifecycle.sleepEpoch)
+                return (batchWakeAt, wakeReadiness?.verifiedAt)
+            }
+            try disableBatchBudget?.consume(wakeAt: budgetTimes.0, configurationReadyAt: budgetTimes.1)
             try translateProtectedInternalLayout(
                 record: durable, loadRecord: { try self.store.load() },
                 snapshotReader: { try self.readGuardSnapshot(durable) },
@@ -481,6 +502,7 @@ final class GuardSession: @unchecked Sendable {
     }
 
     private func command(_ command: String) {
+        var cancelledNormalReadiness = false
         if ["restore", "stop"].contains(command) {
             reapplication.invalidate()
         }
@@ -491,8 +513,12 @@ final class GuardSession: @unchecked Sendable {
             }
         }
         if command == "restore", operation == .disableInternal {
-            authorizationLock.withLock { lifecycle.requestPause() }
+            cancelledNormalReadiness = authorizationLock.withLock {
+                normalWakeReapplication = nil
+                return lifecycle.requestPause()
+            }
         }
+        let alreadyRestored = cancelledNormalReadiness
         if command == "invalidate-connection" {
             print("模拟连接安全条件失效；不代表实际拔线。")
             connectionInvalidated()
@@ -508,7 +534,8 @@ final class GuardSession: @unchecked Sendable {
                 self.applicationCallbacks?.status(.restoringAndQuitting)
                 self.stop()
             case "restore" where self.operation == .disableInternal:
-                self.pauseForConfiguration(forSleep: false)
+                if alreadyRestored { self.applicationCallbacks?.status(.manualConfiguration) }
+                else { self.pauseForConfiguration(forSleep: false) }
             case "confirm-user" where self.operation == .disableInternal:
                 self.reapplication.cancel()
                 traceInternalLifecycle(.configurationConfirmationStarted)
@@ -560,11 +587,11 @@ final class GuardSession: @unchecked Sendable {
         }
     }
 
-    private func loseProtection() {
+    private func loseProtection(observedAt: UInt64? = try? ContinuousClock.nanoseconds()) {
         reapplication.invalidate()
         let first = authorizationLock.withLock {
             let first = !lifecycle.faulted
-            recoveryClock.start()
+            recoveryClock.start(at: observedAt)
             authorization.markLost()
             lifecycle.fail()
             return first
@@ -667,8 +694,14 @@ final class GuardSession: @unchecked Sendable {
             // 醒后只读核验既有责任，尚未进入新控制事务。
             try authorization.verifyAcknowledgement(record: expected)
             guard !expected.sourceUnresolved else { throw RecoveryError.unresolvedSource }
-            guard let elapsed = recoveryClock.elapsedNanoseconds(),
-                  elapsed < internalWakeRecoveryBudgetNanoseconds else { throw GuardError.suspended }
+            if lifecycle.normalWakeReadiness {
+                guard !expected.requiresRecovery, confirmedWakeTopology?.record == expected else {
+                    throw GuardError.protectionLost
+                }
+            } else {
+                guard let elapsed = recoveryClock.elapsedNanoseconds(),
+                      elapsed < internalWakeRecoveryBudgetNanoseconds else { throw GuardError.suspended }
+            }
             if consume { wakePreflightEpoch = epoch }
         }
         try powerGate.check()
@@ -704,8 +737,9 @@ final class GuardSession: @unchecked Sendable {
     ) -> Bool {
         guard operation == .disableInternal, !stopping else { return false }
         reapplication.cancel()
-        if !forSleep { authorizationLock.withLock { lifecycle.requestPause() } }
+        if !forSleep { authorizationLock.withLock { _ = lifecycle.requestPause() } }
         let epoch = authorizationLock.withLock { lifecycle.sleepEpoch }
+        let normalReadiness = forSleep && authorizationLock.withLock { lifecycle.normalWakeReadiness }
         let previousWakeRecoveryEpoch = activeWakeRecoveryEpoch
         activeWakeRecoveryEpoch = forSleep && authorizationLock.withLock {
             lifecycle.sleepEpoch == epoch && lifecycle.wakeRecoveryRequired && !lifecycle.sleeping
@@ -732,7 +766,7 @@ final class GuardSession: @unchecked Sendable {
                 try checkWakePreflightAccess(expected, epoch: epoch)
                 // 先取当前时刻，再读耗时，避免两次采样间隔延长原预算。
                 let now = try ContinuousClock.nanoseconds()
-                guard let deadline = internalWakeWitnessDeadline(now: now, elapsed: recoveryClock.elapsedNanoseconds()) else {
+                guard let deadline = internalWakeWitnessDeadline(now: now, elapsed: recoveryClock.elapsedNanoseconds(), normalReadiness: normalReadiness) else {
                     throw GuardError.suspended
                 }
                 let state = try freshInternalDisplay(
@@ -759,7 +793,8 @@ final class GuardSession: @unchecked Sendable {
                 guard clamshellState() == "开盖", let responsibility = expected.internalDisplay,
                       let id = internalDisplayIDHint,
                       let deadline = internalWakeWitnessDeadline(
-                        now: try ContinuousClock.nanoseconds(), elapsed: recoveryClock.elapsedNanoseconds()
+                        now: try ContinuousClock.nanoseconds(), elapsed: recoveryClock.elapsedNanoseconds(),
+                        normalReadiness: normalReadiness
                       ) else { throw GuardError.suspended }
                 let state = try freshInternalDisplay(
                     identity: responsibility.identity, numericIDHint: id,
@@ -770,6 +805,7 @@ final class GuardSession: @unchecked Sendable {
                 try checkWakePreflightAccess(expected, epoch: epoch)
                 if waiting {
                     traceInternalLifecycle(.wakeTopologyWaiting, recoveryTopology: InternalRecoveryTopologyContext(snapshot: snapshot))
+                    if normalReadiness, topologyWaitingEpoch != epoch { applicationCallbacks?.wakeReadinessWaiting?() }
                     topologyWaitingEpoch = epoch
                     throw GuardError.externalTopologyPending
                 }
@@ -777,34 +813,56 @@ final class GuardSession: @unchecked Sendable {
                 checkingWakeTopology = false
                 topologyWaitingEpoch = nil
             }
-            var restored = try InternalSleepPreparation.restore(checkAccess: { try self.checkRecoveryAccess() }, stopObserving: {
-                traceInternalLifecycle(.observerDrainStarted)
-                stopConnectionObserver()
-                traceInternalLifecycle(.observerDrainFinished)
-            }, operation: { try restoreRecord() })
-            record = restored
+            var restored: RecoveryRecord
+            if normalReadiness {
+                guard let current = record, let anchor = confirmedWakeTopology,
+                      current == anchor.record, !current.requiresRecovery, !current.sourceUnresolved,
+                      try store.load() == current else { throw RecoveryError.identityConflict }
+                // 正常就绪只读核验 C，不进入可能重新挂责并写显示设置的恢复路径。
+                restored = current
+            } else {
+                restored = try InternalSleepPreparation.restore(checkAccess: { try self.checkRecoveryAccess() }, stopObserving: {
+                    traceInternalLifecycle(.observerDrainStarted)
+                    stopConnectionObserver()
+                    traceInternalLifecycle(.observerDrainFinished)
+                }, operation: { try restoreRecord() })
+                record = restored
+            }
             traceInternalLifecycle(.pauseVerificationStarted)
             let snapshot = try pausedSnapshot(restored)
-            traceInternalLifecycle(.pauseVerificationFinished)
-            guard let responsibility = restored.internalDisplay else { throw GuardError.identity }
-            try restored.resumeInternalObservation(
-                current: snapshot.layout(),
-                internalEnabled: snapshot.builtInDisplay(identity: responsibility.identity).isActive
-            )
-            guard try store.load() == record else { throw RecoveryError.unfinishedTransaction }
-            try store.save(restored)
-            record = restored
-            confirmedWakeTopology = try? InternalWakeTopologyReadiness(record: restored, snapshot: snapshot)
+            if normalReadiness {
+                guard let anchor = confirmedWakeTopology else { throw RecoveryError.identityConflict }
+                try anchor.verifyComplete(current: snapshot, record: restored)
+            } else {
+                guard let responsibility = restored.internalDisplay else { throw GuardError.identity }
+                try restored.resumeInternalObservation(
+                    current: snapshot.layout(),
+                    internalEnabled: snapshot.builtInDisplay(identity: responsibility.identity).isActive
+                )
+                guard try store.load() == record else { throw RecoveryError.unfinishedTransaction }
+                try store.save(restored)
+                record = restored
+                confirmedWakeTopology = try? InternalWakeTopologyReadiness(record: restored, snapshot: snapshot)
+            }
             try authorizationLock.withLock {
-                guard lifecycle.permitsRecovery, lifecycle.sleepEpoch == epoch else { throw InternalPowerGateError.suspended }
-                if activeWakeRecoveryEpoch == epoch || wakePreflightEpoch == epoch {
-                    guard !lifecycle.faulted, !lifecycle.stopRequested,
-                          let elapsed = recoveryClock.elapsedNanoseconds(),
+                guard lifecycle.permitsRecovery, lifecycle.sleepEpoch == epoch,
+                      !lifecycle.faulted, !lifecycle.stopRequested else { throw InternalPowerGateError.suspended }
+                if normalReadiness {
+                    guard lifecycle.normalWakeReadiness, let anchor = confirmedWakeTopology,
+                          try store.load() == restored else { throw GuardError.protectionLost }
+                    normalWakeReapplication = InternalNormalWakeReapplication(
+                        epoch: epoch, topology: anchor, verifiedAt: try ContinuousClock.nanoseconds()
+                    )
+                } else if activeWakeRecoveryEpoch == epoch || wakePreflightEpoch == epoch {
+                    guard let elapsed = recoveryClock.elapsedNanoseconds(),
                           elapsed < internalWakeRecoveryBudgetNanoseconds else { throw GuardError.suspended }
                 }
-                lifecycle.didRestore()
+                lifecycle.didRestore(writeFreeConfigurationConfirmed:
+                    confirmedWakeTopology?.record == restored && disableBatchBudget?.allowsNormalWakeReadiness != false)
             }
-            resetRecoveryCycle()
+            traceInternalLifecycle(.pauseVerificationFinished)
+            resetRecoveryCycle(expectedSleepEpoch: epoch)
+            guard authorizationLock.withLock({ lifecycle.sleepEpoch == epoch && lifecycle.permitsRecovery }) else { return false }
             if let applicationCallbacks {
                 if let expectation = try? InternalApplicationExpectation(record: restored) {
                     applicationCallbacks.expectation(expectation)
@@ -812,9 +870,17 @@ final class GuardSession: @unchecked Sendable {
                 applicationCallbacks.status(.manualConfiguration)
             }
             print("已恢复并暂停；可手动设置 C 后输入 confirm-user，再输入 reapply；输入 stop 恢复退出。保护进程继续等待真实退出。")
-            scheduleWakeReapplication()
+            scheduleWakeReapplication(epoch: epoch)
             return true
         } catch {
+            if normalReadiness, authorizationLock.withLock({
+                !lifecycle.faulted && !lifecycle.stopRequested &&
+                    (lifecycle.sleepEpoch != epoch || !lifecycle.resumeAfterWake)
+            }) {
+                return false
+            }
+            if normalReadiness, error as? GuardError != .externalTopologyPending,
+               error as? InternalPowerGateError != .suspended { loseProtection() }
             if checkingWakeTopology, error as? GuardError != .externalTopologyPending {
                 traceInternalLifecycle(.wakeTopologyRejected, succeeded: false, error: error)
             }
@@ -855,7 +921,7 @@ final class GuardSession: @unchecked Sendable {
                 }
                 return false
             }
-            if !attemptedWakePreflight || completedWakePreflight, forSleep,
+            if !normalReadiness, !attemptedWakePreflight || completedWakePreflight, forSleep,
                let delay = authorizationLock.withLock({
                    internalWakeVerificationRetryDelay(error: error, attempt: attempt, lifecycle: lifecycle)
                }) {
@@ -885,37 +951,64 @@ final class GuardSession: @unchecked Sendable {
         record = observed
         confirmedWakeTopology = try? InternalWakeTopologyReadiness(record: observed, snapshot: snapshot)
         stopConnectionObserver()
-        authorizationLock.withLock { lifecycle.didConfirmUserConfiguration() }
+        authorizationLock.withLock {
+            normalWakeReapplication = nil
+            lifecycle.didConfirmUserConfiguration(writeFreeConfigurationConfirmed:
+                confirmedWakeTopology?.record == observed && disableBatchBudget?.allowsNormalWakeReadiness != false)
+        }
         print("已确认用户 C；不修改显示设置，后续恢复以 C 为准。")
     }
 
-    private func reapply(stillCurrent: @escaping @Sendable () -> Bool = { true }) throws {
-        guard operation == .disableInternal, !stopping, stillCurrent(),
-              authorizationLock.withLock({ lifecycle.paused && lifecycle.permitsControls }),
-              let current = try store.load(), current == record else { throw GuardError.suspended }
-        let snapshot = try pausedSnapshot(current)
-        let prepared = try prepareProtectedInternalReapplication(record: current, snapshot: snapshot)
-        guard stillCurrent(), let responsibility = current.internalDisplay else { throw GuardError.suspended }
-        internalDisplayIDHint = try snapshot.builtInDisplay(identity: responsibility.identity).id
+    private func reapply(stillCurrent: @escaping @Sendable () -> Bool = { true }, expectedSleepEpoch: UUID? = nil) throws {
+        let (verifiedEpoch, readiness) = try authorizationLock.withLock { () throws -> (UUID, InternalNormalWakeReapplication?) in
+            guard expectedSleepEpoch == nil || lifecycle.sleepEpoch == expectedSleepEpoch else {
+                throw InternalPowerGateError.suspended
+            }
+            return (lifecycle.sleepEpoch, normalWakeReapplication)
+        }
         do {
-            try startConnectionObserver(responsibility: responsibility)
-            try checkProtectedPeer()
-            try authorizationLock.withLock { try lifecycle.beginReapplication(isCurrent: stillCurrent()) }
-            resetRecoveryCycle()
-            applicationIsCurrent = stillCurrent
-            defer { applicationIsCurrent = nil }
-            applicationCallbacks?.expectation(try InternalApplicationExpectation(record: prepared))
-            try applyPrepared(prepared)
-            if !stopping && !authorizationLock.withLock({ lifecycle.paused }) {
-                print("重新应用已独立读回；沿用同一保护进程及最新用户 C，输入 restore 或 stop 恢复。")
-                applicationCallbacks?.status(.applied)
+            guard operation == .disableInternal, !stopping, stillCurrent(),
+                  authorizationLock.withLock({ lifecycle.paused && lifecycle.permitsControls }),
+                  let current = try store.load(), current == record else { throw GuardError.suspended }
+            let snapshot = try pausedSnapshot(current)
+            try readiness?.verify(current: snapshot, record: current, epoch: authorizationLock.withLock { lifecycle.sleepEpoch })
+            let prepared = try prepareProtectedInternalReapplication(record: current, snapshot: snapshot)
+            guard stillCurrent(), let responsibility = current.internalDisplay else { throw GuardError.suspended }
+            internalDisplayIDHint = try snapshot.builtInDisplay(identity: responsibility.identity).id
+            do {
+                try startConnectionObserver(responsibility: responsibility)
+                try checkProtectedPeer()
+                try authorizationLock.withLock {
+                    guard lifecycle.sleepEpoch == verifiedEpoch else {
+                        throw InternalPowerGateError.suspended
+                    }
+                    if let readiness { try readiness.verifyPrepared(prepared, epoch: lifecycle.sleepEpoch) }
+                    try lifecycle.beginReapplication(isCurrent: stillCurrent())
+                    normalWakeReapplication = nil
+                }
+                resetRecoveryCycle(expectedSleepEpoch: verifiedEpoch)
+                applicationIsCurrent = stillCurrent
+                defer { applicationIsCurrent = nil }
+                applicationCallbacks?.expectation(try InternalApplicationExpectation(record: prepared))
+                try applyPrepared(prepared, wakeReadiness: readiness)
+                if !stopping && !authorizationLock.withLock({ lifecycle.paused }) {
+                    print("重新应用已独立读回；沿用同一保护进程及最新用户 C，输入 restore 或 stop 恢复。")
+                    applicationCallbacks?.status(.applied)
+                }
+            } catch {
+                if authorizationLock.withLock({ lifecycle.pauseAfterFailure(error, protectionReady: authorization.ready) }) {
+                    if authorizationLock.withLock({ lifecycle.permitsRecovery }) {
+                        pauseForConfiguration(forSleep: true)
+                    }
+                } else {
+                    loseProtection()
+                    stop()
+                }
+                throw error
             }
         } catch {
-            if authorizationLock.withLock({ lifecycle.pauseAfterFailure(error, protectionReady: authorization.ready) }) {
-                if authorizationLock.withLock({ lifecycle.permitsRecovery }) {
-                    pauseForConfiguration(forSleep: true)
-                }
-            } else {
+            if let readiness, error as? InternalPowerGateError != .suspended,
+               authorizationLock.withLock({ lifecycle.sleepEpoch == readiness.epoch && lifecycle.shouldResumeAfterWake }) {
                 loseProtection()
                 stop()
             }
@@ -928,7 +1021,10 @@ final class GuardSession: @unchecked Sendable {
             guard powerGate.willSleep() else { return false }
             let previousEpoch = lifecycle.sleepEpoch
             guard lifecycle.willSleep() else { return false }
-            if lifecycle.sleepEpoch != previousEpoch { wakePreflightEpoch = nil }
+            if lifecycle.sleepEpoch != previousEpoch {
+                wakePreflightEpoch = nil
+                normalWakeReapplication = nil
+            }
             return true
         }
         guard accepted else { return false }
@@ -959,10 +1055,13 @@ final class GuardSession: @unchecked Sendable {
         let timestamp = try? ContinuousClock.nanoseconds()
         guard powerGate.didWake() else { return }
         recoveryClock.didWake()
-        recoveryClock.start(at: timestamp)
         let wake = authorizationLock.withLock { () -> (UUID, Bool) in
             lifecycle.didWake()
-            if batchWakeAt == nil { batchWakeAt = timestamp ?? 0 }
+            if !lifecycle.normalWakeReadiness { recoveryClock.start(at: timestamp) }
+            if batchWakeEpoch == nil {
+                batchWakeAt = timestamp ?? 0
+                batchWakeEpoch = lifecycle.sleepEpoch
+            }
             return (lifecycle.sleepEpoch, lifecycle.wakeRecoveryRequired && !lifecycle.sleeping &&
                     !lifecycle.faulted && !lifecycle.stopRequested)
         }
@@ -1005,16 +1104,17 @@ final class GuardSession: @unchecked Sendable {
         }
     }
 
-    private func scheduleWakeReapplication(attempt: Int = 0) {
-        guard !stopping, authorizationLock.withLock({ lifecycle.shouldResumeAfterWake && authorization.ready }) else { return }
+    private func scheduleWakeReapplication(attempt: Int = 0, epoch: UUID? = nil) {
+        let epoch = epoch ?? authorizationLock.withLock { lifecycle.sleepEpoch }
+        guard !stopping, authorizationLock.withLock({ lifecycle.sleepEpoch == epoch && lifecycle.shouldResumeAfterWake && authorization.ready }) else { return }
         reapplication.schedule { [weak self] isCurrent in
             guard let self, isCurrent(),
-                  self.authorizationLock.withLock({ self.lifecycle.shouldResumeAfterWake && self.authorization.ready }) else { return }
+                  self.authorizationLock.withLock({ self.lifecycle.sleepEpoch == epoch && self.lifecycle.shouldResumeAfterWake && self.authorization.ready }) else { return }
             withoutActuallyEscaping(isCurrent) { isCurrent in
-                do { try self.reapply(stillCurrent: isCurrent) }
+                do { try self.reapply(stillCurrent: isCurrent, expectedSleepEpoch: epoch) }
                 catch {
                     if error as? GuardError == .unstable, attempt < 2 {
-                        self.scheduleWakeReapplication(attempt: attempt + 1)
+                        self.scheduleWakeReapplication(attempt: attempt + 1, epoch: epoch)
                     } else {
                         print("醒后重新应用未完成；保持恢复责任，不自动采纳新的用户配置。")
                     }
@@ -1023,9 +1123,10 @@ final class GuardSession: @unchecked Sendable {
         }
     }
 
-    private func resetRecoveryCycle() {
+    private func resetRecoveryCycle(expectedSleepEpoch: UUID? = nil) {
         authorizationLock.withLock {
-            guard !lifecycle.faulted, !lifecycle.stopRequested else { return }
+            guard !lifecycle.faulted, !lifecycle.stopRequested,
+                  expectedSleepEpoch == nil || lifecycle.sleepEpoch == expectedSleepEpoch else { return }
             recoveryEpoch = UUID()
             recoveryRetryScheduled = false
             wakePreflightEpoch = nil

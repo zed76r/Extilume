@@ -326,4 +326,112 @@ final class InternalSessionLifecycleTests: XCTestCase {
         XCTAssertTrue(state.faulted)
         XCTAssertFalse(state.shouldResumeAfterWake)
     }
+
+    func testConfirmedWriteFreeWakeWaitsOnlyForExternalTopology() {
+        for confirmation in 0..<2 {
+            var state = InternalSessionLifecycle()
+            if confirmation == 0 {
+                state.didConfirmUserConfiguration()
+                state.didRestore(writeFreeConfigurationConfirmed: true)
+            } else {
+                state.didConfirmUserConfiguration(writeFreeConfigurationConfirmed: true)
+            }
+            state.willSleep()
+            state.finishSleepPreparation(acknowledged: true)
+            state.didWake()
+            XCTAssertTrue(state.normalWakeReadiness)
+            for elapsed: UInt64? in [nil, 11_000_000_000] {
+                XCTAssertEqual(internalWakeInformationRetryDelay(
+                    error: GuardError.externalTopologyPending, elapsed: elapsed, lifecycle: state
+                ), 0.3)
+                XCTAssertEqual(internalWakeRecoveryDeadlineDecision(
+                    epoch: state.sleepEpoch, lifecycle: &state, elapsed: elapsed
+                ), .stale)
+            }
+            XCTAssertNil(internalWakeInformationRetryDelay(
+                error: SnapshotWitnessError.internalInformationUnavailable, elapsed: 0, lifecycle: state
+            ))
+            XCTAssertNil(internalWakeVerificationRetryDelay(error: GuardError.unstable, attempt: 0, lifecycle: state))
+            XCTAssertNil(internalWakeVerificationRetryDelay(
+                error: SnapshotWitnessError.internalStateChanged, attempt: 0, lifecycle: state
+            ))
+        }
+    }
+
+    func testNormalWakeWitnessHasIndependentFiveSecondDeadline() {
+        XCTAssertEqual(internalWakeWitnessDeadline(now: 1_000, elapsed: nil, normalReadiness: true), 5_000_001_000)
+        XCTAssertEqual(internalWakeWitnessDeadline(now: 1_000, elapsed: 11_000_000_000, normalReadiness: true), 5_000_001_000)
+        XCTAssertNil(internalWakeWitnessDeadline(now: UInt64.max - 4_999_999_999, elapsed: nil, normalReadiness: true))
+    }
+
+    func testUnconfirmedConfigurationKeepsRecoveryDeadline() {
+        for (confirmed, elapsed) in [(false, UInt64?.none), (false, 10_000_000_000), (true, 10_000_000_000)] {
+            var state = InternalSessionLifecycle()
+            state.didConfirmUserConfiguration(writeFreeConfigurationConfirmed: confirmed)
+            if confirmed { state.requestPause() }
+            state.willSleep()
+            state.finishSleepPreparation(acknowledged: true)
+            state.didWake()
+            XCTAssertFalse(state.normalWakeReadiness)
+            XCTAssertNil(internalWakeInformationRetryDelay(
+                error: GuardError.externalTopologyPending, elapsed: elapsed, lifecycle: state
+            ))
+            XCTAssertEqual(internalWakeRecoveryDeadlineDecision(
+                epoch: state.sleepEpoch, lifecycle: &state, elapsed: elapsed
+            ), .expired)
+        }
+    }
+
+    func testNormalWakePauseStopAndFaultRevokeWaiting() {
+        for action in 0..<3 {
+            var state = InternalSessionLifecycle()
+            state.didConfirmUserConfiguration(writeFreeConfigurationConfirmed: true)
+            state.willSleep()
+            state.finishSleepPreparation(acknowledged: true)
+            state.didWake()
+            XCTAssertTrue(state.normalWakeReadiness)
+            if action == 0 {
+                XCTAssertTrue(state.requestPause())
+                XCTAssertFalse(state.wakeRecoveryRequired)
+                XCTAssertFalse(state.shouldRecoverAfterWake)
+                XCTAssertTrue(state.paused && state.permitsControls)
+                XCTAssertFalse(state.pauseRequested)
+            } else if action == 1 {
+                state.requestStop()
+            } else {
+                state.fail()
+            }
+            XCTAssertFalse(state.normalWakeReadiness)
+            XCTAssertFalse(state.shouldResumeAfterWake)
+            XCTAssertNil(internalWakeInformationRetryDelay(
+                error: GuardError.externalTopologyPending, elapsed: nil, lifecycle: state
+            ))
+            if action == 0 {
+                let oldEpoch = state.sleepEpoch
+                state.didConfirmUserConfiguration(writeFreeConfigurationConfirmed: true)
+                XCTAssertTrue(state.shouldResumeAfterWake && state.permitsControls)
+                XCTAssertTrue(state.willSleep())
+                XCTAssertNotEqual(state.sleepEpoch, oldEpoch)
+                XCTAssertTrue(state.normalWakeReadiness)
+            }
+        }
+    }
+
+    func testNormalWakeEpochDoesNotReuseOldCallbacks() {
+        var state = InternalSessionLifecycle()
+        state.didConfirmUserConfiguration(writeFreeConfigurationConfirmed: true)
+        state.willSleep()
+        let oldEpoch = state.sleepEpoch
+        state.willSleep()
+        XCTAssertEqual(state.sleepEpoch, oldEpoch)
+        XCTAssertTrue(state.normalWakeReadiness)
+        state.finishSleepPreparation(acknowledged: true)
+        state.finishSleepPreparation(acknowledged: true)
+        state.didWake()
+        state.willSleep()
+        XCTAssertNotEqual(state.sleepEpoch, oldEpoch)
+        state.finishSleepPreparation(acknowledged: true)
+        state.didWake()
+        XCTAssertEqual(internalWakeRecoveryDeadlineDecision(epoch: oldEpoch, lifecycle: &state, elapsed: nil), .stale)
+    }
 }

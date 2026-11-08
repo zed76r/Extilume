@@ -15,7 +15,7 @@ spec = importlib.util.spec_from_file_location('batch_gate', Path(__file__).with_
 G = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(G)
 D = G.D
-SCOPE = 'normal-recovery-single-batch-v1'
+SCOPE = 'normal-recovery-single-batch-v2'
 TOOLS = ('run-recovery-batch.py', 'recovery-batch-gate.py', 'diagnose-recovery-baseline.py',
          'calibrate-recovery-clock.py', 'verify-guard-interleavings.py', 'verify-guard-drill.py')
 DIALOG = '''on run argv
@@ -41,6 +41,7 @@ class BatchMac(D.Mac):
         self.report = {}
         self.last_scan = None
         self.safety_deadline = None
+        self.registered_roles = set()
 
     @property
     def deadline(self):
@@ -51,6 +52,16 @@ class BatchMac(D.Mac):
                                 capture_output=True, text=True, check=True, timeout=1).stdout
         rows = [row.split(None, 4) for row in output.splitlines() if row.strip()]
         D.require(all(len(row) == 5 for row in rows), 'invalid-process-observation')
+        if 'app' in self.gate.roles:
+            parents = {int(row[0]): int(row[1]) for row in rows}
+            def depth(row):
+                parent = int(row[1])
+                for level in range(3):
+                    if parent == self.gate.roles['app']['pid']:
+                        return level
+                    parent = parents.get(parent)
+                return 3
+            rows.sort(key=depth)
         for pid, parent, uid, state, arguments in rows:
             if state.startswith('Z'):
                 continue
@@ -70,9 +81,18 @@ class BatchMac(D.Mac):
             parents = [role for role, binding in self.gate.roles.items() if binding['pid'] == parent]
             D.require(len(parents) == 1, 'unexpected-controller')
             binding = self.gate.roles[parents[0]]
+            directory = self.bundle / 'state/internal-session'
+            starting_role = None
+            if parents[0] == 'app' and arguments == f"{image} --internal-app-session {directory} {parent} 198":
+                starting_role = 'owner'
+            elif parents[0] == 'owner' and arguments == f"{image} --display-guard {directory} 198":
+                starting_role = 'helper'
+            if starting_role is not None:
+                D.require(self.gate.next_action == 1 and 'start' in self.gate.dispatched_controls
+                          and starting_role not in self.gate.roles, 'unexpected-controller')
             flags = ('--display-snapshot', '--active-display-snapshot', '--internal-display-snapshot', '--external-display-snapshot')
-            D.require(image == binding['executable'] and arguments in
-                      [f"{image} {flag} 198" for flag in flags], 'unexpected-controller')
+            D.require(image == binding['executable'] and (starting_role is not None or arguments in
+                      [f"{image} {flag} 198" for flag in flags]), 'unexpected-controller')
             try:
                 observed = G.read_process_identity(pid)
             except RuntimeError:
@@ -84,7 +104,12 @@ class BatchMac(D.Mac):
                       and observed['uid'] == int(uid) == os.getuid()
                       and G.process_key(G.read_process_identity(pid)) == G.process_key(observed),
                       'native-witness-unbound')
-            self.journal.append(dict(event='native-witness-observed', parentRole=parents[0]))
+            if starting_role is not None:
+                self.gate.bind(starting_role, observed)
+                self.children[pid] = (None, image)
+                self.journal.append(dict(event='native-starting-role-bound', role=starting_role))
+            else:
+                self.journal.append(dict(event='native-witness-observed', parentRole=parents[0]))
 
     def tick(self, force=False):
         if self.safety_deadline is not None:
@@ -93,10 +118,14 @@ class BatchMac(D.Mac):
         try:
             self.gate.tick()
             for role in ('owner', 'helper'):
-                if role not in self.gate.roles and self.gate.native_budget_directory is not None:
+                if role not in self.registered_roles and self.gate.native_budget_directory is not None:
                     path = self.gate.native_budget_directory / (role + '-process.json')
                     if path.exists():
+                        if role == 'helper' and 'owner' not in self.gate.roles:
+                            self.gate.bind_registered_process('owner')
+                            self.registered_roles.add('owner')
                         self.gate.bind_registered_process(role)
+                        self.registered_roles.add(role)
             for role in self.gate.roles.values():
                 self.children.setdefault(role['pid'], (None, role['executable']))
             if self.gate.next_action < len(G.ACTIONS):
@@ -171,7 +200,8 @@ class BatchMac(D.Mac):
             events = self.gate.native_events[self.gate.request_event_start:]
             if (reply.get('sessionState') == {expected: {}}
                     and any(e['role'] == 'controller' and e['stage'] == endpoints[action] for e in events)
-                    and set(self.gate.roles) == set(G.ROLES)):
+                    and set(self.gate.roles) == set(G.ROLES)
+                    and {'owner', 'helper'} <= self.registered_roles):
                 return reply
             self.wait()
 
@@ -336,7 +366,8 @@ def prepare(directory):
         expectedC=None, internalHardwareIdentity=None, records=[], daily=None,
         calibrationApplicable=False, lidOpenAndUnlocked=False, rescueOperator='user',
         rescueActions=['normal-quit-once', 'user-takes-over'], actions=list(G.ACTIONS),
-        maximumNativeDisableAttempts=2, maximumSleepRequests=1, confirmationMethod='local-dialog'))
+        maximumNativeDisableAttempts=2, maximumSleepRequests=1, confirmationMethod='local-dialog',
+        normalWakeReadiness=True))
     return dict(prepared=True, fieldReady=False, scope=SCOPE)
 
 
@@ -348,7 +379,7 @@ def validate_field(bundle, manifest, field):
               and field['maximumSleepRequests'] == 1 and field['confirmationMethod'] == 'local-dialog'
               and field['rescueOperator'] == 'user' and field['rescueActions'] == ['normal-quit-once', 'user-takes-over']
               and field['calibrationApplicable'] is True and field['lidOpenAndUnlocked'] is True
-              and field['daily'] is None, 'field-handoff-or-limits-missing')
+              and field['daily'] is None and field.get('normalWakeReadiness') is True, 'field-handoff-or-limits-missing')
     D.require(field['macOS'] == manifest['macOS'] == platform.mac_ver()[0]
               and field['architecture'] == manifest['architecture'] == platform.machine(), 'environment-changed')
     D.require(uuid.UUID(field['bootSession']).int != 0
@@ -399,7 +430,8 @@ def main(argv=None):
         binaries = {role: dict(executable=str(app), sha256=manifest['files']['Extilume.app/Contents/MacOS/Extilume'])
                     for role in G.ROLES}
         gate = G.RecoveryBatchGate(manifest['budgetDirectory'], manifest['candidate'], field_digest, binaries,
-                                  lambda: D.CLOCK.native_bounds(D.CLOCK.native_sample())[1])
+                                  lambda: D.CLOCK.native_bounds(D.CLOCK.native_sample())[1],
+                                  normal_wake_readiness=field['normalWakeReadiness'])
         result = execute(BatchMac(bundle, field, gate), gate)
         D.save_new(bundle / 'result.json', result)
         print(json.dumps(result, ensure_ascii=False), flush=True)

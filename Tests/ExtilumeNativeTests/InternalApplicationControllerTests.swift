@@ -181,11 +181,14 @@ final class InternalApplicationControllerTests: XCTestCase {
                     callbacks.helperStarted(getpid())
                     XCTAssertTrue(state.hasStartedHelper)
                     callbacks.status(.applied)
+                    callbacks.wakeReadinessWaiting?()
                     XCTAssertEqual(try workerChannel.receive(InternalApplicationCommand.self), .restore)
                     record.beginRestoration()
                     try record.confirmRestored(actual: c, internalEnabled: true)
                     try record.resumeInternalObservation(current: c, internalEnabled: true)
                     try store.save(record)
+                    callbacks.status(.manualConfiguration)
+                    XCTAssertEqual(try workerChannel.receive(InternalApplicationCommand.self), .confirmUser)
                     callbacks.status(.manualConfiguration)
                     XCTAssertEqual(try workerChannel.receive(InternalApplicationCommand.self), .reapply)
                     try record.prepareReapplication(current: c, target: a)
@@ -206,9 +209,12 @@ final class InternalApplicationControllerTests: XCTestCase {
         var controller: InternalApplicationController? = try InternalApplicationController(
             directory: directory, processFactory: factory)
         controller?.startApplication(registerEvents: false) { recorder.append($0) }
-        XCTAssertTrue(pumpMainRunLoop { recorder.statuses.contains(.applied) })
+        XCTAssertTrue(pumpMainRunLoop { recorder.statuses.contains(.waiting) })
+        XCTAssertFalse(recorder.statuses.contains(.recoveryIncomplete))
         controller?.recoverApplication()
         XCTAssertTrue(pumpMainRunLoop { recorder.statuses.contains(.manualConfiguration) })
+        controller?.confirmCurrentConfiguration()
+        XCTAssertTrue(pumpMainRunLoop { recorder.statuses.filter { $0 == .manualConfiguration }.count == 2 })
         controller?.retryApplication()
         XCTAssertTrue(pumpMainRunLoop { recorder.statuses.filter { $0 == .applied }.count == 2 })
         allowFault.signal()
@@ -471,6 +477,67 @@ final class InternalApplicationControllerTests: XCTestCase {
         XCTAssertTrue(pumpMainRunLoop(mode: .modalPanel) { recorder.statuses.contains(.recoveryIncomplete) })
         XCTAssertEqual(recorder.command, .start(recoveryOnly: false))
         controller = nil
+    }
+
+    func testWaitingEventsRequireBoundSessionAndDoNotOverrideQuit() throws {
+        let internalID = UUID()
+        let externalID = UUID()
+        let baseline = try DisplayLayout(main: internalID, origins: [
+            internalID: DisplayOrigin(x: 0, y: 0), externalID: DisplayOrigin(x: 100, y: 0)
+        ])
+        let record = try RecoveryRecord(baseline: baseline, target: baseline,
+            internalDisplay: InternalDisplayResponsibility(identity: internalID, baseline: true, applied: false,
+                hardwareIdentity: InternalDisplayHardwareIdentity(bootSession: UUID(), registryEntryID: 1),
+                numericIDHint: 1))
+        let expectation = try InternalApplicationExpectation(record: record)
+        for scenario in ["unbound", "legacy", "quitting"] {
+            let directory = try makeControllerDirectory()
+            let recorder = InternalApplicationTestRecorder()
+            let release = DispatchSemaphore(value: 0)
+            let factory: InternalApplicationProcessFactory = { _, channel in
+                DispatchQueue.global().async {
+                    do {
+                        let request = try channel.receive(InternalApplicationHandshakeRequest.self)
+                        try channel.send(InternalApplicationEvent.ready(InternalApplicationHandshakeReply(
+                            challenge: request.challenge, workerPID: getpid(), workerUID: UInt32(getuid())
+                        )))
+                        XCTAssertEqual(try channel.receive(InternalApplicationCommand.self), .start(recoveryOnly: false))
+                        if scenario != "unbound" {
+                            try channel.send(InternalApplicationEvent.expectation(expectation))
+                            try channel.send(InternalApplicationEvent.helperStarted(getpid()))
+                            try channel.send(InternalApplicationEvent.status(.applied))
+                        }
+                        if scenario == "quitting" {
+                            XCTAssertEqual(try channel.receive(InternalApplicationCommand.self), .stop)
+                        }
+                        try channel.send(scenario == "legacy" ? InternalApplicationEvent.status(.waiting) : .wakeReadinessWaiting)
+                        if scenario == "quitting" {
+                            try channel.send(InternalApplicationEvent.status(.restoringAndQuitting))
+                        }
+                        _ = release.wait(timeout: .now() + 4)
+                    } catch { XCTFail("protocol fixture failed: \(error)") }
+                }
+                return getpid()
+            }
+            var controller: InternalApplicationController? = try InternalApplicationController(
+                directory: directory, processFactory: factory
+            )
+            controller?.startApplication(registerEvents: false) { recorder.append($0) }
+            if scenario == "quitting" {
+                XCTAssertTrue(pumpMainRunLoop { recorder.statuses.contains(.applied) })
+                controller?.quitApplication { recorder.setCompletion($0) }
+                XCTAssertTrue(pumpMainRunLoop { recorder.statuses.filter { $0 == .restoringAndQuitting }.count == 2 })
+                XCTAssertFalse(recorder.statuses.contains(.waiting))
+                XCTAssertFalse(recorder.statuses.contains(.quitFailed))
+                XCTAssertNil(recorder.completion)
+            } else {
+                XCTAssertTrue(pumpMainRunLoop { recorder.statuses.contains(.recoveryIncomplete) })
+                XCTAssertFalse(recorder.statuses.contains(.waiting))
+            }
+            controller = nil
+            release.signal()
+            try FileManager.default.removeItem(at: directory)
+        }
     }
 
     private func makeControllerDirectory() throws -> URL {

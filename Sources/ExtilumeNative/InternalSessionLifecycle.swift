@@ -13,6 +13,8 @@ struct InternalSessionLifecycle {
     private(set) var exiting = false
     private(set) var stopRequested = false
     private(set) var wakeRecoveryRequired = false
+    private(set) var normalWakeReadiness = false
+    private var confirmedWriteFreeConfiguration = false
     private(set) var sleepEpoch = UUID()
     private var pendingSleepPreparations = 0
 
@@ -27,6 +29,8 @@ struct InternalSessionLifecycle {
     mutating func willSleep() -> Bool {
         guard !exiting else { return false }
         if !sleeping {
+            normalWakeReadiness = confirmedWriteFreeConfiguration && paused && resumeAfterWake
+                && !pauseRequested && !faulted && !stopRequested
             resumeAfterWake = resumeAfterWake || (!paused && !pauseRequested && !faulted && !stopRequested)
             sleepEpoch = UUID()
         }
@@ -50,12 +54,21 @@ struct InternalSessionLifecycle {
         guard permitsRecovery, sleepEpoch == verifiedSleepEpoch, powerAllowsExit() else { return false }
         exiting = true
         resumeAfterWake = false
+        normalWakeReadiness = false
+        confirmedWriteFreeConfiguration = false
         return true
     }
 
-    mutating func requestPause() {
-        pauseRequested = true
+    @discardableResult
+    mutating func requestPause() -> Bool {
+        let cancelledReadiness = normalWakeReadiness
+        if cancelledReadiness { wakeRecoveryRequired = false }
+        normalWakeReadiness = false
+        confirmedWriteFreeConfiguration = false
+        pauseRequested = !cancelledReadiness
+        if cancelledReadiness { paused = true }
         resumeAfterWake = false
+        return cancelledReadiness
     }
 
     mutating func requestStop() {
@@ -63,17 +76,20 @@ struct InternalSessionLifecycle {
         requestPause()
     }
 
-    mutating func didRestore() {
+    mutating func didRestore(writeFreeConfigurationConfirmed: Bool = false) {
         guard permitsRecovery else { return }
         paused = true
         pauseRequested = false
         wakeRecoveryRequired = false
+        normalWakeReadiness = false
+        confirmedWriteFreeConfiguration = writeFreeConfigurationConfirmed
     }
 
-    mutating func didConfirmUserConfiguration() {
+    mutating func didConfirmUserConfiguration(writeFreeConfigurationConfirmed: Bool = false) {
         guard !faulted else { return }
         paused = true
         resumeAfterWake = true
+        confirmedWriteFreeConfiguration = writeFreeConfigurationConfirmed
     }
 
     mutating func beginReapplication(isCurrent: Bool = true) throws {
@@ -84,11 +100,15 @@ struct InternalSessionLifecycle {
         guard paused else { throw RecoveryError.invalidTransition }
         paused = false
         resumeAfterWake = false
+        normalWakeReadiness = false
+        confirmedWriteFreeConfiguration = false
     }
 
     mutating func fail() {
         faulted = true
         resumeAfterWake = false
+        normalWakeReadiness = false
+        confirmedWriteFreeConfiguration = false
     }
 
     mutating func pauseAfterFailure(_ error: Error, protectionReady: Bool) -> Bool {

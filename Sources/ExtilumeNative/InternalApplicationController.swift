@@ -328,6 +328,11 @@ final class InternalApplicationController: PrimaryApplicationControlling {
                 }
                 self.expected = expectation
             } catch { channelDidFail(from: pid); return }
+        case .wakeReadinessWaiting:
+            guard expected != nil, helperPID != nil, !recoveryOnly else { channelDidFail(from: pid); return }
+            guard !quitting, !finalization.faulted else { return }
+            guard verifiedExitRecord == nil, !helperExited else { channelDidFail(from: pid); return }
+            publish(.waiting)
         case .status(let status):
             guard verifiedExitRecord == nil else { channelDidFail(from: pid); return }
             switch status {

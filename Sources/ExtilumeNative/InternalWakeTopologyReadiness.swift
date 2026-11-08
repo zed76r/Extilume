@@ -37,4 +37,27 @@ struct InternalWakeTopologyReadiness {
               try current.layout() == record.baseline else { throw RecoveryError.unresolvedSource }
         return false
     }
+
+    func verifyComplete(current: Snapshot, record: RecoveryRecord) throws {
+        guard record == self.record, !record.requiresRecovery, !record.sourceUnresolved,
+              current == snapshot else { throw RecoveryError.identityConflict }
+    }
+}
+
+struct InternalNormalWakeReapplication {
+    let epoch: UUID
+    let topology: InternalWakeTopologyReadiness
+    let verifiedAt: UInt64
+
+    func verify(current: Snapshot, record: RecoveryRecord, epoch: UUID) throws {
+        guard epoch == self.epoch else { throw InternalControlCancellation.pauseRequested }
+        try topology.verifyComplete(current: current, record: record)
+    }
+
+    func verifyPrepared(_ prepared: RecoveryRecord, epoch: UUID) throws {
+        guard epoch == self.epoch else { throw InternalControlCancellation.pauseRequested }
+        guard prepared.session == topology.record.session, prepared.baseline == topology.record.baseline,
+              prepared.generation > topology.record.generation,
+              prepared.generation - topology.record.generation == 1 else { throw RecoveryError.identityConflict }
+    }
 }

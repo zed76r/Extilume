@@ -9,6 +9,14 @@ final class InternalDisableBatchBudget {
         let bootSession: UUID
         let started: UInt64
         let deadline: UInt64
+        let normalWakeReadiness: Bool?
+
+        init(bootSession: UUID, started: UInt64, deadline: UInt64, normalWakeReadiness: Bool? = nil) {
+            self.bootSession = bootSession
+            self.started = started
+            self.deadline = deadline
+            self.normalWakeReadiness = normalWakeReadiness
+        }
     }
     enum Failure: Error { case rejected }
     struct RestorationReceipt: Codable {
@@ -25,6 +33,8 @@ final class InternalDisableBatchBudget {
     private var firstAttempt: UInt64?
     private var lastTime: UInt64
     private var stopped = false
+
+    var allowsNormalWakeReadiness: Bool { policy.normalWakeReadiness == true }
 
     static func configured(environment: [String: String] = ProcessInfo.processInfo.environment) throws -> InternalDisableBatchBudget? {
         guard let path = environment[environmentKey] else { return nil }
@@ -84,7 +94,7 @@ final class InternalDisableBatchBudget {
     }
 
     // O_EXCL plus fsync consumes before any display write; a failed attempt never gets its slot back.
-    func consume(wakeAt: UInt64?) throws {
+    func consume(wakeAt: UInt64?, configurationReadyAt: UInt64? = nil) throws {
         do {
             guard !stopped, try directory.read("policy.json") == policyBytes else { throw Failure.rejected }
             try directory.requireAbsent("stopped")
@@ -92,23 +102,31 @@ final class InternalDisableBatchBudget {
             guard at >= lastTime, at < policy.deadline else { throw Failure.rejected }
             lastTime = at
             let name: String
+            let windowStart: UInt64?
             if let firstAttempt {
-                guard let wakeAt, wakeAt > firstAttempt, wakeAt <= at,
-                      at - wakeAt < 10_000_000_000 else { throw Failure.rejected }
+                guard let wakeAt, wakeAt > firstAttempt, wakeAt <= at else { throw Failure.rejected }
+                if let configurationReadyAt {
+                    guard policy.normalWakeReadiness == true, configurationReadyAt >= wakeAt,
+                          configurationReadyAt <= at else { throw Failure.rejected }
+                }
+                let start = configurationReadyAt ?? wakeAt
+                guard at - start < 10_000_000_000 else { throw Failure.rejected }
+                windowStart = start
                 name = "wake-consumed.json"
             } else {
-                guard wakeAt == nil else { throw Failure.rejected }
+                guard wakeAt == nil, configurationReadyAt == nil else { throw Failure.rejected }
+                windowStart = nil
                 name = "initial-consumed.json"
             }
             let permitName = firstAttempt == nil ? "initial-authorized.json" : "wake-authorized.json"
             let authorizedAt = try JSONDecoder().decode(UInt64.self, from: directory.read(permitName))
             guard authorizedAt >= policy.started, authorizedAt <= at,
-                  wakeAt.map({ $0 >= authorizedAt }) ?? true else { throw Failure.rejected }
+                  windowStart.map({ $0 >= authorizedAt }) ?? true else { throw Failure.rejected }
             try directory.write(name, value: at)
             // A slow durable write cannot extend the original window.
             let after = try now()
             guard after >= at, after < policy.deadline,
-                  wakeAt.map({ after - $0 < 10_000_000_000 }) ?? true else { throw Failure.rejected }
+                  windowStart.map({ after - $0 < 10_000_000_000 }) ?? true else { throw Failure.rejected }
             try directory.requireAbsent("stopped")
             guard try directory.read("policy.json") == policyBytes else { throw Failure.rejected }
             lastTime = after
