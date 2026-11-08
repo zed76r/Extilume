@@ -611,13 +611,74 @@ final class DisplayEnableTransactionTests: XCTestCase {
         }
     }
 
+    func testRecoveryCommitBoundaryUsesActualCallAndEmitsAfterProtectionReturns() throws {
+        var order: [String] = []
+        var time: UInt64 = 1
+        var markers: [(InternalLifecycleStage, UInt64?, CGError?)] = []
+        let result = try observeInternalRecoveryCommit({
+            order.append("complete")
+            time = 30
+            return .success
+        }, nativeCall: { operation in
+            time = 20
+            let result = operation()
+            time = 40
+            order.append("protection-returned")
+            return result
+        }, now: { time }, trace: {
+            order.append("diagnostic")
+            markers.append(($0, $1, $2))
+        })
+        XCTAssertEqual(result, .success)
+        XCTAssertEqual(order, ["complete", "protection-returned", "diagnostic", "diagnostic"])
+        XCTAssertEqual(markers.map(\.0), [.recoveryEnableNativeStarted, .recoveryEnableNativeFinished])
+        XCTAssertEqual(markers.map(\.1), [20, 30])
+        XCTAssertEqual(markers.last?.2, .success)
+    }
+
+    func testRecoveryCommitBoundaryDoesNotInvokeOrEmitWhenProtectionRejectsBeforeCall() {
+        XCTAssertThrowsError(try observeInternalRecoveryCommit({
+            XCTFail("must not invoke"); return .success
+        }, nativeCall: { _ in throw ValidationError.revoked }, now: {
+            XCTFail("must not sample"); return nil
+        }, trace: { _, _, _ in XCTFail("must not emit") }))
+    }
+
+    func testRecoveryCommitBoundarySurvivesProtectionFailureAfterNativeReturn() {
+        var time: UInt64 = 20
+        var markers: [InternalLifecycleStage] = []
+        XCTAssertThrowsError(try observeInternalRecoveryCommit({ time = 30; return .failure }, nativeCall: {
+            _ = $0()
+            throw ValidationError.revoked
+        }, now: { time }, trace: { stage, _, result in
+            markers.append(stage)
+            if stage == .recoveryEnableNativeFinished { XCTAssertEqual(result, .failure) }
+        }))
+        XCTAssertEqual(markers, [.recoveryEnableNativeStarted, .recoveryEnableNativeFinished])
+    }
+
+    func testUnknownOrReversedBoundaryClockNeverPreventsRecovery() throws {
+        for samples: [UInt64?] in [[nil, 30], [30, nil], [30, 20]] {
+            var samples = samples
+            var markers: [InternalLifecycleStage] = []
+            XCTAssertEqual(try observeInternalRecoveryCommit({ .success }, nativeCall: { $0() },
+                now: { samples.removeFirst() }, trace: { stage, _, _ in markers.append(stage) }), .success)
+            XCTAssertEqual(markers, [.recoveryEnableNativeBoundaryUnavailable])
+        }
+    }
+
     func testRecoveryEnablesBuiltInWithoutExternalOrReadyProtectionAndLeavesRecordAlone() throws {
         let record = try makeRestoringRecord(sourceUnresolved: true)
         let snapshot = makeSnapshot(try layout(mainExternal: true), internalActive: false, includeExternal: false)
         let fake = FakeCalls()
+        var boundaries: [InternalLifecycleStage] = []
 
         try fake.transaction().enableInternalForRecovery(
             record: record, loadRecord: { record },
+            completionCall: { operation in
+                try observeInternalRecoveryCommit(operation, nativeCall: { $0() }, now: { nil },
+                    trace: { stage, _, _ in boundaries.append(stage) })
+            },
             internalReader: { identity in
                 let state = try snapshot.internalDisplayState(identity: identity)
                 return InternalDisplayState(id: state.id, identityUUID: state.identityUUID, isBuiltIn: state.isBuiltIn,
@@ -627,6 +688,7 @@ final class DisplayEnableTransactionTests: XCTestCase {
             }
         )
 
+        XCTAssertEqual(boundaries, [.recoveryEnableNativeBoundaryUnavailable])
         XCTAssertEqual(fake.events, [
             "begin", "configure:80:true", "complete:\(CGConfigureOption.forSession.rawValue)"
         ])

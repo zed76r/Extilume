@@ -682,6 +682,41 @@ class BatchGateTests(unittest.TestCase):
         self.gate.close()
         self.assertIsNone(collector.fd)
 
+    def test_native_fault_stops_gate_but_late_connection_is_saved_until_eof(self):
+        read, write = os.pipe()
+        reader, writer = os.fdopen(read, 'rb', buffering=0), os.fdopen(write, 'wb', buffering=0)
+        self.addCleanup(reader.close)
+        self.addCleanup(writer.close)
+        self.gate.attach_stream(reader.fileno())
+        collector = self.gate.stream
+        self.addCleanup(collector.close)
+        fault = dict(type='internal-lifecycle', clock='mach_continuous_time/ns', role='controller',
+                     stage='firstConnectionInvalidation', continuousNs=0)
+        writer.write((json.dumps(fault) + '\n').encode())
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            with collector.lock:
+                if collector.pending: break
+            time.sleep(.005)
+        with self.assertRaisesRegex(RuntimeError, 'native-fault'):
+            self.gate.tick()
+        self.assertTrue(self.gate.stopped)
+        self.gate.close()
+        observation = dict(type='display-connection-observation', clock='mach_continuous_time/ns', role='controller', continuousNs=1,
+                           flags=8, scope='other', invalidationReason='cg-remove', pid=123)
+        writer.write((json.dumps(observation) + '\n').encode())
+        boundary = dict(type='internal-lifecycle', clock='mach_continuous_time/ns', role='controller',
+                        stage='recoveryEnableNativeFinished', continuousNs=2, cgErrorCode=0, pid=123)
+        writer.write((json.dumps(boundary) + '\n').encode())
+        writer.close()
+        collector.thread.join(timeout=2)
+        self.assertFalse(collector.thread.is_alive())
+        self.gate.close()
+        saved = [json.loads(line) for line in self.gate.journal.path.with_suffix('.connections.jsonl').read_text().splitlines()]
+        self.assertEqual(saved, [{k: v for k, v in item.items() if k != 'pid'} for item in (observation, boundary)])
+        self.assertEqual(collector.take()[0], [boundary])
+        self.assertIsNone(collector.error)
+
     def test_close_is_idempotent_and_does_not_dispatch_cleanup(self):
         self.gate.close();self.gate.close()
         self.assertEqual(self.events()[-1]['controllerCleanup'],'requires-bound-safety-handoff')
@@ -791,12 +826,12 @@ class ApplicationCheckpointTests(unittest.TestCase):
 
 
 class LifecyclePipeTests(unittest.TestCase):
-    def pipe(self):
+    def pipe(self, connection_path=None):
         read, write = os.pipe()
         reader, writer = os.fdopen(read, 'rb', buffering=0), os.fdopen(write, 'wb', buffering=0)
         self.addCleanup(reader.close)
         self.addCleanup(writer.close)
-        collector = G.LifecyclePipe(reader.fileno())
+        collector = G.LifecyclePipe(reader.fileno(), connection_path)
         self.addCleanup(collector.close)
         return reader, writer, collector
 
@@ -883,6 +918,122 @@ class LifecyclePipeTests(unittest.TestCase):
         with tempfile.TemporaryFile() as file:
             with self.assertRaisesRegex(RuntimeError, 'lifecycle-not-pipe'):
                 G.LifecyclePipe(file.fileno())
+
+    def test_connection_formats_are_anonymous_and_private(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'observations.jsonl'
+            _, writer, collector = self.pipe(path)
+            io_event = dict(type='connection-observation', clock='mach_continuous_time/ns', role='controller',
+                observerStartedAtNanoseconds=10, continuousNs=11, event='interest', candidateOrdinal=1,
+                candidate=dict(role='registeredExternal', service='DCPAVDeviceProxy', rawID=999),
+                registryScope='target', messageType=12, messageArgument='one', messageClassification='unknown',
+                observedLocation='external', initial=False, disposition='revoked', invalidated=True,
+                pid=999, rawID=999)
+            cg_event = dict(type='display-connection-observation', clock='mach_continuous_time/ns', role='controller', continuousNs=12,
+                            flags=8, scope='other', invalidationReason='cg-remove', rawID=999)
+            writer.write(('\n'.join(map(json.dumps, (io_event, cg_event))) + '\n').encode())
+            writer.close()
+            events, ended, error = self.collect(collector, eof=True)
+            self.assertEqual(events, [])
+            self.assertTrue(ended)
+            self.assertIsNone(error)
+            saved = [json.loads(line) for line in path.read_text().splitlines()]
+            self.assertEqual(saved[0]['candidate'], {'role': 'registeredExternal', 'service': 'DCPAVDeviceProxy'})
+            self.assertEqual(saved[1]['invalidationReason'], 'cg-remove')
+            self.assertNotIn('999', path.read_text())
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+    def test_connection_rejects_unknown_strings_and_cannot_overwrite(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'observations.jsonl'
+            _, writer, collector = self.pipe(path)
+            with self.assertRaises(FileExistsError):
+                G.LifecyclePipe(collector.fd, path)
+            event = dict(type='display-connection-observation', clock='mach_continuous_time/ns',
+                         role='private-canary', continuousNs=1, flags=8, scope='other')
+            writer.write((json.dumps(event) + '\n').encode())
+            writer.close()
+            collector.thread.join(timeout=2)
+            _, ended, error = self.collect(collector, eof=True)
+            self.assertTrue(ended)
+            self.assertEqual(error, 'lifecycle-reader-failed')
+            self.assertTrue(collector.connection_error)
+            self.assertNotIn('private-canary', path.read_text())
+
+    def test_recovery_boundaries_remain_lifecycle_and_are_saved_without_extra_fields(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'observations.jsonl'
+            _, writer, collector = self.pipe(path)
+            events = [dict(type='internal-lifecycle', clock='mach_continuous_time/ns', role='controller',
+                           stage=stage, continuousNs=number, private='canary')
+                      for number, stage in enumerate(sorted(G.RECOVERY_ENABLE_BOUNDARIES))]
+            writer.write(('\n'.join(map(json.dumps, events)) + '\n').encode())
+            writer.close()
+            pending, ended, error = self.collect(collector, eof=True)
+            self.assertTrue(ended)
+            self.assertIsNone(error)
+            self.assertEqual(pending, events)
+            saved = [json.loads(line) for line in path.read_text().splitlines()]
+            self.assertEqual(saved, [{k: v for k, v in event.items() if k != 'private'} for event in events])
+            self.assertTrue(G.RECOVERY_ENABLE_BOUNDARIES <= G.LIFECYCLE_STAGES)
+
+    def test_connection_observation_limit_reports_missing_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'observations.jsonl'
+            _, writer, collector = self.pipe(path)
+            event = dict(type='display-connection-observation', clock='mach_continuous_time/ns',
+                         role='controller', continuousNs=1, flags=8, scope='other')
+            line = (json.dumps(event) + '\n').encode()
+            for _ in range(4097): writer.write(line)
+            writer.close()
+            collector.thread.join(timeout=2)
+            _, ended, error = self.collect(collector, eof=True)
+            self.assertTrue(ended)
+            self.assertEqual(error, 'lifecycle-reader-failed')
+            self.assertTrue(collector.connection_error)
+            self.assertEqual(len(path.read_text().splitlines()), 4096)
+
+    def test_connection_helper_rejects_unknown_type_and_clock(self):
+        event = dict(type='display-connection-observation', clock='mach_continuous_time/ns',
+                     role='controller', continuousNs=1, flags=8, scope='other')
+        for replacement in (dict(type='unknown'), dict(clock='unknown'), dict(clock=None)):
+            with self.subTest(replacement=replacement), self.assertRaisesRegex(RuntimeError, 'invalid-connection-observation'):
+                G.anonymous_connection(dict(event, **replacement))
+
+    def test_connection_and_recovery_boundaries_share_limit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'observations.jsonl'
+            _, writer, collector = self.pipe(path)
+            event = dict(type='display-connection-observation', clock='mach_continuous_time/ns',
+                         role='controller', continuousNs=1, flags=8, scope='other')
+            boundary = dict(type='internal-lifecycle', clock='mach_continuous_time/ns', role='controller',
+                            stage='recoveryEnableNativeStarted', continuousNs=2)
+            line = (json.dumps(event) + '\n').encode()
+            for _ in range(4095): writer.write(line)
+            writer.write(((json.dumps(boundary) + '\n') * 2).encode())
+            writer.close()
+            collector.thread.join(timeout=2)
+            self.assertFalse(collector.thread.is_alive())
+            self.assertTrue(collector.eof)
+            self.assertEqual(collector.error, 'lifecycle-reader-failed')
+            self.assertTrue(collector.connection_error)
+            saved = [json.loads(line) for line in path.read_text().splitlines()]
+            self.assertEqual(len(saved), 4096)
+            self.assertEqual(saved[-1], boundary)
+
+    def test_connection_fsync_failure_reports_missing_evidence(self):
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(G.os, 'fsync', side_effect=OSError('private')), \
+             patch.object(G.sys, 'stderr', new_callable=io.StringIO) as stderr:
+            path = Path(directory) / 'observations.jsonl'
+            _, writer, collector = self.pipe(path)
+            writer.close()
+            collector.thread.join(timeout=2)
+            self.assertFalse(collector.thread.is_alive())
+            self.assertTrue(collector.eof)
+            self.assertTrue(collector.connection_error)
+            self.assertEqual(collector.error, 'lifecycle-reader-failed')
+            self.assertEqual(stderr.getvalue(), 'connection-evidence-incomplete\n')
 
 
 class KernelIdentityTests(unittest.TestCase):

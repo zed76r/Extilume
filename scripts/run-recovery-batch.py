@@ -270,6 +270,16 @@ class BatchMac(D.Mac):
         return super().close()
 
 
+def close_gate_evidence(gate):
+    try:
+        gate.close()
+    except RuntimeError as error:
+        if str(error) != 'connection-evidence-incomplete':
+            raise
+        return False
+    return gate.stream is None or (gate.stream.eof and not getattr(gate.stream, 'connection_error', False))
+
+
 def execute(backend, gate):
     result = dict(scope=SCOPE, passed=False, hardwareAcceptance=False, automaticRetry=False,
                   processObservation='one-second-known-image-polling-with-transient-blind-spots')
@@ -309,9 +319,10 @@ def execute(backend, gate):
         result['consumedRequests'] = gate.next_action
         result['confirmedRequests'] = gate.confirmed_requests
         result['nativeDisableObserved'] = gate.native_disable_count
-        gate.close()
+        result['connectionEvidenceComplete'] = close_gate_evidence(gate)
         result['pipeEOF'] = gate.stream is None or gate.stream.eof
-        result['passed'] = result['passed'] and result['observerCleanupComplete'] and result['pipeEOF']
+        result['passed'] = (result['passed'] and result['observerCleanupComplete'] and result['pipeEOF']
+                            and result['connectionEvidenceComplete'])
     return result
 
 
@@ -415,6 +426,9 @@ def main(argv=None):
         if args.command == 'prepare':
             print(json.dumps(prepare(args.directory)))
             return 0
+        if not sys.stdin.isatty():
+            print('现场执行需要保持开启的交互终端；未领取额度或执行动作。', file=sys.stderr)
+            return 1
         bundle = D.private_directory(Path(args.bundle).absolute())
         D.require(Path(__file__).resolve() == bundle / 'scripts/run-recovery-batch.py', 'run-frozen-copy-required')
         field_digest = D.digest(args.field)
@@ -442,15 +456,15 @@ def main(argv=None):
                     time.sleep(.1)
                 except KeyboardInterrupt:
                     continue
-            gate.close()
-            D.save_new(bundle / 'handoff-pipe-eof.json', dict(pipeEOF=True, passed=False))
+            complete = close_gate_evidence(gate)
+            D.save_new(bundle / 'handoff-pipe-eof.json', dict(pipeEOF=True, passed=False, connectionEvidenceComplete=complete))
         return 0 if result['passed'] else 1
     except Exception:
         print('候选未就绪或本轮已停止；检查私有回执和已消费额度。', file=sys.stderr)
         return 1
     finally:
         if gate is not None:
-            gate.close()
+            close_gate_evidence(gate)
 
 
 if __name__ == '__main__':

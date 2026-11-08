@@ -1162,6 +1162,12 @@ final class GuardSession: @unchecked Sendable {
                         // CGBegin 返回后，setEnabled 才安装 Cancel defer。
                         return try self.powerGate.perform(invoke)
                     },
+                    completionCall: { invoke in
+                        try observeInternalRecoveryCommit(invoke, nativeCall: { operation in
+                            try self.checkRecoveryAccess()
+                            return try self.powerGate.perform(operation)
+                        })
+                    },
                     internalReader: { identity in
                         try self.checkRecoveryAccess()
                         try self.powerGate.check()

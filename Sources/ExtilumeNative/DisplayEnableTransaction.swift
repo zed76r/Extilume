@@ -3,6 +3,37 @@ import Darwin
 import ExtilumeCore
 import Foundation
 
+func observeInternalRecoveryCommit(
+    _ operation: () -> CGError, nativeCall: DisplayEnableTransaction.NativeCall,
+    now: @escaping () -> UInt64? = { try? ContinuousClock.nanoseconds() },
+    trace: (InternalLifecycleStage, UInt64?, CGError?) -> Void = {
+        traceInternalLifecycle($0, observedAt: $1, cgError: $2)
+    }
+) throws -> CGError {
+    var invoked = false
+    var started: UInt64?, finished: UInt64?
+    var nativeResult: CGError?
+    defer {
+        // 输出在外层调用返回后，避免诊断IO占用真实提交区间。
+        if let started, let finished, finished >= started {
+            trace(.recoveryEnableNativeStarted, started, nil)
+            trace(.recoveryEnableNativeFinished, finished, nativeResult)
+        } else if invoked {
+            trace(.recoveryEnableNativeBoundaryUnavailable, nil, nativeResult)
+        }
+    }
+    return try withoutActuallyEscaping(operation) { operation in
+        try nativeCall {
+            invoked = true
+            started = now()
+            let result = operation()
+            finished = now()
+            nativeResult = result
+            return result
+        }
+    }
+}
+
 enum DisplayEnableTransactionError: Error, Equatable {
     case symbolUnavailable
     case invalidDisplay
@@ -122,6 +153,7 @@ final class DisplayEnableTransaction {
         loadRecord: () throws -> RecoveryRecord?,
         trace: @escaping Trace = { _, _ in },
         nativeCall: NativeCall = { $0() },
+        completionCall: NativeCall? = nil,
         internalReader: (UUID) throws -> InternalDisplayState
     ) throws {
         try record.validate()
@@ -136,7 +168,7 @@ final class DisplayEnableTransaction {
         let initial = try readInternal()
         guard initial.matches(identity: responsibility.identity, hardwareIdentity: responsibility.hardwareIdentity) else { throw RecoveryError.identityConflict }
         let display = initial.id
-        try setEnabled(display: display, enabled: true, trace: trace, nativeCall: nativeCall) {
+        try setEnabled(display: display, enabled: true, trace: trace, nativeCall: nativeCall, completionCall: completionCall) {
             guard try loadRecord() == record else { throw RecoveryError.unfinishedTransaction }
             let actual = try readInternal()
             guard actual.matches(identity: responsibility.identity, hardwareIdentity: responsibility.hardwareIdentity),

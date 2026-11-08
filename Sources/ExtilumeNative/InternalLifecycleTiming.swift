@@ -24,6 +24,7 @@ enum InternalLifecycleStage: String, Encodable {
     case configurationConfirmationStarted, configurationConfirmationFinished, configurationConfirmationFailed
     case wakeTopologyCheckStarted, wakeTopologyWaiting, wakeTopologyReady, wakeTopologyRejected
     case linkReconfigurationStarted, linkReconfigurationCollected, linkReconfigurationVerified, linkReconfigurationFailed
+    case recoveryEnableNativeStarted, recoveryEnableNativeFinished, recoveryEnableNativeBoundaryUnavailable
 }
 
 enum InternalLifecycleRole: String, Encodable, Sendable { case controller, helper, recoveryEntry, witness, observer }

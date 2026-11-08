@@ -88,7 +88,8 @@ App在真实worker／helper退出、channel drain、独立恢复核验及清责�
 
 ```sh
 python3 scripts/run-recovery-batch.py prepare --directory "$CANDIDATE"
-# 当前现场及权限就绪并写好本轮field.json后，才使用冻结副本：
+# 当前现场及权限就绪并写好本轮field.json后，在保持开启的交互终端中使用冻结副本：
+# 自动执行必须分配PTY；清保护锁的外层入口也先核验stdin.isatty()。
 python3 "$CANDIDATE/scripts/run-recovery-batch.py" run --bundle "$CANDIDATE" --field "$CANDIDATE/field.json"
 ```
 
@@ -237,3 +238,27 @@ v3仅覆盖已离线验证的启动登记修复；Native源码与v2完全相同�
 离线相关Swift用例共298项：297通过、1项既有交互菜单用例跳过。其中两项随机UserDefaults域持久化用例初次被文件沙箱拒绝，独立在沙箱外复测通过；未操作日常偏好。Python回归206项通过，涵盖启动登记、原故障拒绝、正常十秒后就绪、总截止、原生动作额度、旧策略及缺失事件拒绝；Release构建和OpenSpec严格校验通过。独立审查发现的正常暂停锁死和退出时迟到waiting误判均已修复并有回归。
 
 本次未启动真实App／probe，未清保护锁、写恢复记录、请求睡眠或新增现场轮次，未提交、推送或安装。v2／v3冻结成员、结果及消费证据保持原样。离线功能实现完成；新候选真实醒后重应用及完整F／S验收仍待单独现场验证，任务4.*及完整3.3保持未完成，进度8/15。
+
+
+### 2026-11-08正常主链v4：输入关闭前缀停止及终端门禁修正
+
+已提交正常就绪修复7f3809d，随后从该提交独立导出构建v4；159份来源／171个冻结成员及严格签名通过，相关Swift298项（297通过、1既有交互跳过）和Python206项通过。只读前检确认开盖、完整双屏C／原模式／内屏硬件身份、无控制进程、旧责任结清；用户明确授权v4单轮及限定菜单收尾。
+
+已备份偏好并仅移除internalControlFailure.v1。执行时没有分配PTY，stdin管道已关闭；批次领取后在启动前以human-input-closed停止。consumedRequests／confirmedRequests／nativeDisableObserved均为0，没有启动App、停用、睡眠或新恢复记录，pipeEOF=true；没有派发正常quit，也未消费限定菜单结束授权。本轮停止结果及已消费批次保留，不补跑。随后只写回备份中原保护锁，逐项确认其他偏好不变；独立新读回完整C／原模式及内屏硬件身份正常、无控制进程、旧记录不变。原result中的安全交接结果不回填，独立收尾另存closeout-verification.json。
+
+已用反例修正工具入口：run无交互终端时，在读取现场清单或领取额度之前明确拒绝；prepare继续允许非交互构建。未来清锁封装亦须先检查stdin.isatty()；本任务新封装已在任何偏好写入前设置该检查。三项新增回归涵盖无TTY零读取／零配额、真实伪终端继续校验、非交互prepare；旧实现其中一项失败，新实现Python209项通过。原生源码没有变化，修正及本记录尚未提交。
+
+v4完整物料位于.local/verification/normal-mainchain-20261108-v4/。新v5仅在7f3809d导出上叠加上述两个Python文件，其他Native／Swift测试字节与v4完全相同；Release及严格签名、159份来源／171个冻结成员和209项Python隔离回归通过，复用适用的297项Swift通过／1跳过结果。v5只读前检通过；清锁前拒绝无TTY的入口已验证，模板仍未授权、配额未领取。新候选位于.local/verification/normal-mainchain-20261108-v5/，再次执行须新的单轮授权。未推送或安装；实机睡眠与自动重应用仍未验收，8/15保持。
+
+
+### 2026-11-08正常主链v5：醒后自动重应用完成，最终退出连接失效
+
+用户另行授权v5单轮及限定菜单收尾。实际分配PTY，先备份偏好并仅清保护锁；首次停用、恢复C、确认C、一次普通睡眠及醒后自动重应用依次完成，前四个动作均确认。正休眠共同区间为[5.649103874,5.649104210]秒；电源通知跨度13.148842916秒单列，不作为休眠时长。原始主控唤醒至再次disableStarted为4.885197750秒、至disableFinished为5.945962209秒，实际两次停用均有Native消费和完成证明；醒后本机弹窗确认外屏正常可操作。
+
+唯一正常stop请求恢复时，enableCompleteStarted之后记录firstConnectionInvalidation，执行器按原native-fault锁存停止。最终consumedRequests=5、confirmedRequests=4、nativeDisableObserved=2，未确认动作为stop，pipeEOF=true。本轮不补跑，不将睡眠分支完成升级为整轮通过；没有额外正常quit或菜单终止。
+
+用户随后确认双屏正常、可操作且未救援。独立读回确认完整原C／原模式、内屏硬件及启用状态、原记录清单正常，App／owner／helper均已无内核进程，保护锁存在。原子restoration.json与注册App身份、本轮会话／代次及C绑定，record为restored、无pending／sourceUnresolved、independentGuardVerified=true；当前记录已按原协议清除，仅留空目录。原result及失败标记保留，独立收尾另存.local/verification/normal-mainchain-20261108-v5/closeout-verification.json，未回填其recoveryVerified字段。
+
+离线确认：stop有意在restoreRecord后才停止并排空ConnectionObserver，恢复enable的Complete未接入停用专用的重配门禁。本轮执行器只保存首次失效的role／stage／时间，丢弃现有结构化连接观测；因此具体CG flags或IO事件来源未知。不能把最终C正常推断为此次事件必属自身恢复，也不通过提前停观察或放宽App故障判定消除失败。恢复enable必须继续支持外屏已断开或保护已失效的情况。
+
+已离线补齐匿名证据留存，控制和故障策略保持：reader把已有CG／IO白名单字段和恢复真实Complete边界写入私有不可覆盖的.connections.jsonl，故障后继续排空至EOF，连接观测与边界合计最多4096条；额外字段不落盘，枚举／整数有限校验，EOF后同步并报告缺证。新增恢复边界只在真实调用内采样，外层powerGate返回或抛错后输出；未知计时不阻断、重试或增加恢复enable。执行器保留原始stopReason，诊断写入失败只增加缺证结果，不覆盖已有native-fault。153项Swift、219项Python及Release通过，独立审查未发现阻塞项；新诊断尚无现场样本，源码及本记录未提交、未安装。未新增现场轮次，完整4.*及3.3仍未完成，8/15保持。

@@ -8,6 +8,7 @@ import subprocess
 import select
 import fcntl
 import stat
+import sys
 import threading
 import time
 from pathlib import Path
@@ -33,8 +34,11 @@ internalOnlineReadStarted internalOnlineReadFinished internalActiveReadStarted i
 configurationConfirmationStarted configurationConfirmationFinished configurationConfirmationFailed
 disableStarted disableFinished disableFailed wakeTopologyCheckStarted wakeTopologyWaiting wakeTopologyReady
 wakeTopologyRejected linkReconfigurationStarted linkReconfigurationCollected linkReconfigurationVerified linkReconfigurationFailed
+recoveryEnableNativeStarted recoveryEnableNativeFinished recoveryEnableNativeBoundaryUnavailable
 """.split())
 
+RECOVERY_ENABLE_BOUNDARIES = {'recoveryEnableNativeStarted', 'recoveryEnableNativeFinished',
+                              'recoveryEnableNativeBoundaryUnavailable'}
 
 NATIVE_FAILURE_CODES = frozenset("""
 connection-confirmation-required enable-symbol-unavailable enable-invalid-display enable-begin-failed
@@ -166,9 +170,77 @@ def application_checkpoint(action, reply, events, requested_at, observed_at, dea
     return True
 
 
+CONNECTION_ENUMS = {
+    'role': {'controller', 'helper', 'recoveryEntry', 'witness', 'observer'},
+    'event': {'matched', 'interest', 'terminated', 'watchFailed'},
+    'registryScope': {'unknown', 'target', 'other', 'expected-internal', 'identity-conflict'},
+    'messageArgument': {'zero', 'one', 'two', 'other'},
+    'messageClassification': {'protectionChanged', 'audioLinkStart', 'videoLinkStart', 'audioLinkStarted',
+                              'videoLinkStarted', 'audioLinkStop', 'videoLinkStop', 'audioLinkStopped',
+                              'videoLinkStopped', 'unknown'},
+    'observedLocation': {'external', 'embedded', 'unavailable', 'other'},
+    'disposition': {'registered', 'unchanged', 'revoked', 'controlledEmbeddedTermination',
+                    'informational', 'pendingReconfiguration'},
+    'scope': {'unknown', 'other', 'expected-internal'},
+    'invalidationReason': {'cg-remove', 'cg-disabled'},
+}
+CONNECTION_CANDIDATE_ENUMS = {
+    'role': {'unidentified', 'unregistered', 'registeredExternal', 'registeredEmbedded', 'retiredEmbedded'},
+    'service': {'DCPAVDeviceProxy', 'DCPAVServiceProxy', 'DCPAVVideoInterfaceProxy'},
+}
+
+
+def anonymous_connection(event):
+    kind = event.get('type')
+    D.require(kind in ('connection-observation', 'display-connection-observation')
+              and event.get('clock') == 'mach_continuous_time/ns', 'invalid-connection-observation')
+    fields = {'role', 'observerStartedAtNanoseconds', 'continuousNs'}
+    if kind == 'connection-observation':
+        fields |= {'event', 'candidateOrdinal', 'registryScope', 'messageType', 'messageArgument',
+                   'messageClassification', 'observedLocation', 'initial', 'disposition', 'invalidated'}
+    else:
+        fields |= {'flags', 'scope', 'invalidationReason'}
+    result = {'type': kind, 'clock': 'mach_continuous_time/ns'}
+    for key in fields & event.keys():
+        value = event[key]
+        if key in CONNECTION_ENUMS:
+            D.require(type(value) is str and value in CONNECTION_ENUMS[key], 'invalid-connection-observation')
+        elif key in ('initial', 'invalidated'):
+            D.require(type(value) is bool, 'invalid-connection-observation')
+        else:
+            limit = 2**32 - 1 if key in ('flags', 'messageType') else 2**64 - 1
+            D.require(type(value) is int and 0 <= value <= limit, 'invalid-connection-observation')
+        result[key] = value
+    required = {'role', 'continuousNs'} | ({'event', 'candidate', 'registryScope', 'disposition', 'invalidated'}
+               if kind == 'connection-observation' else {'flags', 'scope'})
+    D.require(required <= event.keys(), 'invalid-connection-observation')
+    if kind == 'connection-observation':
+        candidate = event['candidate']
+        D.require(isinstance(candidate, dict) and 'role' in candidate, 'invalid-connection-observation')
+        result['candidate'] = {}
+        for key in CONNECTION_CANDIDATE_ENUMS.keys() & candidate.keys():
+            value = candidate[key]
+            D.require(type(value) is str and value in CONNECTION_CANDIDATE_ENUMS[key], 'invalid-connection-observation')
+            result['candidate'][key] = value
+    return result
+
+
+def anonymous_recovery_boundary(event):
+    D.require(event.get('type') == 'internal-lifecycle' and event.get('clock') == 'mach_continuous_time/ns'
+              and type(event.get('role')) is str and event['role'] in CONNECTION_ENUMS['role']
+              and type(event.get('stage')) is str and event['stage'] in RECOVERY_ENABLE_BOUNDARIES
+              and type(event.get('continuousNs')) is int and 0 <= event['continuousNs'] < 2**64,
+              'invalid-recovery-boundary')
+    fields = ('type', 'clock', 'role', 'stage', 'continuousNs', 'cgErrorCode')
+    if 'cgErrorCode' in event:
+        D.require(type(event['cgErrorCode']) is int and -(2**31) <= event['cgErrorCode'] < 2**31,
+                  'invalid-recovery-boundary')
+    return {key: event[key] for key in fields if key in event}
+
+
 class LifecyclePipe:
     """消费启动器交付的独占stdout管道；只关闭自己的副本，不向进程发信号。"""
-    def __init__(self, fd):
+    def __init__(self, fd, connection_path=None):
         D.require(stat.S_ISFIFO(os.fstat(fd).st_mode), 'lifecycle-not-pipe')
         D.require(fcntl.fcntl(fd, fcntl.F_GETFL) & os.O_ACCMODE == os.O_RDONLY, 'lifecycle-not-readable')
         self.lock = threading.Lock()
@@ -176,17 +248,27 @@ class LifecyclePipe:
         self.pending = []
         self.error = None
         self.eof = False
+        self.connection_file = None
+        self.connection_context = None
+        self.connection_count = 0
+        self.connection_error = False
         self.thread = threading.Thread(target=self.read, daemon=False)
         self.fd = os.dup(fd)
         try:
+            if connection_path is not None:
+                self.connection_context = D.CLOCK.private_file(connection_path, create=True)
+                self.connection_file = self.connection_context.__enter__()
             os.set_blocking(self.fd, False)
             self.thread.start()
         except BaseException:
+            if self.connection_file is not None:
+                self.connection_context.__exit__(None, None, None)
             os.close(self.fd)
             raise
 
     def read(self):
         buffer = b''
+        reached_eof = False
         try:
             while not self.stop.is_set():
                 if not select.select([self.fd], [], [], 0.1)[0]:
@@ -197,9 +279,10 @@ class LifecyclePipe:
                     continue
                 with self.lock:
                     if not chunk:
-                        self.eof = True
+                        reached_eof = True
                         if buffer and self.error is None:
                             self.error = 'lifecycle-truncated'
+                            self.connection_error = self.connection_file is not None
                         return
                     if self.error is not None:
                         continue  # Keep draining so diagnostic output cannot block the owner.
@@ -216,6 +299,27 @@ class LifecyclePipe:
                         except (ValueError, UnicodeError):
                             raise RuntimeError('lifecycle-invalid-line') from None
                         D.require(isinstance(event, dict), 'lifecycle-invalid-line')
+                        if event.get('type') in ('connection-observation', 'display-connection-observation'):
+                            if self.connection_file is not None:
+                                try:
+                                    D.require(self.connection_count < 4096, 'connection-observation-overflow')
+                                    self.connection_file.write(json.dumps(anonymous_connection(event), separators=(',', ':')) + '\n')
+                                    self.connection_file.flush()
+                                    self.connection_count += 1
+                                except (OSError, ValueError, RuntimeError):
+                                    self.connection_error = True
+                                    raise
+                            continue
+                        if (self.connection_file is not None and event.get('type') == 'internal-lifecycle'
+                                and type(event.get('stage')) is str and event['stage'] in RECOVERY_ENABLE_BOUNDARIES):
+                            try:
+                                D.require(self.connection_count < 4096, 'connection-observation-overflow')
+                                self.connection_file.write(json.dumps(anonymous_recovery_boundary(event), separators=(',', ':')) + '\n')
+                                self.connection_file.flush()
+                                self.connection_count += 1
+                            except (OSError, ValueError, RuntimeError):
+                                self.connection_error = True
+                                raise
                         if 'stage' in event or event.get('type') == 'internal-lifecycle':
                             D.require(event.get('type') == 'internal-lifecycle', 'lifecycle-invalid-line')
                             D.require(len(self.pending) < 4096, 'lifecycle-overflow')
@@ -224,16 +328,40 @@ class LifecyclePipe:
         except (OSError, ValueError, RuntimeError):
             with self.lock:
                 self.error = 'lifecycle-reader-failed'
+                if self.connection_file is not None:
+                    self.connection_error = True
             # No further writes are allowed once this is observed; keep the pipe drained until handoff.
             while not self.stop.is_set():
                 try:
                     if select.select([self.fd], [], [], 0.1)[0] and not os.read(self.fd, 4096):
-                        with self.lock: self.eof = True
+                        reached_eof = True
                         return
                 except BlockingIOError:
                     continue
                 except OSError:
                     return
+        finally:
+            if self.connection_file is not None:
+                if not reached_eof:
+                    self.connection_error = True
+                try:
+                    self.connection_file.flush()
+                    os.fsync(self.connection_file.fileno())
+                except (OSError, ValueError):
+                    with self.lock:
+                        self.connection_error = True
+                        self.error = 'lifecycle-reader-failed'
+                finally:
+                    try:
+                        self.connection_context.__exit__(None, None, None)
+                    except (OSError, ValueError):
+                        with self.lock:
+                            self.connection_error = True
+                            self.error = 'lifecycle-reader-failed'
+                if self.connection_error:
+                    print('connection-evidence-incomplete', file=sys.stderr, flush=True)
+            with self.lock:
+                self.eof = reached_eof
 
     def take(self):
         with self.lock:
@@ -302,7 +430,7 @@ class RecoveryBatchGate:
                             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                             env=environment, start_new_session=True)
             self.application_process = process
-            self.stream = LifecyclePipe(process.stdout.fileno())
+            self.stream = LifecyclePipe(process.stdout.fileno(), self.journal.path.with_suffix('.connections.jsonl'))
             self.bind('app', self.read_process(process.pid))
             return process
         except BaseException:
@@ -462,7 +590,7 @@ class RecoveryBatchGate:
             self.tick()
             D.require(self.stream is None and self.next_action == 0 and 'app' in self.roles,
                       'lifecycle-attachment-order')
-            self.stream = LifecyclePipe(fd)
+            self.stream = LifecyclePipe(fd, self.journal.path.with_suffix('.connections.jsonl'))
         except BaseException:
             self._latch_stop()
             raise
@@ -782,6 +910,7 @@ class RecoveryBatchGate:
                 self.stream.close()
                 if self.application_process is not None:
                     self.application_process.stdout.close()
+                D.require(not self.stream.connection_error, 'connection-evidence-incomplete')
             return
         self.closed = True
         try:
@@ -798,5 +927,7 @@ class RecoveryBatchGate:
                     self.stream.close()
                     if self.application_process is not None:
                         self.application_process.stdout.close()
+                    if isinstance(self.stream, LifecyclePipe):
+                        D.require(not self.stream.connection_error, 'connection-evidence-incomplete')
             finally:
                 self.journal.close()

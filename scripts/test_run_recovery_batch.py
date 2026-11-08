@@ -3,6 +3,7 @@ import importlib.util
 import io
 import json
 import os
+import pty
 from pathlib import Path
 import tempfile
 import time
@@ -17,6 +18,54 @@ spec.loader.exec_module(R)
 G = R.G
 FIX = G.D.load_tool('test_calibrate_recovery_clock')
 SNAP = G.D.load_tool('test_diagnose_recovery_baseline')
+
+
+class CleanupEvidenceTests(unittest.TestCase):
+    def test_diagnostic_close_failure_preserves_original_native_fault(self):
+        def fault(): raise RuntimeError('native-fault')
+        def close(): raise RuntimeError('connection-evidence-incomplete')
+        backend = SimpleNamespace(tick=lambda **_: fault(), safety_handoff=lambda: {}, close=lambda: True)
+        gate = SimpleNamespace(next_action=0, confirmed_requests=0, native_disable_count=0, stream=None, close=close)
+        result = R.execute(backend, gate)
+        self.assertEqual(result['stopReason'], 'native-fault')
+        self.assertFalse(result['connectionEvidenceComplete'])
+        self.assertFalse(result['passed'])
+        self.assertTrue(result['pipeEOF'])
+
+    def test_other_close_errors_are_not_suppressed(self):
+        def close(): raise RuntimeError('other-failure')
+        with self.assertRaisesRegex(RuntimeError, 'other-failure'):
+            R.close_gate_evidence(SimpleNamespace(close=close))
+
+
+class TerminalEntryTests(unittest.TestCase):
+    def test_run_without_terminal_rejects_before_field_read_or_quota(self):
+        with patch.object(R.sys, 'stdin', io.StringIO()), \
+             patch.object(R.sys, 'stderr', io.StringIO()), \
+             patch.object(R.D, 'private_directory', side_effect=RuntimeError('test-stop')) as directory, \
+             patch.object(G, 'RecoveryBatchGate') as gate:
+            self.assertEqual(R.main(['run', '--bundle', '/not-used', '--field', '/not-used']), 1)
+            directory.assert_not_called()
+            gate.assert_not_called()
+
+    def test_run_with_terminal_reaches_field_validation(self):
+        master, slave = pty.openpty()
+        try:
+            with os.fdopen(slave) as terminal, \
+                 patch.object(R.sys, 'stdin', terminal), \
+                 patch.object(R.sys, 'stderr', io.StringIO()), \
+                 patch.object(R.D, 'private_directory', side_effect=RuntimeError('test-stop')) as directory:
+                self.assertEqual(R.main(['run', '--bundle', '/not-used', '--field', '/not-used']), 1)
+                directory.assert_called_once()
+        finally:
+            os.close(master)
+
+    def test_prepare_still_supports_noninteractive_builds(self):
+        with patch.object(R.sys, 'stdin', io.StringIO()), \
+             patch.object(R.sys, 'stdout', io.StringIO()), \
+             patch.object(R, 'prepare', return_value={'prepared': True}) as prepare:
+            self.assertEqual(R.main(['prepare', '--directory', '/not-used']), 0)
+            prepare.assert_called_once_with('/not-used')
 
 
 class BatchEvidenceTests(unittest.TestCase):
