@@ -41,14 +41,6 @@ private final class FaultedExitVerifierState: @unchecked Sendable {
     var calls: [FaultedExitVerifierCall] { lock.withLock { recordedCalls } }
 }
 
-private final class FaultedExitPersistState: @unchecked Sendable {
-    private let lock = NSLock()
-    private var results: [Bool] = []
-
-    func append(_ result: Bool) { lock.withLock { results.append(result) } }
-    var calls: [Bool] { lock.withLock { results } }
-}
-
 private final class FaultedExitClock: @unchecked Sendable {
     private let lock = NSLock()
     private let initial: UInt64 = 50_000
@@ -78,10 +70,8 @@ private struct FaultedExitRun {
     let results: FaultedExitResults
     let factoryState: FaultedExitFactoryState
     let verifierState: FaultedExitVerifierState
-    let persistState: FaultedExitPersistState
     let firstCommandURL: URL
     let secondCommandURL: URL
-    let faultPersistedURL: URL
     let firstExitURL: URL
     let helperExitURL: URL
     let secondExitURL: URL
@@ -127,11 +117,10 @@ final class InternalFaultedExitTests: XCTestCase {
     }
 
     func testNormalStoppedEventPublishesBatchReceiptAfterClearAndPeerExit() throws {
-        let run = try makeRun(secondPeer: .success, persistFailure: true, normalStop: true)
+        let run = try makeRun(secondPeer: .success, normalStop: true)
         defer { try? FileManager.default.removeItem(at: run.directory) }
         XCTAssertEqual(run.results.completion, true, diagnostics(run))
         XCTAssertEqual(run.factoryState.calls, 1)
-        XCTAssertTrue(run.persistState.calls.isEmpty)
         XCTAssertFalse(FileManager.default.fileExists(atPath: run.recordURL.path))
         XCTAssertTrue(FileManager.default.fileExists(atPath: run.helperExitURL.path))
         let bytes = try Data(contentsOf: run.directory.appendingPathComponent("batch-restoration.json"))
@@ -139,13 +128,11 @@ final class InternalFaultedExitTests: XCTestCase {
     }
 
     func testQuitAfterFaultAddsReadOnlyPeerAndClearsOnlyAfterExactProof() throws {
-        let run = try makeRun(secondPeer: .success, persistFailure: true)
+        let run = try makeRun(secondPeer: .success)
         defer { try? FileManager.default.removeItem(at: run.directory) }
 
         XCTAssertEqual(run.results.completion, true, diagnostics(run))
-        XCTAssertTrue(run.persistState.calls.contains(true))
         XCTAssertEqual(run.factoryState.calls, 2)
-        XCTAssertTrue(FileManager.default.fileExists(atPath: run.faultPersistedURL.path))
         XCTAssertTrue(FileManager.default.fileExists(atPath: run.helperExitURL.path))
         XCTAssertFalse(FileManager.default.fileExists(atPath: run.recordURL.path))
         XCTAssertTrue(FileManager.default.fileExists(atPath: run.directory.appendingPathComponent("batch-restoration.json").path))
@@ -156,22 +143,8 @@ final class InternalFaultedExitTests: XCTestCase {
         XCTAssertEqual(run.verifierState.calls.last?.returnedRecord, run.restoredRecord)
     }
 
-    func testFailedFaultPersistenceRetainsOriginalRecordAndStartsNoSecondPeer() throws {
-        let run = try makeRun(secondPeer: .success, persistFailure: false)
-        defer { try? FileManager.default.removeItem(at: run.directory) }
-
-        XCTAssertEqual(run.results.completion, false, diagnostics(run))
-        XCTAssertEqual(run.persistState.calls.first, false)
-        XCTAssertEqual(run.factoryState.calls, 1)
-        XCTAssertFalse(FileManager.default.fileExists(atPath: run.faultPersistedURL.path))
-        XCTAssertTrue(FileManager.default.fileExists(atPath: run.helperExitURL.path))
-        XCTAssertEqual(run.verifierState.calls.count, 1)
-        XCTAssertEqual(run.verifierState.calls.first?.returnedRecord, run.restoredRecord)
-        XCTAssertEqual(try Self.loadRecord(from: run.directory), run.restoredRecord)
-    }
-
     func testSecondPeerWithDifferentSessionExpectationRetainsRecord() throws {
-        let run = try makeRun(secondPeer: .wrongExpectation, persistFailure: true)
+        let run = try makeRun(secondPeer: .wrongExpectation)
         defer { try? FileManager.default.removeItem(at: run.directory) }
 
         XCTAssertEqual(run.results.completion, false)
@@ -182,7 +155,7 @@ final class InternalFaultedExitTests: XCTestCase {
     }
 
     func testOriginalPeerCannotChangeExpectedGenerationAfterFault() throws {
-        let run = try makeRun(secondPeer: .success, persistFailure: true, changeExpectationAfterFault: true)
+        let run = try makeRun(secondPeer: .success, changeExpectationAfterFault: true)
         defer { try? FileManager.default.removeItem(at: run.directory) }
 
         XCTAssertEqual(run.results.completion, false, diagnostics(run))
@@ -194,7 +167,7 @@ final class InternalFaultedExitTests: XCTestCase {
 
     func testFaultedOrUnfinishedSecondPeerRetainsRecordWithoutThirdPeer() throws {
         for behavior in [SecondPeerBehavior.faulted, .missingFinished] {
-            let run = try makeRun(secondPeer: behavior, persistFailure: true)
+            let run = try makeRun(secondPeer: behavior)
             defer { try? FileManager.default.removeItem(at: run.directory) }
 
             XCTAssertEqual(run.results.completion, false, "\(behavior.rawValue)")
@@ -205,7 +178,7 @@ final class InternalFaultedExitTests: XCTestCase {
     }
 
     func testDeadlineAfterFinalVerifierPreventsClearWithoutWatchdog() throws {
-        let run = try makeRun(secondPeer: .success, persistFailure: true, advanceAfterFinalVerifier: true)
+        let run = try makeRun(secondPeer: .success, advanceAfterFinalVerifier: true)
         defer { try? FileManager.default.removeItem(at: run.directory) }
 
         XCTAssertEqual(run.results.completion, false)
@@ -241,7 +214,6 @@ final class InternalFaultedExitTests: XCTestCase {
 
     private func makeRun(
         secondPeer: SecondPeerBehavior,
-        persistFailure: Bool,
         advanceAfterFinalVerifier: Bool = false,
         changeExpectationAfterFault: Bool = false,
         normalStop: Bool = false
@@ -258,7 +230,6 @@ final class InternalFaultedExitTests: XCTestCase {
         let stoppedEventURL = directory.appendingPathComponent("stopped.json")
         let firstCommandURL = directory.appendingPathComponent("first-command.json")
         let secondCommandURL = directory.appendingPathComponent("second-command.json")
-        let faultPersistedURL = directory.appendingPathComponent("fault-persisted")
         let firstExitURL = directory.appendingPathComponent("first-exit")
         let helperExitURL = directory.appendingPathComponent("helper-exit")
         let secondExitURL = directory.appendingPathComponent("second-exit")
@@ -284,7 +255,6 @@ final class InternalFaultedExitTests: XCTestCase {
         let results = FaultedExitResults()
         let factoryState = FaultedExitFactoryState()
         let verifierState = FaultedExitVerifierState()
-        let persistState = FaultedExitPersistState()
         let clock = FaultedExitClock()
         let factory = peerFactory(
             state: factoryState,
@@ -331,15 +301,6 @@ final class InternalFaultedExitTests: XCTestCase {
                 try self.write(record, to: directory.appendingPathComponent("batch-restoration.json"))
             }
         )
-        let persist: @MainActor () -> Bool = {
-            persistState.append(persistFailure)
-            if persistFailure {
-                try? Data("persisted".utf8).write(to: faultPersistedURL, options: .atomic)
-                try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: faultPersistedURL.path)
-            }
-            return persistFailure
-        }
-        controller.persistFailureForExit = persist
         controller.startApplication(registerEvents: false) { results.append($0) }
         guard pump({ results.statuses.contains(.applied) }) else {
             throw GuardChannelError.timedOut
@@ -378,10 +339,8 @@ final class InternalFaultedExitTests: XCTestCase {
             results: results,
             factoryState: factoryState,
             verifierState: verifierState,
-            persistState: persistState,
             firstCommandURL: firstCommandURL,
             secondCommandURL: secondCommandURL,
-            faultPersistedURL: faultPersistedURL,
             firstExitURL: firstExitURL,
             helperExitURL: helperExitURL,
             secondExitURL: secondExitURL,
@@ -685,7 +644,7 @@ final class InternalFaultedExitTests: XCTestCase {
         let first = (try? String(contentsOf: run.firstDiagnosticURL, encoding: .utf8)) ?? "missing"
         let second = (try? String(contentsOf: run.secondDiagnosticURL, encoding: .utf8)) ?? "missing"
         let command = (try? String(contentsOf: run.secondCommandURL, encoding: .utf8)) ?? "missing"
-        return "statuses=\(run.results.statuses), callbacks=\(run.persistState.calls), "
+        return "statuses=\(run.results.statuses), "
             + "factories=\(run.factoryState.calls), verifiers=\(run.verifierState.calls), "
             + "firstIPC=\(first), secondIPC=\(second), secondCommand=\(command)"
     }

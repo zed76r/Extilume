@@ -7,11 +7,9 @@ import ExtilumeCore
 final class DisplayModeCoordinatorTests: XCTestCase {
     private final class Preferences: DisplayModePreferenceStoring {
         var selectedMode: DisplayApplicationMode?
-        var internalControlLocked = false
         var externalHandoffRequested = false
         var failHandoffSave = false
         func select(_ mode: DisplayApplicationMode) throws { selectedMode = mode }
-        func lockInternalControl() throws { internalControlLocked = true }
         func setExternalHandoffRequested(_ requested: Bool) throws {
             if failHandoffSave { throw RecoveryStoreError.ioFailure }
             externalHandoffRequested = requested
@@ -326,7 +324,6 @@ final class DisplayModeCoordinatorTests: XCTestCase {
         primary.handler?(.quitFailed)
         internalSession.handler?(.applied)
         await drain()
-        XCTAssertFalse(preferences.internalControlLocked)
         coordinator.restoreForConfiguration()
         coordinator.restoreForConfiguration()
         XCTAssertEqual(internalSession.recoveries, 1)
@@ -433,12 +430,11 @@ final class DisplayModeCoordinatorTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: root.appendingPathComponent("recovery-record.json").path))
     }
 
-    func testProtectedExternalOnlySelectionRestoresExternalOwnerBeforeRejection() async throws {
+    func testExternalOnlySelectionWaitsForExternalOwnerRestoration() async throws {
         for restored in [false, true] {
             let root = try directory()
             defer { try? FileManager.default.removeItem(at: root) }
             let preferences = Preferences()
-            preferences.internalControlLocked = true
             let external = Session()
             var modes: [DisplayApplicationMode] = []
             let statuses = StatusValues()
@@ -460,12 +456,12 @@ final class DisplayModeCoordinatorTests: XCTestCase {
             finishRestore(restored)
             await drain()
 
-            XCTAssertEqual(modes, [.internalOnly], "Protected internal control must never start")
-            XCTAssertTrue(preferences.internalControlLocked)
             if restored {
                 XCTAssertFalse(coordinator.hasExternalRecoveryOwner)
-                guard case .unsupported = statuses.last else { return XCTFail("Restored owner must leave the protection gate closed") }
+                XCTAssertEqual(modes, [.internalOnly, .externalOnly])
+                XCTAssertEqual(statuses.last, .applying)
             } else {
+                XCTAssertEqual(modes, [.internalOnly], "Unfinished restoration must block the next mode")
                 XCTAssertEqual(statuses.last, .recoveryIncomplete)
                 external.handler?(.quitFailed)
                 await drain()
@@ -488,7 +484,7 @@ final class DisplayModeCoordinatorTests: XCTestCase {
         }
     }
 
-    func testFailedRecoveryRetainsOwnerAndPersistentDisableLatch() async throws {
+    func testFailedRecoveryRetainsOwnerUntilRestoredThenAllowsExplicitRetry() async throws {
         let root = try directory()
         defer { try? FileManager.default.removeItem(at: root) }
         let preferences = Preferences()
@@ -505,7 +501,6 @@ final class DisplayModeCoordinatorTests: XCTestCase {
         coordinator.selectMode(.externalPrimary)
         internalSession.quitCompletion?(false)
         await drain()
-        XCTAssertTrue(preferences.internalControlLocked)
         XCTAssertEqual(calls, 1)
         coordinator.selectMode(.externalOnly)
         XCTAssertEqual(calls, 1)
@@ -515,6 +510,9 @@ final class DisplayModeCoordinatorTests: XCTestCase {
         await drain()
         coordinator.selectMode(.externalOnly)
         XCTAssertEqual(calls, 1)
+        internalSession.quitCompletion?(true)
+        await drain()
+        XCTAssertEqual(calls, 2, "A completed recovery permits a fresh explicit session")
     }
 
     func testRootLeaseBlocksSecondOwnerEvenWithSeparateModeState() throws {
@@ -531,7 +529,6 @@ final class DisplayModeCoordinatorTests: XCTestCase {
         let root = try directory()
         defer { try? FileManager.default.removeItem(at: root) }
         let preferences = Preferences()
-        preferences.internalControlLocked = true
         let primary = Session()
         let coordinator = try DisplayModeCoordinator(directory: root, preferences: preferences) { _, _, _ in primary }
         let statuses = StatusValues()
@@ -540,6 +537,8 @@ final class DisplayModeCoordinatorTests: XCTestCase {
         primary.handler?(.applied)
         await drain()
         coordinator.selectMode(.externalOnly)
+        primary.quitCompletion?(false)
+        await drain()
         primary.handler?(.manualConfiguration)
         await drain()
         guard case .unsupported = statuses.last else { return XCTFail("Old owner must not expose only-external actions") }
@@ -549,6 +548,11 @@ final class DisplayModeCoordinatorTests: XCTestCase {
         await drain()
         guard case .unsupported = statuses.last else { return XCTFail("Preference is not physical effect") }
         coordinator.selectMode(.externalPrimary)
+        XCTAssertEqual(statuses.last, .applying)
+        primary.quitCompletion?(true)
+        await drain()
+        primary.handler?(.applied)
+        await drain()
         XCTAssertEqual(statuses.last, .applied)
     }
 
@@ -660,7 +664,7 @@ final class DisplayModeCoordinatorTests: XCTestCase {
         var last: PrimarySessionStatus? { lock.withLock { values.last } }
     }
 
-    func testModePreferenceCorruptionAndFailureLockSurviveRecreation() throws {
+    func testModePreferencesSurviveRecreationAndIgnoreLegacyFailureLock() throws {
         let name = "ExtilumePreferenceTests.\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: name))
         defer { defaults.removePersistentDomain(forName: name) }
@@ -673,12 +677,21 @@ final class DisplayModeCoordinatorTests: XCTestCase {
         XCTAssertTrue(DisplayModePreferences(defaults: defaults).externalHandoffRequested)
         try preferences.setExternalHandoffRequested(false)
         XCTAssertFalse(DisplayModePreferences(defaults: defaults).externalHandoffRequested)
-        try preferences.lockInternalControl()
         try preferences.select(.externalPrimary)
-        XCTAssertTrue(DisplayModePreferences(defaults: defaults).internalControlLocked)
         defaults.set("unsupported", forKey: "explicitDisplayMode.v1")
         XCTAssertNil(preferences.selectedMode)
         defaults.set("malformed", forKey: "internalControlFailure.v1")
-        XCTAssertTrue(preferences.internalControlLocked)
+        let root = try directory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        var starts = 0
+        let coordinator = try DisplayModeCoordinator(directory: root, preferences: preferences) { _, _, _ in
+            starts += 1
+            return Session()
+        }
+        coordinator.startApplication(registerEvents: false, recoveryOnly: false) { _ in }
+        XCTAssertEqual(starts, 0)
+        coordinator.selectMode(.externalOnly)
+        XCTAssertEqual(starts, 1)
+        XCTAssertEqual(defaults.string(forKey: "internalControlFailure.v1"), "malformed")
     }
 }

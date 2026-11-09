@@ -82,24 +82,20 @@ func applicationPreferenceSuiteName(for directory: URL) -> String {
 }
 
 @MainActor
-func externalHandoffLaunchPreferences(for directory: URL, protectionDefaults: UserDefaults = .standard) throws -> (defaults: UserDefaults, preferences: DisplayModePreferences) {
+func externalHandoffLaunchPreferences(for directory: URL) throws -> (defaults: UserDefaults, preferences: DisplayModePreferences) {
     guard let defaults = UserDefaults(suiteName: applicationPreferenceSuiteName(for: directory)) else {
         throw RecoveryStoreError.ioFailure
     }
-    let preferences = DisplayModePreferences(defaults: defaults, protectionDefaults: protectionDefaults)
-    // Carry directory-only failures forward so changing profiles cannot bypass them.
-    if preferences.internalControlLocked { try preferences.lockInternalControl() }
+    let preferences = DisplayModePreferences(defaults: defaults)
     return (defaults, preferences)
 }
 
 @MainActor
-func recoveryBatchLaunchPreferences(for directory: URL, defaults: UserDefaults,
-                                    protectionDefaults: UserDefaults = .standard) throws -> DisplayModePreferences {
+func recoveryBatchLaunchPreferences(for directory: URL, defaults: UserDefaults) throws -> DisplayModePreferences {
     let state = try LayoutCloseoutDirectory(directory.path)
     try state.requireAbsent("recovery-record.json")
     try state.requireAbsent("internal-session")
-    let preferences = DisplayModePreferences(defaults: defaults, protectionDefaults: protectionDefaults)
-    guard !preferences.internalControlLocked else { throw ApplicationLaunchError.invalidArguments }
+    let preferences = DisplayModePreferences(defaults: defaults)
     // External-only already waits for explicit activation; never start the saved automatic mode.
     try preferences.select(.externalOnly)
     return preferences

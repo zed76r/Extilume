@@ -7,14 +7,12 @@ import XCTest
 final class ExternalInputHandoffIntegrationTests: XCTestCase {
     private final class Preferences: DisplayModePreferenceStoring {
         var selectedMode: DisplayApplicationMode?
-        var internalControlLocked = false
         var externalHandoffRequested = false
         var failNextSelection = false
         func select(_ mode: DisplayApplicationMode) throws {
             if failNextSelection { failNextSelection = false; throw RecoveryStoreError.ioFailure }
             selectedMode = mode
         }
-        func lockInternalControl() throws { internalControlLocked = true }
         func setExternalHandoffRequested(_ requested: Bool) throws { externalHandoffRequested = requested }
     }
 

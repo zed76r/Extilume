@@ -27,8 +27,6 @@ final class DisplayModeCoordinator: PrimaryApplicationControlling, DisplayModeSe
     // Retrying a failed mode handoff must not resume an application quit.
     private var handoffRecoveryPending = false
     private var actionPending = false
-    private var internalFailureLatched = false
-    private var failureLatchPersisted = true
     private var pendingStartupRecovery: DisplayApplicationMode?
     private var conflictingResponsibilities = false
     private var connectionRecoveryConfirmation: (ExternalConnectionRecoveryConfirmation, UUID)?
@@ -59,7 +57,6 @@ final class DisplayModeCoordinator: PrimaryApplicationControlling, DisplayModeSe
         self.inputSettings = inputSettings
         self.factory = factory
         selectedMode = preferences.selectedMode
-        internalFailureLatched = preferences.internalControlLocked
         requiresExplicitActivation = selectedMode == .externalOnly
             || (selectedMode == .internalOnly && !preferences.externalHandoffRequested)
         lease = try RecoveryStore(directory: directory)
@@ -89,8 +86,6 @@ final class DisplayModeCoordinator: PrimaryApplicationControlling, DisplayModeSe
             if pending {
                 if previous != nil && previous?.canClear != true { conflictingResponsibilities = true }
                 pendingStartupRecovery = .externalOnly
-                internalFailureLatched = true
-                try preferences.lockInternalControl()
             }
         }
     }
@@ -144,11 +139,6 @@ final class DisplayModeCoordinator: PrimaryApplicationControlling, DisplayModeSe
         }
         requiresExplicitActivation = false
         modeDidChange?()
-        if mode == .externalOnly && internalFailureLatched && activeMode != .internalOnly {
-            pendingExplicitInputSession = nil
-            publish(.unsupported("保护曾失效，仅外屏需修复并重新验收"))
-            return
-        }
         if controller == nil { start(mode, recoveryOnly: false, explicitSelection: true); return }
         if activeMode == mode, pendingStartupRecovery == nil, !ownerRetiring {
             if status.canRetryApplication || ((mode == .externalOnly || mode == .internalOnly)
@@ -248,7 +238,6 @@ final class DisplayModeCoordinator: PrimaryApplicationControlling, DisplayModeSe
         inputSettings.cancelInputDetection()
         pendingExplicitInputSession = nil
         if activeMode == .internalOnly, !clearExternalHandoffRequest() { completion(false); return }
-        guard failureLatchPersisted || latchFailure() else { completion(false); return }
         guard !handoffCleanupPending else { completion(false); return }
         guard let controller else {
             completion(pendingStartupRecovery == nil)
@@ -262,7 +251,7 @@ final class DisplayModeCoordinator: PrimaryApplicationControlling, DisplayModeSe
             Self.onMainRunLoop { [weak self] in
                 guard let self, self.generation == oldGeneration else { completion(false); return }
                 self.quitPending = false
-                if !restored { self.latchFailure(); self.publish(.quitFailed) }
+                if !restored { self.publish(.quitFailed) }
                 completion(restored)
             }
         }
@@ -291,12 +280,6 @@ final class DisplayModeCoordinator: PrimaryApplicationControlling, DisplayModeSe
             activeMode = mode
             ownerRetiring = false
             handoffRecoveryPending = false
-            if let internalController = next as? InternalApplicationController {
-                internalController.persistFailureForExit = { [weak self] in
-                    guard let self, self.generation == run, self.activeMode == .externalOnly else { return false }
-                    return self.latchFailure()
-                }
-            }
             if let externalController = next as? ExternalApplicationController {
                 externalController.setAutomaticReapplicationAllowed(
                     availableModes.contains(.internalOnly) && preferences.externalHandoffRequested
@@ -312,8 +295,6 @@ final class DisplayModeCoordinator: PrimaryApplicationControlling, DisplayModeSe
                     self.ownerStatus = value
                     if mode == .internalOnly, value == .manualConfiguration,
                        !self.clearExternalHandoffRequest() { return }
-                    if mode == .externalOnly && [.recoveryIncomplete, .quitFailed, .quitWaitingForDisplays,
-                                                .applicationFailedRestored].contains(value), !self.latchFailure() { return }
                     self.publish(value == .quitFailed && self.handoffRecoveryPending ? .recoveryIncomplete : value)
                 }
             }
@@ -336,7 +317,7 @@ final class DisplayModeCoordinator: PrimaryApplicationControlling, DisplayModeSe
                 guard restored else {
                     self.pendingExplicitInputSession = nil
                     self.handoffRecoveryPending = true
-                    self.latchFailure(); self.publish(.recoveryIncomplete); return
+                    self.publish(.recoveryIncomplete); return
                 }
                 do { try self.lease.clear() }
                 catch {
@@ -352,9 +333,7 @@ final class DisplayModeCoordinator: PrimaryApplicationControlling, DisplayModeSe
                 self.handoffCleanupPending = false
                 self.handoffRecoveryPending = false
                 self.ownerRetiring = false
-                if mode == .externalOnly && self.internalFailureLatched {
-                    self.publish(.unsupported("保护曾失效，仅外屏需修复并重新验收"))
-                } else if let mode { self.start(mode, recoveryOnly: false, explicitSelection: true) }
+                if let mode { self.start(mode, recoveryOnly: false, explicitSelection: true) }
                 else { self.publish(.applicationFailedRestored) }
             }
         }
@@ -368,14 +347,6 @@ final class DisplayModeCoordinator: PrimaryApplicationControlling, DisplayModeSe
                                          requiresMatchingTarget: explicit != nil) { [weak self] result in
             DispatchQueue.main.async { [weak self] in self?.inputSettings.recordResult(result) }
         }
-    }
-
-    @discardableResult
-    private func latchFailure() -> Bool {
-        guard activeMode == .externalOnly else { return true }
-        internalFailureLatched = true
-        do { try preferences.lockInternalControl(); failureLatchPersisted = true; return true }
-        catch { failureLatchPersisted = false; publish(.recoveryIncomplete); return false }
     }
 
     private func isUnsupported(_ status: PrimarySessionStatus) -> Bool {

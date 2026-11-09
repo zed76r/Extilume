@@ -14,7 +14,6 @@ final class InternalApplicationController: PrimaryApplicationControlling {
     private let restorationVerifier: InternalApplicationRestorationVerifier
     private let now: @Sendable () throws -> UInt64
     private let restorationReceipt: ((RecoveryRecord, InternalApplicationExpectation) throws -> Void)?
-    var persistFailureForExit: (@MainActor () -> Bool)?
     private var statusHandler: (@Sendable (PrimarySessionStatus) -> Void)?
     private var quitCompletion: (@Sendable (Bool) -> Void)?
     private var workerPID: pid_t?
@@ -377,9 +376,9 @@ final class InternalApplicationController: PrimaryApplicationControlling {
             let mayVerifyExit = quitIsCurrent(finalization.request) && !recoveryOnly
                 && !finalization.faulted && !transportFailed && expected != nil && helperPID != nil && !helperExited
             noteWorkerFault()
-            if mayVerifyExit, persistFailureForExit?() == true, quitIsCurrent(finalization.request) {
+            if mayVerifyExit, quitIsCurrent(finalization.request) {
                 faultedQuitCandidate = true
-                print("退出恢复遇到故障；门禁已持久锁存，等待原会话与辅助完成终验。")
+                print("退出恢复遇到故障；等待原会话与辅助完成终验。")
                 publish(.restoringAndQuitting)
             } else if quitting { finishQuit(success: false, status: .quitFailed) }
             else { publish(.recoveryIncomplete) }
@@ -480,10 +479,6 @@ final class InternalApplicationController: PrimaryApplicationControlling {
                     if let record, self.faultedQuitCandidate, self.finalization.faulted,
                        self.faultedStopReceived, self.workerSucceeded, !self.transportFailed,
                        self.verifiedExitRecord == nil, self.quitIsCurrent(request) {
-                        guard self.persistFailureForExit?() == true, self.quitIsCurrent(request) else {
-                            self.finishVerification(success: false, waitingForDisplays: false)
-                            return
-                        }
                         self.retireWorkerHandles()
                         self.verifiedExitRecord = record
                         self.faultedQuitCandidate = false
@@ -517,8 +512,7 @@ final class InternalApplicationController: PrimaryApplicationControlling {
             throw RecoveryError.unfinishedTransaction
         }
         if let verifiedExitRecord {
-            guard record == verifiedExitRecord, orderlyFinished,
-                  persistFailureForExit?() == true, quitIsCurrent(request) else {
+            guard record == verifiedExitRecord, orderlyFinished, quitIsCurrent(request) else {
                 throw RecoveryError.unfinishedTransaction
             }
         }
@@ -538,7 +532,7 @@ final class InternalApplicationController: PrimaryApplicationControlling {
             try restorationReceipt(record, expected)
             guard quitIsCurrent(request) else { throw RecoveryError.unfinishedTransaction }
         }
-        if verifiedExitRecord != nil { print("故障门禁保持；只读终验完成，允许结束本次退出。") }
+        if verifiedExitRecord != nil { print("只读终验完成，允许结束本次退出。") }
     }
 
     private nonisolated static func waitsForDisplays(

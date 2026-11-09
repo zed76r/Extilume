@@ -36,19 +36,16 @@ final class ApplicationLaunchTests: XCTestCase {
         let root = try makeTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
         let suite = "ExtilumeBatchTests.\(UUID().uuidString)"
-        let protectionSuite = "ExtilumeProtectionTests.\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
-        let protection = try XCTUnwrap(UserDefaults(suiteName: protectionSuite))
         defer {
             defaults.removePersistentDomain(forName: suite)
-            protection.removePersistentDomain(forName: protectionSuite)
         }
         for (index, mode) in [DisplayApplicationMode.externalPrimary, .internalOnly].enumerated() {
             let directory = try makeDirectory(in: root, name: "state-\(index)", mode: 0o700)
-            let saved = DisplayModePreferences(defaults: defaults, protectionDefaults: protection)
+            let saved = DisplayModePreferences(defaults: defaults)
             try saved.select(mode)
             try saved.setExternalHandoffRequested(mode == .internalOnly)
-            let preferences = try recoveryBatchLaunchPreferences(for: directory, defaults: defaults, protectionDefaults: protection)
+            let preferences = try recoveryBatchLaunchPreferences(for: directory, defaults: defaults)
             XCTAssertEqual(preferences.selectedMode, .externalOnly)
             var factoryCalls = 0
             let coordinator = try DisplayModeCoordinator(
@@ -66,22 +63,23 @@ final class ApplicationLaunchTests: XCTestCase {
     }
 
     @MainActor
-    func testRecoveryBatchRejectsProtectionLockAndExistingResponsibilities() throws {
+    func testRecoveryBatchIgnoresLegacyLockAndRejectsExistingResponsibilities() throws {
         let root = try makeTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
         let suite = "ExtilumeBatchTests.\(UUID().uuidString)"
-        let protectionSuite = "ExtilumeProtectionTests.\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
-        let protection = try XCTUnwrap(UserDefaults(suiteName: protectionSuite))
         defer {
             defaults.removePersistentDomain(forName: suite)
-            protection.removePersistentDomain(forName: protectionSuite)
         }
         let lockKey = "internalControlFailure.v1"
-        protection.set(true, forKey: lockKey)
-        XCTAssertThrowsError(try recoveryBatchLaunchPreferences(for: root, defaults: defaults, protectionDefaults: protection))
-        XCTAssertEqual(protection.object(forKey: lockKey) as? Bool, true)
-        protection.removeObject(forKey: lockKey)
+        defaults.set("keep", forKey: "unrelated")
+        for value in [true as Any, false as Any, "malformed" as Any] {
+            defaults.set(value, forKey: lockKey)
+            let preferences = try recoveryBatchLaunchPreferences(for: root, defaults: defaults)
+            XCTAssertEqual(preferences.selectedMode, .externalOnly)
+            XCTAssertEqual(defaults.object(forKey: lockKey) as? NSObject, value as? NSObject)
+            XCTAssertEqual(defaults.string(forKey: "unrelated"), "keep")
+        }
 
         for name in ["recovery-record.json", "internal-session"] {
             let directory = try makeDirectory(in: root, name: "case-\(name)", mode: 0o700)
@@ -92,7 +90,7 @@ final class ApplicationLaunchTests: XCTestCase {
             }
             let sentinel = name == "internal-session" ? existing.appendingPathComponent("keep") : existing
             try contents.write(to: sentinel)
-            XCTAssertThrowsError(try recoveryBatchLaunchPreferences(for: directory, defaults: defaults, protectionDefaults: protection))
+            XCTAssertThrowsError(try recoveryBatchLaunchPreferences(for: directory, defaults: defaults))
             XCTAssertEqual(try Data(contentsOf: sentinel), contents)
         }
     }
@@ -308,7 +306,7 @@ final class ApplicationLaunchTests: XCTestCase {
         XCTAssertEqual(inputSettings.inputOptions, [])
         XCTAssertFalse(inputSettings.automaticInputEnabled)
 
-        let restarted = try externalHandoffLaunchPreferences(for: launchOptions.stateDirectory, protectionDefaults: protection)
+        let restarted = try externalHandoffLaunchPreferences(for: launchOptions.stateDirectory)
         XCTAssertEqual(restarted.preferences.selectedMode, .internalOnly)
         XCTAssertTrue(restarted.preferences.externalHandoffRequested)
         XCTAssertFalse(ExternalDisplayInputSettings(defaults: restarted.defaults).automaticInputEnabled)
@@ -319,7 +317,7 @@ final class ApplicationLaunchTests: XCTestCase {
 
         let freshDirectory = try makeDirectory(in: root, name: "fresh-state", mode: 0o700)
         let freshSuiteName = applicationPreferenceSuiteName(for: freshDirectory)
-        let fresh = try externalHandoffLaunchPreferences(for: freshDirectory, protectionDefaults: protection)
+        let fresh = try externalHandoffLaunchPreferences(for: freshDirectory)
         defer { fresh.defaults.removePersistentDomain(forName: freshSuiteName) }
         var factoryCalls = 0
         let coordinator = try DisplayModeCoordinator(
@@ -338,59 +336,22 @@ final class ApplicationLaunchTests: XCTestCase {
     }
 
     @MainActor
-    func testExternalHandoffProtectionLockPersistsAcrossDirectories() throws {
+    func testExternalHandoffIgnoresLegacyLockWithoutChangingIt() throws {
         let root = try makeTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
-        let protectionName = "ExtilumeProtectionTests.\(UUID().uuidString)"
-        let protection = try XCTUnwrap(UserDefaults(suiteName: protectionName))
-        defer { protection.removePersistentDomain(forName: protectionName) }
-        let firstDirectory = root.appendingPathComponent("first", isDirectory: true)
-        let secondDirectory = try makeDirectory(in: root, name: "second", mode: 0o700)
-        let first = try externalHandoffLaunchPreferences(for: firstDirectory, protectionDefaults: protection)
-        defer {
-            first.defaults.removePersistentDomain(forName: applicationPreferenceSuiteName(for: firstDirectory))
-        }
+        let suiteName = applicationPreferenceSuiteName(for: root)
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
         let key = "internalControlFailure.v1"
-
-        XCTAssertFalse(first.preferences.internalControlLocked)
-        for value in [false as Any, "malformed" as Any] {
-            protection.set(value, forKey: key)
-            XCTAssertTrue(first.preferences.internalControlLocked)
+        defaults.set(DisplayApplicationMode.internalOnly.rawValue, forKey: "explicitDisplayMode.v1")
+        defaults.set(true, forKey: "externalHandoffRequested.v1")
+        for value in [true as Any, false as Any, "malformed" as Any] {
+            defaults.set(value, forKey: key)
+            let result = try externalHandoffLaunchPreferences(for: root)
+            XCTAssertEqual(result.preferences.selectedMode, .internalOnly)
+            XCTAssertTrue(result.preferences.externalHandoffRequested)
+            XCTAssertEqual(defaults.object(forKey: key) as? NSObject, value as? NSObject)
         }
-        protection.removeObject(forKey: key)
-        first.defaults.set(false, forKey: key)
-        XCTAssertTrue(first.preferences.internalControlLocked)
-        let restarted = try externalHandoffLaunchPreferences(for: firstDirectory, protectionDefaults: protection)
-        XCTAssertTrue(restarted.preferences.internalControlLocked)
-        XCTAssertEqual(protection.object(forKey: key) as? Bool, true)
-        first.defaults.removeObject(forKey: key)
-        protection.removeObject(forKey: key)
-
-        try first.preferences.lockInternalControl()
-        XCTAssertEqual(first.defaults.object(forKey: key) as? Bool, true)
-        XCTAssertEqual(protection.object(forKey: key) as? Bool, true)
-        let second = try externalHandoffLaunchPreferences(for: secondDirectory, protectionDefaults: protection)
-        defer { second.defaults.removePersistentDomain(forName: applicationPreferenceSuiteName(for: secondDirectory)) }
-        XCTAssertTrue(second.preferences.internalControlLocked)
-        protection.set(DisplayApplicationMode.internalOnly.rawValue, forKey: "explicitDisplayMode.v1")
-        protection.set(true, forKey: "externalHandoffRequested.v1")
-        var factoryCalls = 0
-        let coordinator = try DisplayModeCoordinator(
-            directory: secondDirectory,
-            preferences: second.preferences,
-            availableModes: [.externalPrimary, .externalOnly, .internalOnly],
-            inputSettings: ExternalDisplayInputSettings(defaults: second.defaults)
-        ) { _, _, _ in
-            factoryCalls += 1
-            throw RecoveryStoreError.ioFailure
-        }
-        coordinator.startApplication(registerEvents: false, recoveryOnly: false) { _ in }
-        coordinator.selectMode(.externalOnly)
-        XCTAssertEqual(factoryCalls, 0)
-        coordinator.selectMode(.externalPrimary)
-        XCTAssertEqual(factoryCalls, 1)
-        XCTAssertEqual(protection.string(forKey: "explicitDisplayMode.v1"), DisplayApplicationMode.internalOnly.rawValue)
-        XCTAssertTrue(protection.bool(forKey: "externalHandoffRequested.v1"))
     }
 
     private func makeTemporaryDirectory() throws -> URL {

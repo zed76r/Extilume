@@ -297,10 +297,8 @@ final class ExternalApplicationControllerTests: XCTestCase {
     func testCoordinatorKeepsConfirmationReachableAfterUnresolvedRecoveryFailure() async throws {
         final class Preferences: DisplayModePreferenceStoring {
             var selectedMode: DisplayApplicationMode? = .internalOnly
-            var internalControlLocked = false
             var externalHandoffRequested = true
             func select(_ mode: DisplayApplicationMode) throws { selectedMode = mode }
-            func lockInternalControl() throws { internalControlLocked = true }
             func setExternalHandoffRequested(_ requested: Bool) throws { externalHandoffRequested = requested }
         }
         let fixture = try Fixture(); try fixture.seedHeld()
