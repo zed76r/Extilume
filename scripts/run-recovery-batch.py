@@ -1,4 +1,4 @@
-"""固定正常恢复单轮；prepare只构建隔离候选，run须绑定现场清单及已有授权。"""
+"""固定恢复或退出诊断单轮；prepare只构建隔离候选，run须绑定现场清单及已有授权。"""
 import argparse
 import importlib.util
 import json
@@ -16,6 +16,8 @@ G = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(G)
 D = G.D
 SCOPE = 'normal-recovery-single-batch-v2'
+EXIT_SCOPE = 'exit-provenance-single-batch-v1'
+UNATTENDED_EXIT_SCOPE = 'exit-machine-evidence-single-batch-v1'
 TOOLS = ('run-recovery-batch.py', 'recovery-batch-gate.py', 'diagnose-recovery-baseline.py',
          'calibrate-recovery-clock.py', 'verify-guard-interleavings.py', 'verify-guard-drill.py')
 DIALOG = '''on run argv
@@ -41,6 +43,7 @@ class BatchMac(D.Mac):
         self.report = {}
         self.last_scan = None
         self.safety_deadline = None
+        self.safety_requested_at = None
         self.registered_roles = set()
 
     @property
@@ -128,7 +131,7 @@ class BatchMac(D.Mac):
                         self.registered_roles.add(role)
             for role in self.gate.roles.values():
                 self.children.setdefault(role['pid'], (None, role['executable']))
-            if self.gate.next_action < len(G.ACTIONS):
+            if self.gate.next_action < len(self.gate.actions):
                 self.gate.check_roles(tuple(self.gate.roles))
             for event in self.events():
                 self.gate.observe_power(event, self.field['bootSession'])
@@ -136,18 +139,21 @@ class BatchMac(D.Mac):
             if force or self.last_scan is None or awake - self.last_scan >= D.NS:
                 D.require(self.last_scan is None or 0 <= awake - self.last_scan <= 3 * D.NS, 'observation-gap')
                 self.check_processes(None)
-                for entry in self.field['records']:
-                    if entry.get('absent') is True:
-                        D.check_absent_daily(entry)
-                    else:
-                        D.require(D.digest(entry['path']) == entry['sha256'], 'responsibility-changed')
-                        D.restored(D.CLOCK.load_private(entry['path']))
+                self.check_records()
                 self.last_scan = self.now()[1]
                 D.require(self.last_scan - awake <= D.NS, 'process-observation-slow')
             self.gate.tick()
         except BaseException:
             self.gate._latch_stop()
             raise
+
+    def check_records(self):
+        for entry in self.field['records']:
+            if entry.get('absent') is True:
+                D.check_absent_daily(entry)
+            else:
+                D.require(D.digest(entry['path']) == entry['sha256'], 'responsibility-changed')
+                D.restored(D.CLOCK.load_private(entry['path']))
 
     def visual(self, message):
         self.tick()
@@ -237,30 +243,47 @@ class BatchMac(D.Mac):
         """失败后只消费尚未派发的正常退出；不重试已派发的quit或终止控制进程。"""
         gate = self.gate
         gate._latch_stop()
-        self.safety_deadline = self.now()[0] + 10 * D.NS
+        if self.safety_deadline is None:
+            self.safety_deadline = self.now()[0] + 10 * D.NS
+            self.safety_requested_at = gate.requested_at
         report = dict(normalQuitRequested=False, pipeEOF=gate.stream is None,
                       recoveryVerified=False, userHandoffRequired=True)
         try:
+            self.tick()
             if 'app' in gate.roles and not G.process_has_exited(gate.roles['app']) and 'stop' not in gate.dispatched_controls:
                 gate.dispatched_controls.add('stop')
-                self.journal.append(dict(event='consume-before-safety-quit'))
+                self.safety_requested_at = self.now()[0]
+                self.journal.append(dict(event='consume-before-safety-quit', continuousNs=self.safety_requested_at))
                 gate.check_roles(('app',))
                 app = gate.roles['app']
                 target = f"{app['pid']}:{app['startSeconds']}:{app['startMicroseconds']}"
+                remaining = (self.safety_deadline - self.now()[0]) / D.NS
+                D.require(remaining > 0, 'safety-observation-deadline')
                 report['normalQuitRequested'] = True
                 subprocess.run([app['executable'], '--control', 'quit', '--allow-display-write',
-                                '--target-process', target], capture_output=True, timeout=10, check=False)
+                                '--target-process', target], capture_output=True, timeout=remaining, check=False)
             while gate.application_process is not None and gate.application_process.poll() is None:
                 self.wait()
             if gate.stream is not None:
                 while not gate.stream.eof:
                     self.wait()
                 report['pipeEOF'] = True
+            while any(not G.process_has_exited(binding) for binding in gate.roles.values()):
+                self.wait()
+            self.tick()
+            self.check_processes(None)
+            self.check_records()
             # A failure remains a failure even if the allowed safety quit restores the desktop.
-            self.read_C('handoff')
+            snapshots, internal = self.read_C('handoff')
             report['softwareCVerified'] = True
+            self.check_processes(None)
+            self.check_records()
+            gate.verify_restoration(self.field['expectedC'], self.field['internalHardwareIdentity'], snapshots, internal,
+                                    self.safety_requested_at, self.now()[0], G.process_has_exited)
+            self.tick()
+            report['recoveryVerified'] = True
         except Exception:
-            report['softwareCVerified'] = False
+            report.setdefault('softwareCVerified', False)
         self.journal.append(dict(event='safety-handoff', result=report))
         return report
 
@@ -280,28 +303,40 @@ def close_gate_evidence(gate):
     return gate.stream is None or (gate.stream.eof and not getattr(gate.stream, 'connection_error', False))
 
 
-def execute(backend, gate):
-    result = dict(scope=SCOPE, passed=False, hardwareAcceptance=False, automaticRetry=False,
+def execute(backend, gate, unattended=False):
+    D.require(not unattended or gate.exit_only, 'unattended-requires-exit-only')
+    result = dict(scope=UNATTENDED_EXIT_SCOPE if unattended else (EXIT_SCOPE if gate.exit_only else SCOPE), passed=False, hardwareAcceptance=False, automaticRetry=False,
                   processObservation='one-second-known-image-polling-with-transient-blind-spots')
+    if unattended:
+        result['physicalObservationPending'] = True
     try:
         backend.tick(force=True)
         backend.read_C('preflight')
-        backend.visual('请确认开盖、已解锁，双屏画面正常且可操作。本轮最多两次停用、一次睡眠和一次正常退出；异常即停止。')
+        if not unattended:
+            backend.visual('请确认开盖、已解锁，双屏画面正常且可操作。' + (
+                '本轮仅一次停用后正常退出，不请求睡眠；异常即停止。' if gate.exit_only else
+                '本轮最多两次停用、一次睡眠和一次正常退出；异常即停止。'))
         gate.launch_application(backend.bundle / 'state', backend.field['bootSession'])
         gate.wait_for_standby(wait=backend.wait)
-        for action in ('start', 'restore'):
-            gate.request(action, lambda action=action: gate.control_application(action)['result'] == 'accepted',
-                         lambda action=action: gate.verify_application(action, backend.wait_application(action)))
-        backend.read_C('confirmed-C')
-        gate.confirm_configuration_visual(wait=backend.wait)
-        gate.request('confirm-user', lambda: gate.control_application('confirm-user')['result'] == 'accepted',
-                     lambda: gate.verify_application('confirm-user', backend.wait_application('confirm-user')))
-        backend.preflight()
-        before = backend.capture('before')
-        backend.start_recorder()
-        gate.request('sleep', lambda: backend.sleep_once() is None, lambda: backend.sleep_and_verify(before))
+        gate.request('start', lambda: gate.control_application('start')['result'] == 'accepted',
+                     lambda: gate.verify_application('start', backend.wait_application('start')))
+        if gate.exit_only:
+            if not unattended:
+                backend.visual('请确认内屏已停用，外屏画面正常且可操作；确认后仅请求一次正常退出。')
+        else:
+            gate.request('restore', lambda: gate.control_application('restore')['result'] == 'accepted',
+                         lambda: gate.verify_application('restore', backend.wait_application('restore')))
+            backend.read_C('confirmed-C')
+            gate.confirm_configuration_visual(wait=backend.wait)
+            gate.request('confirm-user', lambda: gate.control_application('confirm-user')['result'] == 'accepted',
+                         lambda: gate.verify_application('confirm-user', backend.wait_application('confirm-user')))
+            backend.preflight()
+            before = backend.capture('before')
+            backend.start_recorder()
+            gate.request('sleep', lambda: backend.sleep_once() is None, lambda: backend.sleep_and_verify(before))
         gate.request('stop', lambda: gate.control_application('stop')['result'] == 'accepted', backend.exit_and_verify)
-        backend.visual('请确认退出后内外两屏均正常、可操作，且未采取救援措施。')
+        if not unattended:
+            backend.visual('请确认退出后内外两屏均正常、可操作，且未采取救援措施。')
         backend.tick(force=True)
         result['passed'] = True
     except BaseException as error:
@@ -333,7 +368,8 @@ def source_bindings(repo):
     return {str(path.relative_to(repo)): D.digest(path) for path in paths}
 
 
-def prepare(directory):
+def prepare(directory, exit_only=False, unattended=False):
+    D.require(not unattended or exit_only, 'unattended-requires-exit-only')
     repo = Path(__file__).resolve().parents[1]
     bundle = Path(directory).absolute()
     bundle.mkdir(mode=0o700)
@@ -363,34 +399,39 @@ def prepare(directory):
         target = bundle / 'scripts' / name
         target.write_bytes((bundle / 'source/scripts' / name).read_bytes())
         target.chmod(0o600)
-    budget = repo / '.local/verification/normal-recovery-budgets'
+    budget = repo / '.local/verification' / ('exit-provenance-budgets' if exit_only else 'normal-recovery-budgets')
     budget.mkdir(mode=0o700, parents=True, exist_ok=True)
     D.private_directory(budget)
     files = {str(path.relative_to(bundle)): D.digest(path) for path in bundle.rglob('*')
              if path.is_file()}
-    manifest = dict(version=1, scope=SCOPE, candidate=str(uuid.uuid4()), budgetDirectory=str(budget),
+    scope = UNATTENDED_EXIT_SCOPE if unattended else (EXIT_SCOPE if exit_only else SCOPE)
+    manifest = dict(version=1, scope=scope, candidate=str(uuid.uuid4()), budgetDirectory=str(budget),
                     files=files, sources=bindings, macOS=platform.mac_ver()[0], architecture=platform.machine())
     D.save_new(bundle / 'manifest.json', manifest)
-    D.save_new(bundle / 'field.template.json', dict(approved=False, scope=SCOPE, candidate=manifest['candidate'],
+    D.save_new(bundle / 'field.template.json', dict(approved=False, scope=scope, candidate=manifest['candidate'],
         manifestSHA256=D.digest(bundle / 'manifest.json'), probeSHA256=D.digest(probe),
         macOS=manifest['macOS'], architecture=manifest['architecture'], bootSession=None,
         expectedC=None, internalHardwareIdentity=None, records=[], daily=None,
         calibrationApplicable=False, lidOpenAndUnlocked=False, rescueOperator='user',
-        rescueActions=['normal-quit-once', 'user-takes-over'], actions=list(G.ACTIONS),
-        maximumNativeDisableAttempts=2, maximumSleepRequests=1, confirmationMethod='local-dialog',
-        normalWakeReadiness=True))
-    return dict(prepared=True, fieldReady=False, scope=SCOPE)
+        rescueActions=['normal-quit-once', 'user-takes-over'], actions=list(G.EXIT_ACTIONS if exit_only else G.ACTIONS),
+        maximumNativeDisableAttempts=1 if exit_only else 2, maximumSleepRequests=0 if exit_only else 1,
+        confirmationMethod='machine-evidence' if unattended else 'local-dialog', normalWakeReadiness=not exit_only))
+    return dict(prepared=True, fieldReady=False, scope=scope)
 
 
 def validate_field(bundle, manifest, field):
-    D.require(manifest['version'] == 1 and manifest['scope'] == field['scope'] == SCOPE
+    unattended = manifest['scope'] == UNATTENDED_EXIT_SCOPE
+    exit_only = manifest['scope'] in (EXIT_SCOPE, UNATTENDED_EXIT_SCOPE)
+    D.require(manifest['version'] == 1 and manifest['scope'] in (SCOPE, EXIT_SCOPE, UNATTENDED_EXIT_SCOPE) and manifest['scope'] == field['scope']
               and field['approved'] is True and field['candidate'] == manifest['candidate']
               and field['manifestSHA256'] == D.digest(bundle / 'manifest.json'), 'field-authorization-required')
-    D.require(field['actions'] == list(G.ACTIONS) and field['maximumNativeDisableAttempts'] == 2
-              and field['maximumSleepRequests'] == 1 and field['confirmationMethod'] == 'local-dialog'
+    D.require(field['actions'] == list(G.EXIT_ACTIONS if exit_only else G.ACTIONS)
+              and type(field['maximumNativeDisableAttempts']) is int and field['maximumNativeDisableAttempts'] == (1 if exit_only else 2)
+              and type(field['maximumSleepRequests']) is int and field['maximumSleepRequests'] == (0 if exit_only else 1)
+              and field['confirmationMethod'] == ('machine-evidence' if unattended else 'local-dialog')
               and field['rescueOperator'] == 'user' and field['rescueActions'] == ['normal-quit-once', 'user-takes-over']
               and field['calibrationApplicable'] is True and field['lidOpenAndUnlocked'] is True
-              and field['daily'] is None and field.get('normalWakeReadiness') is True, 'field-handoff-or-limits-missing')
+              and field['daily'] is None and field.get('normalWakeReadiness') is (not exit_only), 'field-handoff-or-limits-missing')
     D.require(field['macOS'] == manifest['macOS'] == platform.mac_ver()[0]
               and field['architecture'] == manifest['architecture'] == platform.machine(), 'environment-changed')
     D.require(uuid.UUID(field['bootSession']).int != 0
@@ -417,6 +458,8 @@ def main(argv=None):
     commands = parser.add_subparsers(dest='command', required=True)
     prep = commands.add_parser('prepare', help='构建并冻结隔离候选，不启动App或改变显示')
     prep.add_argument('--directory', required=True)
+    prep.add_argument('--exit-only', action='store_true', help='独立冻结一次停用、一次正常退出、零睡眠的诊断候选')
+    prep.add_argument('--unattended', action='store_true', help='仅用于零睡眠退出机器证据，不记录人工画面确认')
     run = commands.add_parser('run', help='执行已有授权的固定正常单轮，不包含故障注入或补轮')
     run.add_argument('--bundle', required=True)
     run.add_argument('--field', required=True)
@@ -424,7 +467,9 @@ def main(argv=None):
     gate = None
     try:
         if args.command == 'prepare':
-            print(json.dumps(prepare(args.directory)))
+            D.require(not args.unattended or args.exit_only, 'unattended-requires-exit-only')
+            print(json.dumps(prepare(args.directory, exit_only=True, unattended=True) if args.unattended else
+                             prepare(args.directory, exit_only=True) if args.exit_only else prepare(args.directory)))
             return 0
         if not sys.stdin.isatty():
             print('现场执行需要保持开启的交互终端；未领取额度或执行动作。', file=sys.stderr)
@@ -445,8 +490,8 @@ def main(argv=None):
                     for role in G.ROLES}
         gate = G.RecoveryBatchGate(manifest['budgetDirectory'], manifest['candidate'], field_digest, binaries,
                                   lambda: D.CLOCK.native_bounds(D.CLOCK.native_sample())[1],
-                                  normal_wake_readiness=field['normalWakeReadiness'])
-        result = execute(BatchMac(bundle, field, gate), gate)
+                                  normal_wake_readiness=field['normalWakeReadiness'], exit_only=field['scope'] in (EXIT_SCOPE, UNATTENDED_EXIT_SCOPE))
+        result = execute(BatchMac(bundle, field, gate), gate, unattended=field['scope'] == UNATTENDED_EXIT_SCOPE)
         D.save_new(bundle / 'result.json', result)
         print(json.dumps(result, ensure_ascii=False), flush=True)
         if not result['pipeEOF']:

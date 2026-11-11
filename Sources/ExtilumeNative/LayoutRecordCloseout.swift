@@ -12,6 +12,7 @@ enum LayoutCloseoutStage: String, Codable {
     case records, ownership, sourceIdentity, clock, boot, evidence, processes
     case snapshotFirst, snapshotSecond, layout, internalWitness, internalState, observationReceipt
     case recordBinding, backup, save, saveIntent, savedRecord, finalVerification, completion
+    case externalWitness, externalState, clear, cleared
 }
 
 struct LayoutCloseoutStoppedReceipt: Codable {
@@ -79,6 +80,16 @@ struct LayoutCloseoutRequest: Codable {
         }
         try internalHardwareIdentity.validate()
         _ = try expectedC.layout()
+    }
+
+    func validateExternal(now: UInt64, probeSHA256 actual: String) throws {
+        guard scope == "stale-external-record-closeout-v1", records.map(\.role) == ["daily-external"],
+              expectedC.displays.allSatisfy({ display in
+                  let mode = display.mode
+                  return mode.width > 0 && mode.height > 0 && mode.pixelWidth > 0 && mode.pixelHeight > 0
+                      && mode.refreshRate.isFinite && mode.refreshRate > 0 && display.rotation.isFinite
+              }) else { throw LayoutCloseoutError.authorization }
+        try validateEnvironment(now: now, probeSHA256: actual)
     }
 }
 
@@ -241,14 +252,27 @@ func performLayoutRecordCloseout(
             try freshInternalDisplay(identity: identity, numericIDHint: id, hardwareIdentity: hardware,
                                      trace: { _ in }, deadlineNanoseconds: deadline, checkAccess: access)
         }
+    },
+    externalState: @escaping (_ id: UInt32, _ deadline: UInt64, _ check: () throws -> Void) throws -> ExternalDisplayState = { id, deadline, check in
+        try check()
+        guard let captured = try readExternalDisplayState(id), captured.id == id else {
+            throw LayoutCloseoutError.observation
+        }
+        return try withoutActuallyEscaping(check) { access in
+            try freshExternalDisplay(identity: captured.identity, numericIDHint: id,
+                                     deadlineNanoseconds: deadline, checkAccess: access)
+        }
     }
 ) throws {
     let start = try now()
+    let externalCloseout = request.scope == "stale-external-record-closeout-v1"
     if residualProof != nil {
         guard request.scope == "legacy-layout-residual-closeout-v1", request.records.map(\.role) == ["old-2"] else {
             throw LayoutCloseoutError.authorization
         }
         try request.validateEnvironment(now: start, probeSHA256: executableSHA256)
+    } else if externalCloseout {
+        try request.validateExternal(now: start, probeSHA256: executableSHA256)
     } else {
         try request.validate(now: start, probeSHA256: executableSHA256)
     }
@@ -263,6 +287,7 @@ func performLayoutRecordCloseout(
     var observation = 0
     var completed: [String] = []
     var stage = LayoutCloseoutStage.records
+    var verifiedExternal: ExternalDisplayState?
     func checkpoint(force: Bool = false) throws {
         let callerStage = stage
         stage = .clock
@@ -304,11 +329,24 @@ func performLayoutRecordCloseout(
               state.isBuiltIn, state.isEnabled, state.hardwareIdentity == request.internalHardwareIdentity else {
             throw LayoutCloseoutError.observation
         }
+        if externalCloseout {
+            stage = .externalWitness
+            guard let physical = second.displays.first(where: { $0.identity == .physical }),
+                  let uuid = physical.identityUUID else { throw LayoutCloseoutError.observation }
+            let actual = try externalState(physical.id, deadline, { try checkpoint() })
+            stage = .externalState
+            try actual.identity.validate()
+            guard actual.id == physical.id, actual.identity.uuid == uuid, actual.isEnabled,
+                  actual.identity.bootSession == request.internalHardwareIdentity.bootSession,
+                  verifiedExternal == nil || verifiedExternal == actual else { throw LayoutCloseoutError.observation }
+            verifiedExternal = actual
+        }
         try checkpoint(force: true)
         observation += 1
         stage = .observationReceipt
         try evidence.write("observation-\(observation).json", value: second)
         try evidence.write("internal-\(observation).json", value: state)
+        if let verifiedExternal { try evidence.write("external-\(observation).json", value: verifiedExternal) }
         try checkpoint(force: true)
         try retainedProof?.verify()
     }
@@ -342,7 +380,13 @@ func performLayoutRecordCloseout(
                   original.record.session == entry.session, original.record.generation == entry.generation else {
                 throw LayoutCloseoutError.storage
             }
-            candidates.append(try original.record.confirmingLayoutCloseout(actual: request.expectedC.layout()))
+            if externalCloseout {
+                guard let verifiedExternal else { throw LayoutCloseoutError.observation }
+                candidates.append(try original.record.confirmingExternalCloseout(
+                    actual: request.expectedC.layout(), identity: verifiedExternal.identity))
+            } else {
+                candidates.append(try original.record.confirmingLayoutCloseout(actual: request.expectedC.layout()))
+            }
             originals.append(original.bytes)
         }
         stage = .backup
@@ -352,28 +396,38 @@ func performLayoutRecordCloseout(
         var closedHashes: [String] = []
         for (index, entry) in request.records.enumerated() {
             stage = .save
-            let closed = try stores[index].closeLayoutResponsibility(
-                expectedOriginal: originals[index], target: request.expectedC.layout(),
-                backup: { data in
+            let backup: (Data) throws -> Void = { data in
                     stage = .backup
                     guard try evidence.read("\(entry.role)-original.json") == data else { throw LayoutCloseoutError.storage }
                     stage = .save
-                },
-                verify: {
+                }
+            let verifyRecord: () throws -> Void = {
                     try verifySources()
                     try verify()
                     stage = .save
-                },
-                beforeSave: {
+                }
+            let beforeSave: () throws -> Void = {
                     stage = .saveIntent
                     try evidence.write("\(entry.role)-save-requested.json", value: ["originalSHA256": entry.originalSHA256])
                     try verify()
                     stage = .save
-                }, checkBeforeCommit: {
+                }
+            let checkBeforeCommit: () throws -> Void = {
                     try checkpoint(force: true)
                     try verifySources()
                     try checkpoint()
-                })
+                }
+            let closed: RecoveryRecord
+            if externalCloseout {
+                guard let verifiedExternal else { throw LayoutCloseoutError.observation }
+                closed = try stores[index].closeExternalResponsibility(expectedOriginal: originals[index],
+                    target: request.expectedC.layout(), identity: verifiedExternal.identity, backup: backup,
+                    verify: verifyRecord, beforeSave: beforeSave, checkBeforeCommit: checkBeforeCommit)
+            } else {
+                closed = try stores[index].closeLayoutResponsibility(expectedOriginal: originals[index],
+                    target: request.expectedC.layout(), backup: backup, verify: verifyRecord,
+                    beforeSave: beforeSave, checkBeforeCommit: checkBeforeCommit)
+            }
             stage = .savedRecord
             guard let saved = try stores[index].loadWithOriginalBytes(), saved.record == closed else {
                 throw LayoutCloseoutError.storage
@@ -393,6 +447,20 @@ func performLayoutRecordCloseout(
         }
         try verifySources()
         try checkpoint(force: true)
+        if externalCloseout {
+            stage = .clear
+            try evidence.write("clear-requested.json", value: ["restoredSHA256": closedHashes[0]])
+            try verify()
+            try verifySources()
+            guard let saved = try stores[0].loadWithOriginalBytes(), saved.record == candidates[0],
+                  layoutCloseoutSHA256(saved.bytes) == closedHashes[0] else { throw LayoutCloseoutError.storage }
+            stage = .clear
+            try checkpoint(force: true)
+            try stores[0].clear()
+            stage = .cleared
+            guard try stores[0].load() == nil else { throw LayoutCloseoutError.storage }
+            try checkpoint(force: true)
+        }
         stage = .completion
         try evidence.write("complete.json", value: ["verifiedRoles": completed])
         try checkpoint(force: true)
@@ -405,7 +473,7 @@ func performLayoutRecordCloseout(
     }
 }
 
-func runLayoutRecordCloseout(requestPath: String, residual: Bool = false) throws {
+func runLayoutRecordCloseout(requestPath: String, residual: Bool = false, external: Bool = false) throws {
     let url = URL(fileURLWithPath: requestPath)
     guard requestPath.hasPrefix("/"), let executable = Bundle.main.executableURL else { throw LayoutCloseoutError.authorization }
     let input = try LayoutCloseoutDirectory(url.deletingLastPathComponent().path)
@@ -419,7 +487,11 @@ func runLayoutRecordCloseout(requestPath: String, residual: Bool = false) throws
     } else {
         request = try JSONDecoder().decode(LayoutCloseoutRequest.self, from: bytes)
         proof = nil
+        guard request.scope == (external ? "stale-external-record-closeout-v1" : "legacy-layout-record-closeout-v1") else {
+            throw LayoutCloseoutError.authorization
+        }
     }
+    guard !external || !residual else { throw LayoutCloseoutError.authorization }
     try performLayoutRecordCloseout(request: request, requestBytes: bytes,
         executableSHA256: layoutCloseoutSHA256(Data(contentsOf: executable)), residualProof: proof)
 }

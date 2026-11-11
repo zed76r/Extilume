@@ -153,6 +153,41 @@ final class InternalDisableBatchBudgetTests: XCTestCase {
         XCTAssertThrowsError(try gate.consume(wakeAt: 150))
         XCTAssertTrue(exists("stopped"))
     }
+    func testExitOnlyRejectsWakePermitAndRestartCannotReclaimInitialSlot() throws {
+        let policy = InternalDisableBatchBudget.Policy(
+            bootSession: boot, started: 100, deadline: 180_000_000_100, exitOnly: true
+        )
+        try JSONEncoder().encode(policy).write(to: root.appendingPathComponent("policy.json"))
+        let gate = try budget()
+        try gate.consume(wakeAt: nil)
+        time = 200
+        XCTAssertThrowsError(try gate.consume(wakeAt: 150))
+        XCTAssertFalse(exists("wake-consumed.json"))
+        XCTAssertTrue(exists("stopped"))
+        XCTAssertThrowsError(try budget().consume(wakeAt: nil))
+        XCTAssertThrowsError(try budget().consume(wakeAt: 150))
+    }
+
+    func testExitOnlyRestartCannotReclaimInitialBeforeWakeAttempt() throws {
+        let policy = InternalDisableBatchBudget.Policy(
+            bootSession: boot, started: 100, deadline: 180_000_000_100, exitOnly: true
+        )
+        try JSONEncoder().encode(policy).write(to: root.appendingPathComponent("policy.json"))
+        try budget().consume(wakeAt: nil)
+        time = 200
+        XCTAssertThrowsError(try budget().consume(wakeAt: 150))
+        XCTAssertFalse(exists("wake-consumed.json"))
+        XCTAssertThrowsError(try budget().consume(wakeAt: nil))
+    }
+
+    func testExitOnlyAndNormalWakeReadinessCannotBothBeEnabled() throws {
+        let policy = InternalDisableBatchBudget.Policy(
+            bootSession: boot, started: 100, deadline: 180_000_000_100, normalWakeReadiness: true, exitOnly: true
+        )
+        try JSONEncoder().encode(policy).write(to: root.appendingPathComponent("policy.json"))
+        XCTAssertThrowsError(try budget())
+        XCTAssertFalse(exists("initial-consumed.json"))
+    }
     func testRestartCannotReclaimInitialSlot() throws {
         try budget().consume(wakeAt: nil)
         XCTAssertThrowsError(try budget().consume(wakeAt: nil))

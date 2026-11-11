@@ -19,6 +19,7 @@ D = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(D)
 
 ACTIONS = ('start', 'restore', 'confirm-user', 'sleep', 'stop')
+EXIT_ACTIONS = ('start', 'stop')
 ROLES = ('app', 'owner', 'helper')
 LIFECYCLE_STAGES = frozenset("""
 sleepRequested sleepWaitFinished powerAcknowledged systemHasPoweredOn firstConnectionInvalidation restorationStarted
@@ -191,6 +192,7 @@ CONNECTION_CANDIDATE_ENUMS = {
 
 
 def anonymous_connection(event):
+    D.require(isinstance(event, dict), 'invalid-connection-observation')
     kind = event.get('type')
     D.require(kind in ('connection-observation', 'display-connection-observation')
               and event.get('clock') == 'mach_continuous_time/ns', 'invalid-connection-observation')
@@ -222,6 +224,28 @@ def anonymous_connection(event):
             value = candidate[key]
             D.require(type(value) is str and value in CONNECTION_CANDIDATE_ENUMS[key], 'invalid-connection-observation')
             result['candidate'][key] = value
+    return result
+
+
+def anonymous_invalidation(event):
+    sources = {'cg-remove', 'cg-disabled', 'io-negative', 'io-role-conflict', 'io-candidate-changed',
+               'controlled-link-budget-expired', 'controlled-link-reconfiguration-failed',
+               'power-observer', 'protection-communication', 'debug-command'}
+    D.require(event.get('type') == 'connection-invalidation' and event.get('clock') == 'mach_continuous_time/ns'
+              and event.get('role') == 'controller' and type(event.get('source')) is str
+              and event['source'] in sources, 'invalid-connection-invalidation')
+    result = {key: event[key] for key in ('type', 'clock', 'role', 'source')}
+    for key in ('observedAtNanoseconds', 'recoveryStartedAtNanoseconds'):
+        if key in event:
+            value = event[key]
+            D.require(value is None or (type(value) is int and 0 <= value < 2**64), 'invalid-connection-invalidation')
+            result[key] = value
+    observed, started = result.get('observedAtNanoseconds'), result.get('recoveryStartedAtNanoseconds')
+    D.require(observed is None or started is None or started <= observed, 'invalid-connection-invalidation')
+    for key, kind in (('connection', 'connection-observation'), ('display', 'display-connection-observation')):
+        if key in event:
+            D.require(isinstance(event[key], dict) and event[key].get('type') == kind, 'invalid-connection-invalidation')
+            result[key] = anonymous_connection(event[key])
     return result
 
 
@@ -299,11 +323,12 @@ class LifecyclePipe:
                         except (ValueError, UnicodeError):
                             raise RuntimeError('lifecycle-invalid-line') from None
                         D.require(isinstance(event, dict), 'lifecycle-invalid-line')
-                        if event.get('type') in ('connection-observation', 'display-connection-observation'):
+                        if event.get('type') in ('connection-observation', 'display-connection-observation', 'connection-invalidation'):
                             if self.connection_file is not None:
                                 try:
                                     D.require(self.connection_count < 4096, 'connection-observation-overflow')
-                                    self.connection_file.write(json.dumps(anonymous_connection(event), separators=(',', ':')) + '\n')
+                                    clean = anonymous_invalidation(event) if event['type'] == 'connection-invalidation' else anonymous_connection(event)
+                                    self.connection_file.write(json.dumps(clean, separators=(',', ':')) + '\n')
                                     self.connection_file.flush()
                                     self.connection_count += 1
                                 except (OSError, ValueError, RuntimeError):
@@ -379,9 +404,12 @@ class LifecyclePipe:
 
 
 class RecoveryBatchGate:
-    def __init__(self, budget_directory, candidate, field_digest, binaries, now, read_process=None, normal_wake_readiness=False):
+    def __init__(self, budget_directory, candidate, field_digest, binaries, now, read_process=None, normal_wake_readiness=False, exit_only=False):
         D.require(type(normal_wake_readiness) is bool, 'invalid-normal-wake-readiness')
+        D.require(type(exit_only) is bool and not (exit_only and normal_wake_readiness), 'invalid-exit-only')
         self.normal_wake_readiness = normal_wake_readiness
+        self.exit_only = exit_only
+        self.actions = EXIT_ACTIONS if exit_only else ACTIONS
         D.require(set(binaries) == set(ROLES), 'missing-role-binary')
         self.binaries = {role: dict(binding) for role, binding in binaries.items()}
         for binding in self.binaries.values():
@@ -441,6 +469,7 @@ class RecoveryBatchGate:
         process = None
         try:
             self.tick()
+            D.require(not self.exit_only, 'exit-only-action')
             D.require(self.next_action == self.confirmed_requests == 2 and not self.inflight
                       and not self.configuration_dialog_started, 'visual-confirmation-order')
             self.check_roles(ROLES)
@@ -552,6 +581,8 @@ class RecoveryBatchGate:
             self.native_budget_directory = path
             with D.CLOCK.private_file(path / 'policy.json', create=True) as output:
                 policy = dict(bootSession=boot_session, started=self.started, deadline=self.deadline)
+                if self.exit_only:
+                    policy['exitOnly'] = True
                 if self.normal_wake_readiness:
                     policy['normalWakeReadiness'] = True
                 json.dump(policy, output)
@@ -580,7 +611,7 @@ class RecoveryBatchGate:
             for event in events:
                 self._record_lifecycle(event)
             D.require(error is None, 'lifecycle-reader-failed')
-            D.require(not eof or self.next_action == len(ACTIONS), 'lifecycle-unexpected-eof')
+            D.require(not eof or self.next_action == len(self.actions), 'lifecycle-unexpected-eof')
         except BaseException:
             self._latch_stop()
             raise
@@ -618,6 +649,10 @@ class RecoveryBatchGate:
             observed['recoveryTopology'] = dict(counts)
         self.native_events.append(event)
         self.journal.append(observed)
+        D.require(not self.exit_only or stage not in {
+            'sleepRequested', 'sleepWaitFinished', 'powerAcknowledged', 'powerAcknowledgementStarted',
+            'powerAcknowledgementFinished', 'systemHasPoweredOn', 'wakeTopologyCheckStarted',
+            'wakeTopologyWaiting', 'wakeTopologyReady', 'wakeTopologyRejected'}, 'exit-only-power-event')
         D.require(event.get('succeeded') is not False and 'failureCode' not in event
                   and not stage.endswith(('Failed', 'Rejected')) and stage != 'firstConnectionInvalidation',
                   'native-fault')
@@ -639,7 +674,8 @@ class RecoveryBatchGate:
             self.journal.append(dict(event='native-disable-observed', count=self.native_disable_count))
             first = (self.native_disable_count == 1 and self.next_action == 1
                      and self.requested_at is not None and at >= self.requested_at)
-            reapply = self.native_disable_count == 2 and self.next_action == 4 and self.wake is not None and at >= self.wake
+            reapply = (not self.exit_only and self.native_disable_count == 2 and self.next_action == 4
+                       and self.wake is not None and at >= self.wake)
             D.require(event['role'] == 'controller' and event.get('operation') == 'disable'
                       and not was_pending and (first or reapply), 'native-disable-outside-budget')
             self.native_disable_pending = True
@@ -677,8 +713,8 @@ class RecoveryBatchGate:
     def request(self, action, send, verify):
         try:
             self.tick()
-            D.require(not self.inflight and self.next_action < len(ACTIONS)
-                      and action == ACTIONS[self.next_action], 'action-order-or-quota')
+            D.require(not self.inflight and self.next_action < len(self.actions)
+                      and action == self.actions[self.next_action], 'action-order-or-quota')
             D.require(callable(send) and callable(verify), 'missing-action-adapter')
             required = ('app',) if action == 'start' else ROLES
             self.check_roles(required)
@@ -736,7 +772,7 @@ class RecoveryBatchGate:
                         'confirm-user': 'confirm-configuration', 'stop': 'quit'}
             D.require((reading and (self.verifying or (self.next_action == 0 and 'app' in self.roles)))
                       or (self.inflight and self.next_action > 0 and not self.verifying
-                          and action in commands and action == ACTIONS[self.next_action - 1]),
+                          and action in commands and action == self.actions[self.next_action - 1]),
                       'control-outside-request')
             if action == 'confirm-user':
                 D.require(self.configuration_visual_at is not None, 'configuration-needs-human-confirmation')
@@ -773,7 +809,7 @@ class RecoveryBatchGate:
     def verify_application(self, action, reply, events=None):
         try:
             self.tick()
-            D.require(self.inflight and self.verifying and action == ACTIONS[self.next_action - 1],
+            D.require(self.inflight and self.verifying and action == self.actions[self.next_action - 1],
                       'no-matching-pending-action')
             if self.stream is not None:
                 D.require(events is None, 'lifecycle-input-override')
@@ -787,6 +823,7 @@ class RecoveryBatchGate:
     def observe_wake(self, at):
         try:
             self.tick()
+            D.require(not self.exit_only, 'exit-only-power-event')
             D.require(self.sleep_request_at is not None and self.wake is None
                       and type(at) is int and self.sleep_request_at <= at <= self.last_time,
                       'invalid-wake-boundary')
@@ -802,6 +839,7 @@ class RecoveryBatchGate:
     def observe_power(self, event, boot_session):
         try:
             self.tick()
+            D.require(not self.exit_only, 'exit-only-power-event')
             D.require(self.next_action == 4 and self.power_event is None and self.sleep_request_at is not None,
                       'unexpected-power-event')
             sleep = D.CLOCK.uint(event['willSleepAtNanoseconds'])
@@ -820,6 +858,7 @@ class RecoveryBatchGate:
     def verify_sleep(self, before, after, evidence, reply, probe_sha256):
         try:
             self.tick()
+            D.require(not self.exit_only, 'exit-only-power-event')
             D.require(self.inflight and self.verifying and self.next_action == 4 and self.power_event is not None
                       and self.wake is not None, 'sleep-checkpoint-order')
             assessment = D.CLOCK.compare(before, after, evidence)
@@ -854,55 +893,65 @@ class RecoveryBatchGate:
                     has_exited=process_has_exited):
         try:
             self.tick()
-            D.require(self.inflight and self.verifying and self.next_action == len(ACTIONS)
-                      and isinstance(self.stream, LifecyclePipe) and self.stream.eof
-                      and self.native_budget_directory is not None, 'exit-checkpoint-order')
-            D.require(self.application_process is not None and self.application_process.poll() == 0,
-                      'application-exit-not-normal')
-            D.require(set(self.roles) == set(ROLES) and all(has_exited(self.roles[role]) for role in ROLES),
-                      'controller-still-running')
-            receipt = D.CLOCK.load_private(self.native_budget_directory / 'restoration.json')
-            app = {key: self.roles['app'][key] for key in ('pid', 'startSeconds', 'startMicroseconds')}
-            D.require(receipt.get('version') == 1 and receipt.get('app') == app
-                      and type(receipt.get('verifiedAtNanoseconds')) is int
-                      and self.requested_at <= receipt['verifiedAtNanoseconds'] <= self.last_time,
-                      'unbound-restoration-receipt')
-            expectation, record = receipt['expectation'], receipt['record']
-            D.restored(record)
-            D.require(record.get('independentGuardVerified') is True
-                      and record.get('externalDisplay') is None
-                      and record['session'] == expectation['session']
-                      and type(record['generation']) is int and record['generation'] > 0
-                      and record['generation'] == expectation['generation'], 'unverified-restoration-receipt')
-            expected = D.signature(expected_snapshot)
-            layout = {'main': expected['builtIn']['identity'], 'origins': []}
-            for role in ('builtIn', 'physical'):
-                display = expected[role]
-                layout['origins'].extend((display['identity'], dict(x=display['x'], y=display['y'])))
-            D.require(D.WIRE.layout_key(record['baseline']) == D.WIRE.layout_key(expectation['baseline'])
-                      == D.WIRE.layout_key(layout)
-                      and str(uuid.UUID(expectation['internalIdentity'])) == expected['builtIn']['identity']
-                      and expectation.get('hardware') == expected_hardware, 'restoration-C-mismatch')
-            responsibility = record.get('internalDisplay', {})
-            D.require(responsibility.get('baseline') is True and responsibility.get('pending') is False
-                      and responsibility.get('hardwareIdentity') == expected_hardware
-                      and responsibility.get('identity') == expectation['internalIdentity'], 'internal-restoration-unverified')
-            D.require(len(snapshots) == 2 and all(D.signature(snapshot) == expected for snapshot in snapshots),
-                      'C-or-mode-mismatch')
-            inner = next(d for d in snapshots[-1]['displays'] if D.WIRE.identity_case(d['identity']) == 'builtIn')
-            state = internal_reply.get('state', {}).get('_0', {})
-            D.require(state.get('isBuiltIn') is True and state.get('isOnline') is True and state.get('isActive') is True
-                      and state.get('hardwareIdentity') == expected_hardware and state.get('id') == inner['id']
-                      and str(uuid.UUID(state['identityUUID'])) == expected['builtIn']['identity']
-                      and str(uuid.UUID(state['reportedIdentityUUID'])) == expected['builtIn']['identity'],
-                      'internal-identity-unverified')
-            D.require(all(has_exited(self.roles[role]) for role in ROLES), 'controller-still-running')
+            D.require(self.inflight and self.verifying and self.next_action == len(self.actions), 'exit-checkpoint-order')
+            self.verify_restoration(expected_snapshot, expected_hardware, snapshots, internal_reply,
+                                    self.requested_at, self.last_time, has_exited)
             self.journal.append(dict(event='independent-exit-verified'))
             self.tick()
             return True
         except BaseException:
             self._latch_stop()
             raise
+
+    def verify_restoration(self, expected_snapshot, expected_hardware, snapshots, internal_reply,
+                           requested_at, observed_at, has_exited=process_has_exited):
+        # 故障收尾复用同一终验，但不恢复动作许可或改变原失败结果。
+        D.require(type(requested_at) is int and type(observed_at) is int
+                  and self.started <= requested_at <= observed_at, 'invalid-restoration-window')
+        D.require(isinstance(self.stream, LifecyclePipe) and self.stream.eof
+                  and self.stream.error is None and not self.stream.connection_error
+                  and self.native_budget_directory is not None, 'exit-checkpoint-order')
+        D.require(self.application_process is not None and self.application_process.poll() == 0,
+                  'application-exit-not-normal')
+        D.require(set(self.roles) == set(ROLES) and all(has_exited(self.roles[role]) for role in ROLES),
+                  'controller-still-running')
+        receipt = D.CLOCK.load_private(self.native_budget_directory / 'restoration.json')
+        app = {key: self.roles['app'][key] for key in ('pid', 'startSeconds', 'startMicroseconds')}
+        D.require(receipt.get('version') == 1 and receipt.get('app') == app
+                  and type(receipt.get('verifiedAtNanoseconds')) is int
+                  and requested_at <= receipt['verifiedAtNanoseconds'] <= observed_at,
+                  'unbound-restoration-receipt')
+        expectation, record = receipt['expectation'], receipt['record']
+        D.restored(record)
+        D.require(record.get('independentGuardVerified') is True
+                  and record.get('externalDisplay') is None
+                  and record['session'] == expectation['session']
+                  and type(record['generation']) is int and record['generation'] > 0
+                  and record['generation'] == expectation['generation'], 'unverified-restoration-receipt')
+        expected = D.signature(expected_snapshot)
+        layout = {'main': expected['builtIn']['identity'], 'origins': []}
+        for role in ('builtIn', 'physical'):
+            display = expected[role]
+            layout['origins'].extend((display['identity'], dict(x=display['x'], y=display['y'])))
+        D.require(D.WIRE.layout_key(record['baseline']) == D.WIRE.layout_key(expectation['baseline'])
+                  == D.WIRE.layout_key(layout)
+                  and str(uuid.UUID(expectation['internalIdentity'])) == expected['builtIn']['identity']
+                  and expectation.get('hardware') == expected_hardware, 'restoration-C-mismatch')
+        responsibility = record.get('internalDisplay', {})
+        D.require(responsibility.get('baseline') is True and responsibility.get('pending') is False
+                  and responsibility.get('hardwareIdentity') == expected_hardware
+                  and responsibility.get('identity') == expectation['internalIdentity'], 'internal-restoration-unverified')
+        D.require(len(snapshots) == 2 and all(D.signature(snapshot) == expected for snapshot in snapshots),
+                  'C-or-mode-mismatch')
+        inner = next(d for d in snapshots[-1]['displays'] if D.WIRE.identity_case(d['identity']) == 'builtIn')
+        state = internal_reply.get('state', {}).get('_0', {})
+        D.require(state.get('isBuiltIn') is True and state.get('isOnline') is True and state.get('isActive') is True
+                  and state.get('hardwareIdentity') == expected_hardware and state.get('id') == inner['id']
+                  and str(uuid.UUID(state['identityUUID'])) == expected['builtIn']['identity']
+                  and str(uuid.UUID(state['reportedIdentityUUID'])) == expected['builtIn']['identity'],
+                  'internal-identity-unverified')
+        D.require(all(has_exited(self.roles[role]) for role in ROLES), 'controller-still-running')
+        return True
 
     def close(self):
         if self.closed:
@@ -917,7 +966,7 @@ class RecoveryBatchGate:
             self._latch_stop()
             self.journal.append(dict(event='gate-closed', consumed=self.next_action, confirmed=self.confirmed_requests,
                                      nativeDisableObserved=self.native_disable_count, nativeDisablePending=self.native_disable_pending,
-                                     unconfirmedAction=ACTIONS[self.next_action - 1] if self.next_action > self.confirmed_requests else None,
+                                     unconfirmedAction=self.actions[self.next_action - 1] if self.next_action > self.confirmed_requests else None,
                                      controllerCleanup='requires-bound-safety-handoff',
                                      readerCleanup='retained-until-eof' if isinstance(self.stream, LifecyclePipe) and not self.stream.eof else 'close-requested'))
         finally:

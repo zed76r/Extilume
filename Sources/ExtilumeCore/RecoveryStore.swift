@@ -300,11 +300,40 @@ public final class RecoveryStore {
         beforeSave: () throws -> Void,
         checkBeforeCommit: () throws -> Void = {}
     ) throws -> RecoveryRecord {
+        try closeResponsibility(expectedOriginal: expectedOriginal, backup: backup, verify: verify,
+                                beforeSave: beforeSave, checkBeforeCommit: checkBeforeCommit) {
+            try $0.confirmingLayoutCloseout(actual: target)
+        }
+    }
+
+    public func closeExternalResponsibility(
+        expectedOriginal: Data,
+        target: DisplayLayout,
+        identity: ExternalDisplayIdentity,
+        backup: (Data) throws -> Void,
+        verify: () throws -> Void,
+        beforeSave: () throws -> Void,
+        checkBeforeCommit: () throws -> Void = {}
+    ) throws -> RecoveryRecord {
+        try closeResponsibility(expectedOriginal: expectedOriginal, backup: backup, verify: verify,
+                                beforeSave: beforeSave, checkBeforeCommit: checkBeforeCommit) {
+            try $0.confirmingExternalCloseout(actual: target, identity: identity)
+        }
+    }
+
+    private func closeResponsibility(
+        expectedOriginal: Data,
+        backup: (Data) throws -> Void,
+        verify: () throws -> Void,
+        beforeSave: () throws -> Void,
+        checkBeforeCommit: () throws -> Void,
+        close: (RecoveryRecord) throws -> RecoveryRecord
+    ) throws -> RecoveryRecord {
         guard ownsExclusiveLock else { throw RecoveryStoreError.ownershipUnavailable }
         guard let original = try loadWithOriginalBytes(), original.bytes == expectedOriginal else {
             throw RecoveryStoreError.invalidRecord
         }
-        let closed = try original.record.confirmingLayoutCloseout(actual: target)
+        let closed = try close(original.record)
         try verify()
         try backup(original.bytes)
         try verify()

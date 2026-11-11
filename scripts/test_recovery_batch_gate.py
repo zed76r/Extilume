@@ -292,6 +292,76 @@ class BatchGateTests(unittest.TestCase):
         directory = Path(self.gate.prepare_native_budget(str(uuid.uuid4()))['EXTILUME_RECOVERY_BATCH_DIRECTORY'])
         self.assertIs(json.loads((directory/'policy.json').read_text())['normalWakeReadiness'], True)
 
+    def exit_gate(self):
+        gate = G.RecoveryBatchGate(self.root, str(uuid.uuid4()), 'a'*64, self.binaries,
+                                   lambda: self.time, lambda pid: self.processes[pid], exit_only=True)
+        self.addCleanup(gate.close)
+        for role, pid in zip(G.ROLES, (10, 11, 12)):
+            gate.bind(role, self.processes[pid])
+        return gate
+
+    def test_exit_only_policy_and_sequence(self):
+        gate = self.exit_gate()
+        self.assertEqual(gate.actions, G.EXIT_ACTIONS)
+        roles = gate.roles
+        gate.roles = {}
+        boot = str(uuid.uuid4())
+        directory = Path(gate.prepare_native_budget(boot)['EXTILUME_RECOVERY_BATCH_DIRECTORY'])
+        self.assertEqual(json.loads((directory/'policy.json').read_text()),
+                         dict(bootSession=boot, started=0, deadline=180*G.D.NS, exitOnly=True))
+        gate.roles = roles
+        queue = []
+        gate.stream = SimpleNamespace(take=lambda: (queue.pop(0) if queue else [], False, None), close=lambda: None)
+        reply, events = application_evidence('start')
+        self.time = 100
+        def start():
+            self.time = 200
+            queue.append(events)
+            return True
+        gate.request('start', start, lambda: gate.verify_application('start', reply))
+        self.assertEqual(gate.native_disable_count, 1)
+        self.assertFalse(gate.native_disable_pending)
+        gate.request('stop', lambda: gate.control_application('stop', lambda *a, **k:
+                     SimpleNamespace(returncode=0, stdout=b'{"result":"accepted"}'))['result'] == 'accepted', lambda: True)
+        self.assertEqual(gate.confirmed_requests, 2)
+        self.assertFalse((directory/'wake-authorized.json').exists())
+
+    def test_exit_only_rejects_other_actions_and_power_events(self):
+        for action in ('restore', 'confirm-user', 'sleep', 'start'):
+            with self.subTest(action=action):
+                gate = self.exit_gate()
+                gate.request('start', lambda: True, lambda: True)
+                with self.assertRaisesRegex(RuntimeError, 'action-order-or-quota'):
+                    gate.request(action, lambda: self.fail('must not dispatch'), lambda: True)
+                self.assertTrue(gate.stopped)
+        for call in ('confirm', 'wake', 'power', 'sleep'):
+            with self.subTest(call=call):
+                gate = self.exit_gate()
+                operations = {'confirm': lambda: gate.confirm_configuration_visual(spawn=lambda *a, **k: self.fail('dialog')),
+                              'wake': lambda: gate.observe_wake(0), 'power': lambda: gate.observe_power({}, str(uuid.uuid4())),
+                              'sleep': lambda: gate.verify_sleep({}, {}, {}, {}, '')}
+                with self.assertRaisesRegex(RuntimeError, 'exit-only-'):
+                    operations[call]()
+                self.assertTrue(gate.stopped)
+
+    def test_exit_only_rejects_power_stages_and_second_disable(self):
+        for stage in ('sleepRequested', 'sleepWaitFinished', 'powerAcknowledged', 'powerAcknowledgementStarted',
+                      'powerAcknowledgementFinished', 'systemHasPoweredOn', 'wakeTopologyCheckStarted',
+                      'wakeTopologyWaiting', 'wakeTopologyReady', 'wakeTopologyRejected', 'disableStarted'):
+            with self.subTest(stage=stage):
+                gate = self.exit_gate()
+                gate.request('start', lambda: True, lambda: True)
+                gate.native_disable_count = 1
+                event = dict(type='internal-lifecycle', clock='mach_continuous_time/ns', role='controller',
+                             stage=stage, continuousNs=0, operation='disable')
+                with self.assertRaisesRegex(RuntimeError, 'exit-only-power-event|native-disable-outside-budget'):
+                    gate._record_lifecycle(event)
+
+    def test_exit_only_configuration_is_strict(self):
+        for options in (dict(exit_only=1), dict(exit_only=True, normal_wake_readiness=True)):
+            with self.subTest(options=options), self.assertRaisesRegex(RuntimeError, 'invalid-exit-only'):
+                G.RecoveryBatchGate(self.root, str(uuid.uuid4()), 'a'*64, self.binaries, lambda: self.time, **options)
+
     def test_normal_readiness_keeps_original_wake_and_absolute_deadline(self):
         self.gate.normal_wake_readiness = True
         for action in G.ACTIONS[:4]: self.gate.request(action, lambda: True, lambda: True)
@@ -705,6 +775,10 @@ class BatchGateTests(unittest.TestCase):
         observation = dict(type='display-connection-observation', clock='mach_continuous_time/ns', role='controller', continuousNs=1,
                            flags=8, scope='other', invalidationReason='cg-remove', pid=123)
         writer.write((json.dumps(observation) + '\n').encode())
+        cause = dict(type='connection-invalidation', clock='mach_continuous_time/ns', role='controller',
+                     source='cg-remove', observedAtNanoseconds=1, recoveryStartedAtNanoseconds=0,
+                     display=observation, pid=123)
+        writer.write((json.dumps(cause) + '\n').encode())
         boundary = dict(type='internal-lifecycle', clock='mach_continuous_time/ns', role='controller',
                         stage='recoveryEnableNativeFinished', continuousNs=2, cgErrorCode=0, pid=123)
         writer.write((json.dumps(boundary) + '\n').encode())
@@ -713,7 +787,10 @@ class BatchGateTests(unittest.TestCase):
         self.assertFalse(collector.thread.is_alive())
         self.gate.close()
         saved = [json.loads(line) for line in self.gate.journal.path.with_suffix('.connections.jsonl').read_text().splitlines()]
-        self.assertEqual(saved, [{k: v for k, v in item.items() if k != 'pid'} for item in (observation, boundary)])
+        clean_observation = {k: v for k, v in observation.items() if k != 'pid'}
+        self.assertEqual(saved, [clean_observation, dict(G.anonymous_invalidation(cause)),
+                                 {k: v for k, v in boundary.items() if k != 'pid'}])
+        self.assertEqual(saved[1]['display'], clean_observation)
         self.assertEqual(collector.take()[0], [boundary])
         self.assertIsNone(collector.error)
 
@@ -931,7 +1008,16 @@ class LifecyclePipeTests(unittest.TestCase):
                 pid=999, rawID=999)
             cg_event = dict(type='display-connection-observation', clock='mach_continuous_time/ns', role='controller', continuousNs=12,
                             flags=8, scope='other', invalidationReason='cg-remove', rawID=999)
-            writer.write(('\n'.join(map(json.dumps, (io_event, cg_event))) + '\n').encode())
+            sources = ('cg-remove', 'cg-disabled', 'io-negative', 'io-role-conflict', 'io-candidate-changed',
+                       'controlled-link-budget-expired', 'controlled-link-reconfiguration-failed',
+                       'power-observer', 'protection-communication', 'debug-command')
+            causes = [dict(type='connection-invalidation', clock='mach_continuous_time/ns', role='controller',
+                           source=source, observedAtNanoseconds=12, recoveryStartedAtNanoseconds=10,
+                           connection=io_event, display=cg_event, private=999) for source in sources]
+            causes[0]['observedAtNanoseconds'] = None
+            causes[0]['recoveryStartedAtNanoseconds'] = None
+            del causes[1]['observedAtNanoseconds']
+            writer.write(('\n'.join(map(json.dumps, (io_event, cg_event, *causes))) + '\n').encode())
             writer.close()
             events, ended, error = self.collect(collector, eof=True)
             self.assertEqual(events, [])
@@ -940,6 +1026,13 @@ class LifecyclePipeTests(unittest.TestCase):
             saved = [json.loads(line) for line in path.read_text().splitlines()]
             self.assertEqual(saved[0]['candidate'], {'role': 'registeredExternal', 'service': 'DCPAVDeviceProxy'})
             self.assertEqual(saved[1]['invalidationReason'], 'cg-remove')
+            self.assertEqual([event['source'] for event in saved[2:]], list(sources))
+            self.assertIsNone(saved[2]['observedAtNanoseconds'])
+            self.assertIsNone(saved[2]['recoveryStartedAtNanoseconds'])
+            self.assertNotIn('observedAtNanoseconds', saved[3])
+            self.assertEqual((saved[4]['recoveryStartedAtNanoseconds'], saved[4]['observedAtNanoseconds']), (10, 12))
+            self.assertEqual(saved[4]['connection'], saved[0])
+            self.assertEqual(saved[4]['display'], saved[1])
             self.assertNotIn('999', path.read_text())
             self.assertEqual(path.stat().st_mode & 0o777, 0o600)
 
@@ -1000,6 +1093,17 @@ class LifecyclePipeTests(unittest.TestCase):
             with self.subTest(replacement=replacement), self.assertRaisesRegex(RuntimeError, 'invalid-connection-observation'):
                 G.anonymous_connection(dict(event, **replacement))
 
+    def test_invalidation_rejects_invalid_sources_timestamps_and_nested_types(self):
+        event = dict(type='connection-invalidation', clock='mach_continuous_time/ns', role='controller',
+                     source='power-observer', observedAtNanoseconds=12, recoveryStartedAtNanoseconds=10)
+        for replacement in (dict(source='unknown'), dict(source=True), dict(role='helper'), dict(clock='unknown'),
+                            dict(observedAtNanoseconds=True), dict(recoveryStartedAtNanoseconds=False),
+                            dict(observedAtNanoseconds=-1), dict(observedAtNanoseconds=2**64),
+                            dict(recoveryStartedAtNanoseconds=13), dict(connection='private'),
+                            dict(display=dict(type='connection-observation'))):
+            with self.subTest(replacement=replacement), self.assertRaises(RuntimeError):
+                G.anonymous_invalidation(dict(event, **replacement))
+
     def test_connection_and_recovery_boundaries_share_limit(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / 'observations.jsonl'
@@ -1008,9 +1112,11 @@ class LifecyclePipeTests(unittest.TestCase):
                          role='controller', continuousNs=1, flags=8, scope='other')
             boundary = dict(type='internal-lifecycle', clock='mach_continuous_time/ns', role='controller',
                             stage='recoveryEnableNativeStarted', continuousNs=2)
+            cause = dict(type='connection-invalidation', clock='mach_continuous_time/ns', role='controller',
+                         source='power-observer')
             line = (json.dumps(event) + '\n').encode()
-            for _ in range(4095): writer.write(line)
-            writer.write(((json.dumps(boundary) + '\n') * 2).encode())
+            for _ in range(4094): writer.write(line)
+            writer.write((json.dumps(boundary) + '\n' + json.dumps(cause) + '\n' + json.dumps(cause) + '\n').encode())
             writer.close()
             collector.thread.join(timeout=2)
             self.assertFalse(collector.thread.is_alive())
@@ -1019,7 +1125,7 @@ class LifecyclePipeTests(unittest.TestCase):
             self.assertTrue(collector.connection_error)
             saved = [json.loads(line) for line in path.read_text().splitlines()]
             self.assertEqual(len(saved), 4096)
-            self.assertEqual(saved[-1], boundary)
+            self.assertEqual(saved[-2:], [boundary, cause])
 
     def test_connection_fsync_failure_reports_missing_evidence(self):
         with tempfile.TemporaryDirectory() as directory, \

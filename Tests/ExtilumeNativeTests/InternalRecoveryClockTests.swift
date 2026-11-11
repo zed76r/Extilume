@@ -103,6 +103,7 @@ final class InternalRecoveryClockTests: XCTestCase {
         clock.didWake()
 
         clock.setBootSession(bootB)
+        XCTAssertNil(clock.startedAtNanoseconds)
         fixture.enqueueNow(250)
         clock.start()
         XCTAssertNil(clock.elapsedNanoseconds())
@@ -122,6 +123,7 @@ final class InternalRecoveryClockTests: XCTestCase {
         clock.didWake()
 
         clock.reset()
+        XCTAssertNil(clock.startedAtNanoseconds)
         XCTAssertNil(clock.elapsedNanoseconds())
         fixture.enqueueNow(250)
         clock.start()
@@ -174,6 +176,7 @@ final class InternalRecoveryClockTests: XCTestCase {
         clock.start(at: 250)
         fixture.enqueueNow(400)
 
+        XCTAssertEqual(clock.startedAtNanoseconds, 100)
         XCTAssertEqual(clock.elapsedNanoseconds(), 300)
     }
 
@@ -182,6 +185,7 @@ final class InternalRecoveryClockTests: XCTestCase {
         let missingClock = recoveryClock(missingFixture)
         missingClock.start(at: nil)
         missingClock.start(at: 100)
+        XCTAssertNil(missingClock.startedAtNanoseconds)
         missingFixture.enqueueNow(200)
         XCTAssertNil(missingClock.elapsedNanoseconds())
 

@@ -10,12 +10,15 @@ final class InternalDisableBatchBudget {
         let started: UInt64
         let deadline: UInt64
         let normalWakeReadiness: Bool?
+        let exitOnly: Bool?
 
-        init(bootSession: UUID, started: UInt64, deadline: UInt64, normalWakeReadiness: Bool? = nil) {
+        init(bootSession: UUID, started: UInt64, deadline: UInt64, normalWakeReadiness: Bool? = nil,
+             exitOnly: Bool? = nil) {
             self.bootSession = bootSession
             self.started = started
             self.deadline = deadline
             self.normalWakeReadiness = normalWakeReadiness
+            self.exitOnly = exitOnly
         }
     }
     enum Failure: Error { case rejected }
@@ -46,7 +49,8 @@ final class InternalDisableBatchBudget {
         directory = try LayoutCloseoutDirectory(path)
         policyBytes = try directory.read("policy.json")
         policy = try JSONDecoder().decode(Policy.self, from: policyBytes)
-        guard policy.bootSession == (try boot()), policy.deadline > policy.started,
+        guard !(policy.exitOnly == true && policy.normalWakeReadiness == true),
+              policy.bootSession == (try boot()), policy.deadline > policy.started,
               policy.deadline - policy.started <= 180_000_000_000 else { throw Failure.rejected }
         self.now = now
         lastTime = policy.started
@@ -104,6 +108,7 @@ final class InternalDisableBatchBudget {
             let name: String
             let windowStart: UInt64?
             if let firstAttempt {
+                guard policy.exitOnly != true else { throw Failure.rejected }
                 guard let wakeAt, wakeAt > firstAttempt, wakeAt <= at else { throw Failure.rejected }
                 if let configurationReadyAt {
                     guard policy.normalWakeReadiness == true, configurationReadyAt >= wakeAt,

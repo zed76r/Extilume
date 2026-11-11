@@ -499,6 +499,21 @@ public struct RecoveryRecord: Codable, Equatable, Sendable {
         phase = .prepared
     }
 
+    public func confirmingExternalCloseout(actual: DisplayLayout, identity: ExternalDisplayIdentity) throws -> RecoveryRecord {
+        try validate()
+        try identity.validate()
+        guard version == 4, internalDisplay == nil, let responsibility = externalDisplay,
+              responsibility.baseline, responsibility.pending, phase == .owned || phase == .restoring,
+              !sourceUnresolved, actual == baseline, identity.bootSession != responsibility.identity.bootSession,
+              identity.uuid == responsibility.identity.uuid, identity.registryPath == responsibility.identity.registryPath,
+              identity.edidUUID == responsibility.identity.edidUUID else { throw RecoveryError.unfinishedTransaction }
+        var closed = self
+        closed.beginRestoration()
+        try closed.confirmRestored(actual: actual, internalEnabled: true, externalEnabled: true)
+        try closed.validate()
+        return closed
+    }
+
     public func confirmingLayoutCloseout(actual: DisplayLayout) throws -> RecoveryRecord {
         try validate()
         guard phase == .owned, layoutPending, !sourceUnresolved,

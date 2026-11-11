@@ -1,3 +1,4 @@
+import ExtilumeCore
 import Foundation
 
 enum ConnectionObservationEvent: String, Encodable, Sendable { case matched, interest, terminated, watchFailed }
@@ -126,6 +127,50 @@ struct ConnectionDisplayObservation: Encodable, Sendable {
     let flags: UInt32
     let scope: ConnectionDisplayScope
     let invalidationReason: String?
+}
+
+enum ConnectionInvalidationSource: String, Encodable, Sendable, CaseIterable {
+    case cgRemove = "cg-remove", cgDisabled = "cg-disabled", ioNegative = "io-negative"
+    case ioRoleConflict = "io-role-conflict", ioCandidateChanged = "io-candidate-changed"
+    case controlledLinkBudgetExpired = "controlled-link-budget-expired"
+    case controlledLinkReconfigurationFailed = "controlled-link-reconfiguration-failed"
+    case powerObserver = "power-observer", protectionCommunication = "protection-communication"
+    case debugCommand = "debug-command"
+}
+
+struct ConnectionInvalidation: Encodable, Sendable {
+    let type = "connection-invalidation"
+    let clock = "mach_continuous_time/ns"
+    let role = InternalLifecycleRole.controller
+    let source: ConnectionInvalidationSource
+    let observedAtNanoseconds: UInt64?
+    var recoveryStartedAtNanoseconds: UInt64?
+    let connection: ConnectionObservation?
+    let display: ConnectionDisplayObservation?
+
+    init(source: ConnectionInvalidationSource, observedAtNanoseconds: UInt64?, recoveryStartedAtNanoseconds: UInt64?,
+         connection: ConnectionObservation? = nil, display: ConnectionDisplayObservation? = nil) {
+        self.source = source
+        self.observedAtNanoseconds = observedAtNanoseconds
+        self.recoveryStartedAtNanoseconds = recoveryStartedAtNanoseconds
+        self.connection = connection
+        self.display = display
+    }
+
+    init(source: ConnectionInvalidationSource, at timestamp: UInt64? = try? ContinuousClock.nanoseconds()) {
+        self.init(source: source, observedAtNanoseconds: timestamp, recoveryStartedAtNanoseconds: timestamp)
+    }
+}
+
+// 与撤权共用调用方的短锁，后来的来源不能覆盖首次原因。
+struct FirstConnectionInvalidation {
+    private(set) var value: ConnectionInvalidation?
+
+    mutating func record(_ value: ConnectionInvalidation) -> Bool {
+        guard self.value == nil else { return false }
+        self.value = value
+        return true
+    }
 }
 
 func connectionObservationMarker<Value: Encodable & Sendable>(_ observation: Value) throws -> String {

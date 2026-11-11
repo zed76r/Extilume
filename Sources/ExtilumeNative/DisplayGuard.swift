@@ -149,7 +149,7 @@ final class GuardSession: @unchecked Sendable {
     private var powerObserver: InternalSystemPowerObserver?
     private let powerGate = InternalPowerGate()
     private var recoveryDisplayCallbackRegistered = false
-    private var reportedConnectionInvalidation = false
+    private var firstConnectionInvalidation = FirstConnectionInvalidation()
     private var recoveryFailed = false
     private let recoveryClock = InternalRecoveryClock()
     private var recoveryRetryScheduled = false
@@ -206,7 +206,8 @@ final class GuardSession: @unchecked Sendable {
                     },
                     didWake: { [weak self] in self?.didWake() },
                     onFailure: { [weak self] in
-                        self?.connectionInvalidated(message: "电源通知确认失败；禁止新停用，保留恢复责任。")
+                        self?.connectionInvalidated(ConnectionInvalidation(source: .powerObserver),
+                                                    message: "电源通知确认失败；禁止新停用，保留恢复责任。")
                     }
                 )
                 try observer.start()
@@ -402,7 +403,8 @@ final class GuardSession: @unchecked Sendable {
             let input = DispatchSource.makeReadSource(fileDescriptor: parentChannel.descriptor, queue: .global())
             input.setEventHandler { [weak self] in
                 self?.protectionInputSource?.cancel()
-                self?.connectionInvalidated(message: "保护通信失效；禁止新控制，主进程负责核验恢复。")
+                self?.connectionInvalidated(ConnectionInvalidation(source: .protectionCommunication),
+                                            message: "保护通信失效；禁止新控制，主进程负责核验恢复。")
             }
             protectionInputSource = input
             input.resume()
@@ -521,7 +523,7 @@ final class GuardSession: @unchecked Sendable {
         let alreadyRestored = cancelledNormalReadiness
         if command == "invalidate-connection" {
             print("模拟连接安全条件失效；不代表实际拔线。")
-            connectionInvalidated()
+            connectionInvalidated(ConnectionInvalidation(source: .debugCommand))
             return
         }
         queue.async { [weak self] in
@@ -600,26 +602,30 @@ final class GuardSession: @unchecked Sendable {
     }
 
     private func connectionInvalidated(
-        message: String = "连接安全条件失效；禁止新控制，主进程负责核验恢复。",
-        observedAt: UInt64? = try? ContinuousClock.nanoseconds()
+        _ cause: ConnectionInvalidation,
+        message: String = "连接安全条件失效；禁止新控制，主进程负责核验恢复。"
     ) {
         // 危险事件立即撤权，不等待控制队列上的快照或握手。
+        var invalidation = cause
         let first = authorizationLock.withLock {
-            recoveryClock.start(at: observedAt)
-            let first = !reportedConnectionInvalidation
-            reportedConnectionInvalidation = true
+            recoveryClock.start(at: cause.recoveryStartedAtNanoseconds)
             authorization.markLost()
             lifecycle.fail()
-            return first
+            invalidation.recoveryStartedAtNanoseconds = recoveryClock.startedAtNanoseconds
+            return firstConnectionInvalidation.record(invalidation)
         }
         reapplication.invalidate()
+        // 先入异步输出队列，避免停止线程先完成排空并退出。
+        if first { traceConnectionObservation(invalidation) }
         queue.async { [weak self] in
             guard let self, !self.stopping else { return }
             self.stop()
         }
         if first {
             applicationCallbacks?.faulted()
-            if let observedAt { traceInternalLifecycle(.firstConnectionInvalidation, observedAt: observedAt) }
+            if let observedAt = cause.recoveryStartedAtNanoseconds {
+                traceInternalLifecycle(.firstConnectionInvalidation, observedAt: observedAt)
+            }
             else { print("首个连接失效计时不可用；不能据此判定恢复时限通过。") }
         }
         print(message)
@@ -641,10 +647,10 @@ final class GuardSession: @unchecked Sendable {
                     self.scheduleRecoveryRetry(after: 0)
                 }
             }
-        ) { [weak self] reason, observedAt in
+        ) { [weak self] invalidation in
             self?.connectionInvalidated(
-                message: "连接安全条件失效 [\(reason)]；禁止新控制，主进程负责核验恢复。",
-                observedAt: observedAt
+                invalidation,
+                message: "连接安全条件失效 [\(invalidation.source.rawValue)]；禁止新控制，主进程负责核验恢复。"
             )
         }
         connectionObserver = observer
@@ -1223,7 +1229,12 @@ final class GuardSession: @unchecked Sendable {
         }
         do {
             let verifiedSleepEpoch = authorizationLock.withLock { lifecycle.sleepEpoch }
-            record = try restoreRecord()
+            // 恢复 Complete 会重建链路；沿用切回双屏时先停止控制观察的边界。
+            record = try InternalSleepPreparation.restore(checkAccess: { try self.checkRecoveryAccess() }, stopObserving: {
+                traceInternalLifecycle(.observerDrainStarted)
+                stopConnectionObserver()
+                traceInternalLifecycle(.observerDrainFinished)
+            }, operation: { try restoreRecord() })
             // 恢复不等待诊断；退出前才收束回调，保留触发本轮撤权的记录。
             drainConnectionObservations(afterStoppingProducer: stopConnectionObserver)
             if authorizationLock.withLock({ authorization.ready }) {

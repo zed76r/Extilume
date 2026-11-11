@@ -116,6 +116,106 @@ final class ExternalRecoveryStoreTests: XCTestCase {
         }
     }
 
+    func testExternalCloseoutPreservesOriginalBindingAndSupportsRestoring() throws {
+        let fixture = try makeFixture()
+        var owned = fixture.prepared
+        try owned.markApplying()
+        try owned.confirmApplied(fixture.internalOnly, internalEnabled: true, externalEnabled: false)
+        let old = try XCTUnwrap(owned.externalDisplay)
+        let identity = newIdentity(old.identity)
+        for restoring in [false, true] {
+            var record = owned
+            if restoring { record.beginRestoration() }
+            let closed = try record.confirmingExternalCloseout(actual: fixture.baseline, identity: identity)
+            XCTAssertEqual(closed.phase, .restored)
+            XCTAssertTrue(closed.canClear)
+            XCTAssertEqual(closed.session, record.session)
+            XCTAssertEqual(closed.generation, record.generation)
+            XCTAssertEqual(closed.externalDisplay?.identity, old.identity)
+            XCTAssertEqual(closed.externalDisplay?.numericIDHint, old.numericIDHint)
+            XCTAssertFalse(try XCTUnwrap(closed.externalDisplay).pending)
+            XCTAssertFalse(closed.layoutPending)
+        }
+        XCTAssertThrowsError(try owned.confirmingLayoutCloseout(actual: fixture.baseline))
+    }
+
+    func testExternalCloseoutRejectsWrongIdentityLayoutPhaseAndUnresolved() throws {
+        let fixture = try makeFixture()
+        var owned = fixture.prepared
+        try owned.markApplying()
+        try owned.confirmApplied(fixture.internalOnly, internalEnabled: true, externalEnabled: false)
+        let original = try XCTUnwrap(owned.externalDisplay).identity
+        let current = newIdentity(original)
+        let variants = [original,
+            ExternalDisplayIdentity(uuid: UUID(), registryPath: original.registryPath, edidUUID: original.edidUUID, bootSession: current.bootSession, registryEntryID: 1),
+            ExternalDisplayIdentity(uuid: original.uuid, registryPath: "other", edidUUID: original.edidUUID, bootSession: current.bootSession, registryEntryID: 1),
+            ExternalDisplayIdentity(uuid: original.uuid, registryPath: original.registryPath, edidUUID: "other", bootSession: current.bootSession, registryEntryID: 1),
+            ExternalDisplayIdentity(uuid: original.uuid, registryPath: original.registryPath, edidUUID: original.edidUUID, bootSession: current.bootSession, registryEntryID: 0)]
+        for identity in variants {
+            XCTAssertThrowsError(try owned.confirmingExternalCloseout(actual: fixture.baseline, identity: identity))
+        }
+        XCTAssertThrowsError(try owned.confirmingExternalCloseout(actual: fixture.target, identity: current))
+        XCTAssertThrowsError(try fixture.prepared.confirmingExternalCloseout(actual: fixture.baseline, identity: current))
+        var unresolved = owned
+        XCTAssertThrowsError(try unresolved.observeExternalEnabled(true, source: .unknown))
+        XCTAssertThrowsError(try unresolved.confirmingExternalCloseout(actual: fixture.baseline, identity: current))
+        let noExternal = try RecoveryRecord(baseline: fixture.baseline, target: fixture.target)
+        XCTAssertThrowsError(try noExternal.confirmingExternalCloseout(actual: fixture.baseline, identity: current))
+        let internalResponsibility = InternalDisplayResponsibility(identity: internalID, baseline: true, applied: true)
+        let mixed = try RecoveryRecord(baseline: fixture.baseline, target: fixture.target,
+                                       internalDisplay: internalResponsibility, externalDisplay: fixture.prepared.externalDisplay)
+        XCTAssertThrowsError(try mixed.confirmingExternalCloseout(actual: fixture.baseline, identity: current))
+    }
+
+    func testExternalCloseoutRequiresLockAndPreservesBytesAcrossFailures() throws {
+        for failure in 0...5 {
+            try withTemporaryDirectory { directory in
+                let fixture = try makeFixture()
+                let store = try RecoveryStore(directory: directory)
+                try store.acquireExclusiveOwnership()
+                let owned = try store.applyExternal(fixture.prepared) { (fixture.internalOnly, true, false) }
+                let identity = newIdentity(try XCTUnwrap(owned.externalDisplay).identity)
+                let original = try XCTUnwrap(store.loadWithOriginalBytes()?.bytes)
+                let other = try RecoveryStore(directory: directory)
+                XCTAssertThrowsError(try other.closeExternalResponsibility(expectedOriginal: original, target: fixture.baseline,
+                    identity: identity, backup: { _ in }, verify: {}, beforeSave: {}))
+                var backup: Data?
+                var verifies = 0
+                let changed = original + Data(" ".utf8)
+                let run = {
+                    try store.closeExternalResponsibility(expectedOriginal: failure == 0 ? changed : original,
+                        target: fixture.baseline, identity: identity, backup: { bytes in
+                            backup = bytes
+                            if failure == 1 { throw RecoveryStoreError.ioFailure }
+                        }, verify: {
+                            verifies += 1
+                            if failure == 2 && verifies == 2 { throw RecoveryStoreError.ioFailure }
+                        }, beforeSave: {
+                            if failure == 3 { try changed.write(to: self.recordURL(in: directory)) }
+                        }, checkBeforeCommit: {
+                            if failure == 4 { throw RecoveryStoreError.ioFailure }
+                        })
+                }
+                if failure < 5 {
+                    XCTAssertThrowsError(try run())
+                    XCTAssertEqual(try store.loadWithOriginalBytes()?.bytes, failure == 3 ? changed : original)
+                } else {
+                    let closed = try run()
+                    XCTAssertEqual(backup, original)
+                    XCTAssertEqual(verifies, 3)
+                    XCTAssertEqual(try store.load(), closed)
+                    XCTAssertTrue(closed.canClear)
+                    XCTAssertTrue(FileManager.default.fileExists(atPath: recordURL(in: directory).path))
+                }
+            }
+        }
+    }
+
+    private func newIdentity(_ old: ExternalDisplayIdentity) -> ExternalDisplayIdentity {
+        ExternalDisplayIdentity(uuid: old.uuid, registryPath: old.registryPath, edidUUID: old.edidUUID,
+                                bootSession: UUID(), registryEntryID: old.registryEntryID + 1)
+    }
+
     private func makeFixture() throws -> (
         prepared: RecoveryRecord,
         baseline: DisplayLayout,

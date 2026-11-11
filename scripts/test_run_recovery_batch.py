@@ -25,7 +25,7 @@ class CleanupEvidenceTests(unittest.TestCase):
         def fault(): raise RuntimeError('native-fault')
         def close(): raise RuntimeError('connection-evidence-incomplete')
         backend = SimpleNamespace(tick=lambda **_: fault(), safety_handoff=lambda: {}, close=lambda: True)
-        gate = SimpleNamespace(next_action=0, confirmed_requests=0, native_disable_count=0, stream=None, close=close)
+        gate = SimpleNamespace(exit_only=False, next_action=0, confirmed_requests=0, native_disable_count=0, stream=None, close=close)
         result = R.execute(backend, gate)
         self.assertEqual(result['stopReason'], 'native-fault')
         self.assertFalse(result['connectionEvidenceComplete'])
@@ -66,6 +66,25 @@ class TerminalEntryTests(unittest.TestCase):
              patch.object(R, 'prepare', return_value={'prepared': True}) as prepare:
             self.assertEqual(R.main(['prepare', '--directory', '/not-used']), 0)
             prepare.assert_called_once_with('/not-used')
+
+    def test_prepare_exit_only_selects_separate_candidate_without_running(self):
+        with patch.object(R.sys, 'stdin', io.StringIO()), \
+             patch.object(R.sys, 'stdout', io.StringIO()), \
+             patch.object(R, 'prepare', return_value={'prepared': True}) as prepare:
+            self.assertEqual(R.main(['prepare', '--directory', '/not-used', '--exit-only']), 0)
+            prepare.assert_called_once_with('/not-used', exit_only=True)
+
+    def test_unattended_prepare_requires_exit_only(self):
+        with patch.object(R.sys, 'stdout', io.StringIO()), patch.object(R.sys, 'stderr', io.StringIO()), \
+             patch.object(R, 'prepare', return_value={'prepared': True}) as prepare:
+            self.assertEqual(R.main(['prepare', '--directory', '/not-used', '--unattended']), 1)
+            prepare.assert_not_called()
+            self.assertEqual(R.main(['prepare', '--directory', '/not-used', '--exit-only', '--unattended']), 0)
+            prepare.assert_called_once_with('/not-used', exit_only=True, unattended=True)
+        with self.assertRaisesRegex(RuntimeError, 'unattended-requires-exit-only'):
+            R.prepare('/not-used', unattended=True)
+        with self.assertRaisesRegex(RuntimeError, 'unattended-requires-exit-only'):
+            R.execute(None, SimpleNamespace(exit_only=False), unattended=True)
 
 
 class BatchEvidenceTests(unittest.TestCase):
@@ -301,8 +320,13 @@ class BatchEvidenceTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'invalid-topology-counts'):
                 self.gate.tick()
 
-    def test_fixed_entry_runs_real_gate_pipe_sleep_and_exit_validators_without_hardware(self):
+    def fixed_round(self, stop_fault=False, mutate_receipt=lambda receipt: None, keep_helper=False, exit_only=False, unattended=False):
         self.pipe.close()
+        if exit_only:
+            binaries = self.gate.binaries
+            self.gate.close()
+            self.gate = G.RecoveryBatchGate(self.root, str(uuid.uuid4()), 'a'*64, binaries,
+                lambda: self.time, lambda pid: self.processes[pid], exit_only=True)
         self.gate.roles.clear()
         os.close(self.writer)
         self.writer = None
@@ -312,18 +336,29 @@ class BatchEvidenceTests(unittest.TestCase):
         state.mkdir(mode=0o700)
         reader, self.writer = os.pipe()
         child = SimpleNamespace(pid=10, stdout=os.fdopen(reader, 'rb'), poll=lambda: None)
-        backend = SimpleNamespace(bundle=self.root, field=dict(bootSession=FIX.SESSION), close=lambda: True)
+        backend = R.BatchMac.__new__(R.BatchMac)
+        backend.bundle, backend.gate, backend.journal = self.root, self.gate, self.gate.journal
+        backend.field = dict(bootSession=FIX.SESSION, expectedC=snapshot,
+                             internalHardwareIdentity=hardware, records=[])
+        backend.safety_deadline = backend.last_scan = None
+        backend.registered_roles, backend.children = set(), {}
+        backend.now = lambda: (self.time, self.time)
+        backend.events = lambda: []
+        backend.check_processes = lambda daily: None
+        backend.close = lambda: True
         calls = []
-        def tick(force=False):
-            self.gate.tick()
-        backend.tick = tick
-        backend.wait = lambda: (tick(), time.sleep(.001))
+        self.round_calls = calls
+        def wait():
+            if keep_helper and backend.safety_deadline is not None:
+                self.time = backend.safety_deadline
+            backend.tick()
+            time.sleep(.001)
+        backend.wait = wait
         backend.visual = lambda message: calls.append('visual')
         backend.preflight = lambda: calls.append('sleep-preflight')
-        backend.read_C = lambda phase: calls.append(phase)
+        backend.read_C = lambda phase: (calls.append(phase), ([snapshot, snapshot], internal))[1]
         backend.start_recorder = lambda: calls.append('recorder-ready')
         backend.capture = lambda name: FIX.capture(100, 100)
-        backend.safety_handoff = lambda: self.fail('successful fixture must not need safety handoff')
         def launch(directory, boot):
             process = G.RecoveryBatchGate.launch_application(self.gate, directory, boot, lambda *a, **k: child)
             self.pipe = self.gate.stream
@@ -333,6 +368,7 @@ class BatchEvidenceTests(unittest.TestCase):
         phase = ['standby']
         def run(args, **kwargs):
             command = args[2]
+            calls.append(command)
             if command == 'status':
                 status = 'waiting' if phase[0] == 'standby' else 'applied' if phase[0] == 'start' else 'manualConfiguration'
                 return SimpleNamespace(returncode=0, stdout=json.dumps(dict(result='status', sessionState={status: {}},
@@ -343,6 +379,7 @@ class BatchEvidenceTests(unittest.TestCase):
                     G.D.save_new(self.gate.native_budget_directory / (role+'-process.json'),
                                  {key: self.processes[pid][key] for key in ('pid', 'startSeconds', 'startMicroseconds')})
                     self.gate.bind_registered_process(role)
+                    backend.registered_roles.add(role)
                 self.time = 21
                 self.emit([(20, 'disableStarted'), (21, 'disableFinished')])
             elif command == 'restore-for-configuration':
@@ -364,10 +401,19 @@ class BatchEvidenceTests(unittest.TestCase):
                 record = dict(session=expectation['session'], generation=3, baseline=layout, phase='restored',
                     layoutPending=False, sourceUnresolved=False, independentGuardVerified=True,
                     internalDisplay=dict(identity=inner['identityUUID'], baseline=True, pending=False, hardwareIdentity=hardware))
-                G.D.save_new(self.gate.native_budget_directory / 'restoration.json', dict(version=1,
+                receipt = dict(version=1,
                     app={key: self.processes[10][key] for key in ('pid', 'startSeconds', 'startMicroseconds')},
-                    verifiedAtNanoseconds=self.time, expectation=expectation, record=record))
-                self.processes.clear()
+                    verifiedAtNanoseconds=self.time, expectation=expectation, record=record)
+                mutate_receipt(receipt)
+                G.D.save_new(self.gate.native_budget_directory / 'restoration.json', receipt)
+                if stop_fault:
+                    self.emit([(1601, 'firstConnectionInvalidation')])
+                    cause = dict(type='connection-invalidation', clock='mach_continuous_time/ns', role='controller',
+                        source='protection-communication', observedAtNanoseconds=1601, recoveryStartedAtNanoseconds=1600)
+                    os.write(self.writer, (json.dumps(cause) + '\n').encode())
+                for pid in list(self.processes):
+                    if not keep_helper or pid != 12:
+                        del self.processes[pid]
                 child.poll = lambda: 0
                 os.close(self.writer)
                 self.writer = None
@@ -398,13 +444,109 @@ class BatchEvidenceTests(unittest.TestCase):
             return True
         with patch.object(self.gate, 'launch_application', launch), \
              patch.object(self.gate, 'control_application', lambda action, *a: control(action, run)), \
-             patch.object(self.gate, 'confirm_configuration_visual', confirm):
-            result = R.execute(backend, self.gate)
+             patch.object(self.gate, 'confirm_configuration_visual', confirm), \
+             patch.object(G, 'process_has_exited', side_effect=lambda binding: binding['pid'] not in self.processes):
+            result = R.execute(backend, self.gate, unattended=unattended)
+        return result
+
+    def test_fixed_entry_runs_real_gate_pipe_sleep_and_exit_validators_without_hardware(self):
+        result = self.fixed_round()
         self.assertTrue(result['passed'], result)
         self.assertEqual(result['confirmedRequests'], 5)
         self.assertEqual(result['nativeDisableObserved'], 2)
         self.assertIsNone(self.pipe.fd)
-        self.assertTrue(child.stdout.closed)
+        self.assertTrue(self.gate.application_process.stdout.closed)
+
+    def test_exit_only_runs_start_then_quit_and_independent_restoration_without_sleep(self):
+        result = self.fixed_round(exit_only=True)
+        self.assertTrue(result['passed'], result)
+        self.assertEqual(result['scope'], R.EXIT_SCOPE)
+        self.assertEqual((result['consumedRequests'], result['confirmedRequests'], result['nativeDisableObserved']), (2, 2, 1))
+        controls = [call for call in self.round_calls if call in
+                    ('apply-externalOnly', 'restore-for-configuration', 'confirm-configuration', 'quit')]
+        self.assertEqual(controls, ['apply-externalOnly', 'quit'])
+        self.assertTrue(set(self.round_calls).isdisjoint({'sleep-preflight', 'recorder-ready', 'confirmed-C'}))
+        self.assertFalse((self.gate.native_budget_directory / 'wake-authorized.json').exists())
+        self.assertTrue(result['pipeEOF'])
+
+    def test_exit_only_fault_preserves_cause_and_verifies_cleanup_without_repeating_quit(self):
+        result = self.fixed_round(exit_only=True, stop_fault=True)
+        self.assertFalse(result['passed'])
+        self.assertEqual(result['stopReason'], 'native-fault')
+        self.assertEqual((result['consumedRequests'], result['confirmedRequests'], result['nativeDisableObserved']), (2, 1, 1))
+        self.assertTrue(result['safetyHandoff']['recoveryVerified'], result)
+        self.assertFalse(result['safetyHandoff']['normalQuitRequested'])
+        self.assertEqual(self.round_calls.count('quit'), 1)
+        path = self.gate.journal.path.with_suffix('.connections.jsonl')
+        causes = [json.loads(line) for line in path.read_text().splitlines() if 'connection-invalidation' in line]
+        self.assertEqual([cause['source'] for cause in causes], ['protection-communication'])
+
+    def test_unattended_exit_retains_machine_verification_without_visual_confirmation(self):
+        result = self.fixed_round(exit_only=True, unattended=True)
+        self.assertTrue(result['passed'], result)
+        self.assertEqual(result['scope'], R.UNATTENDED_EXIT_SCOPE)
+        self.assertTrue(result['physicalObservationPending'])
+        self.assertFalse(result['hardwareAcceptance'])
+        self.assertEqual((result['consumedRequests'], result['confirmedRequests'], result['nativeDisableObserved']), (2, 2, 1))
+        self.assertEqual([call for call in self.round_calls if call in ('apply-externalOnly', 'quit')],
+                         ['apply-externalOnly', 'quit'])
+        self.assertIn('preflight', self.round_calls)
+        self.assertTrue(set(self.round_calls).isdisjoint({'visual', 'sleep-preflight', 'recorder-ready'}))
+        self.assertTrue(result['pipeEOF'])
+        self.assertTrue(result['connectionEvidenceComplete'])
+        self.assertFalse((self.gate.native_budget_directory / 'wake-authorized.json').exists())
+
+    def test_stop_connection_fault_retains_failure_and_independently_verifies_recovery(self):
+        result = self.fixed_round(stop_fault=True)
+        self.assertFalse(result['passed'])
+        self.assertEqual(result['stopReason'], 'native-fault')
+        self.assertEqual((result['consumedRequests'], result['confirmedRequests']), (5, 4))
+        self.assertEqual(result['nativeDisableObserved'], 2)
+        self.assertTrue(result['safetyHandoff']['recoveryVerified'], result)
+        self.assertFalse(result['safetyHandoff']['normalQuitRequested'])
+        self.assertTrue(result['pipeEOF'])
+        self.assertTrue(self.gate.application_process.stdout.closed)
+
+    def test_fault_recovery_rejects_stale_receipt_without_reissuing_quit(self):
+        result = self.fixed_round(stop_fault=True, mutate_receipt=lambda receipt:
+                                  receipt['app'].update(startMicroseconds=2))
+        self.assertEqual(result['stopReason'], 'native-fault')
+        self.assertFalse(result['safetyHandoff']['recoveryVerified'])
+        self.assertFalse(result['safetyHandoff']['normalQuitRequested'])
+        self.assertTrue(result['safetyHandoff']['userHandoffRequired'])
+
+    def test_fault_recovery_keeps_pending_responsibility_unverified(self):
+        result = self.fixed_round(stop_fault=True, mutate_receipt=lambda receipt:
+                                  receipt['record'].update(layoutPending=True))
+        self.assertEqual(result['stopReason'], 'native-fault')
+        self.assertTrue(result['safetyHandoff']['softwareCVerified'])
+        self.assertFalse(result['safetyHandoff']['recoveryVerified'])
+
+    def test_fault_recovery_requires_independent_guard_proof(self):
+        result = self.fixed_round(stop_fault=True, mutate_receipt=lambda receipt:
+                                  receipt['record'].update(independentGuardVerified=False))
+        self.assertFalse(result['safetyHandoff']['recoveryVerified'])
+        self.assertFalse(result['passed'])
+
+    def test_fault_recovery_waits_for_helper_after_app_exit_and_pipe_eof(self):
+        result = self.fixed_round(stop_fault=True, keep_helper=True)
+        self.assertTrue(result['pipeEOF'])
+        self.assertEqual(result['stopReason'], 'native-fault')
+        self.assertFalse(result['safetyHandoff']['recoveryVerified'])
+        self.assertTrue(result['safetyHandoff']['userHandoffRequired'])
+
+    def test_safety_handoff_does_not_renew_deadline_or_send_quit_after_expiry(self):
+        backend = R.BatchMac.__new__(R.BatchMac)
+        backend.gate, backend.journal = self.gate, self.gate.journal
+        backend.now = lambda: (self.time, self.time)
+        backend.safety_deadline = 100
+        self.time = 101
+        with patch.object(R.subprocess, 'run') as run:
+            result = backend.safety_handoff()
+        self.assertEqual(backend.safety_deadline, 100)
+        self.assertFalse(result['recoveryVerified'])
+        self.assertFalse(result['normalQuitRequested'])
+        run.assert_not_called()
 
     def test_prefix_failure_enters_handoff_without_later_actions(self):
         calls = []
@@ -421,6 +563,7 @@ class BatchEvidenceTests(unittest.TestCase):
         backend = R.BatchMac.__new__(R.BatchMac)
         backend.gate = self.gate
         backend.now = lambda: (100, 100)
+        backend.safety_deadline = None
         backend.journal = self.gate.journal
         backend.read_C = lambda phase: ([], {})
         with patch.object(G, 'process_has_exited', return_value=False), \
@@ -539,6 +682,7 @@ class NativeWitnessTests(unittest.TestCase):
         gate = self.backend.gate
         gate.roles = {'app': dict(pid=11, executable=self.binding['executable'])}
         gate.next_action = 1
+        gate.actions = G.ACTIONS
         gate.native_budget_directory = self.backend.bundle
         gate.tick = lambda: None
         def bind(role):
@@ -648,6 +792,47 @@ class FieldBindingTests(unittest.TestCase):
     def test_complete_bound_field_passes_without_starting_any_process(self):
         with patch.object(R.subprocess, 'Popen', side_effect=AssertionError('no process')):
             R.validate_field(self.bundle, self.manifest, self.field)
+
+    def exit_field(self):
+        self.manifest['scope'] = R.EXIT_SCOPE
+        (self.bundle / 'manifest.json').write_text(json.dumps(self.manifest))
+        self.field.update(scope=R.EXIT_SCOPE, manifestSHA256=G.D.digest(self.bundle / 'manifest.json'),
+                          actions=list(G.EXIT_ACTIONS), maximumNativeDisableAttempts=1, maximumSleepRequests=0,
+                          normalWakeReadiness=False)
+
+    def test_exit_field_requires_exact_separate_scope_and_limits(self):
+        self.exit_field()
+        with patch.object(R.subprocess, 'Popen', side_effect=AssertionError('no process')):
+            R.validate_field(self.bundle, self.manifest, self.field)
+            original = copy.deepcopy(self.field)
+            for replacement in (dict(scope=R.SCOPE), dict(approved=False), dict(actions=list(G.ACTIONS)),
+                                dict(maximumNativeDisableAttempts=2), dict(maximumNativeDisableAttempts=True),
+                                dict(maximumSleepRequests=1), dict(maximumSleepRequests=False),
+                                dict(normalWakeReadiness=True)):
+                with self.subTest(replacement=replacement), self.assertRaises(RuntimeError):
+                    R.validate_field(self.bundle, self.manifest, dict(original, **replacement))
+
+    def test_normal_manifest_cannot_authorize_exit_sequence_by_field_edit(self):
+        self.field.update(scope=R.EXIT_SCOPE, actions=['start', 'stop'], maximumNativeDisableAttempts=1,
+                          maximumSleepRequests=0, normalWakeReadiness=False)
+        with self.assertRaisesRegex(RuntimeError, 'field-authorization-required'):
+            R.validate_field(self.bundle, self.manifest, self.field)
+
+    def test_unattended_scope_requires_machine_method_and_exact_exit_limits(self):
+        self.exit_field()
+        self.manifest['scope'] = R.UNATTENDED_EXIT_SCOPE
+        (self.bundle / 'manifest.json').write_text(json.dumps(self.manifest))
+        self.field.update(scope=R.UNATTENDED_EXIT_SCOPE, confirmationMethod='machine-evidence',
+                          manifestSHA256=G.D.digest(self.bundle / 'manifest.json'))
+        R.validate_field(self.bundle, self.manifest, self.field)
+        for replacement in (dict(confirmationMethod='local-dialog'), dict(actions=list(G.ACTIONS)),
+                            dict(maximumNativeDisableAttempts=2), dict(maximumSleepRequests=1),
+                            dict(normalWakeReadiness=True), dict(scope=R.EXIT_SCOPE)):
+            with self.subTest(replacement=replacement), self.assertRaises(RuntimeError):
+                R.validate_field(self.bundle, self.manifest, dict(self.field, **replacement))
+        self.exit_field()
+        with self.assertRaises(RuntimeError):
+            R.validate_field(self.bundle, self.manifest, dict(self.field, confirmationMethod='machine-evidence'))
 
     def test_unapproved_field_stays_unapproved(self):
         self.field['approved'] = False

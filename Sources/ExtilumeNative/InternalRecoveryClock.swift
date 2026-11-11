@@ -98,6 +98,10 @@ final class InternalRecoveryClock: @unchecked Sendable {
         intervals.removeAll()
     }
 
+    var startedAtNanoseconds: UInt64? {
+        lock.withLock { epochInvalidated ? nil : faultStartedAt }
+    }
+
     func elapsedNanoseconds() -> UInt64? {
         lock.lock()
         defer { lock.unlock() }

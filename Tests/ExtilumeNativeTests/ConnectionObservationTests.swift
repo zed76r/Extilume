@@ -60,6 +60,63 @@ final class ConnectionObservationTests: XCTestCase {
         XCTAssertFalse(line.contains("entryID"))
     }
 
+    func testInvalidationSourcesKeepDistinctTimesAndAnonymousContext() throws {
+        XCTAssertEqual(Set(ConnectionInvalidationSource.allCases.map(\.rawValue)), [
+            "cg-remove", "cg-disabled", "io-negative", "io-role-conflict", "io-candidate-changed",
+            "controlled-link-budget-expired", "controlled-link-reconfiguration-failed", "power-observer",
+            "protection-communication", "debug-command"
+        ])
+        let connection = observation()
+        let display = ConnectionDisplayObservation(role: .controller, observerStartedAtNanoseconds: 90,
+            continuousNs: 123, flags: CGDisplayChangeSummaryFlags.removeFlag.rawValue,
+            scope: .other, invalidationReason: "cg-remove")
+        for source in ConnectionInvalidationSource.allCases {
+            let marker = ConnectionInvalidation(source: source, observedAtNanoseconds: 123,
+                recoveryStartedAtNanoseconds: 100, connection: connection, display: display)
+            let line = try connectionObservationMarker(marker)
+            let value = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any])
+            XCTAssertEqual(Set(value.keys), ["type", "clock", "role", "source", "observedAtNanoseconds",
+                                             "recoveryStartedAtNanoseconds", "connection", "display"])
+            XCTAssertEqual(value["type"] as? String, "connection-invalidation")
+            XCTAssertEqual(value["clock"] as? String, "mach_continuous_time/ns")
+            XCTAssertEqual(value["role"] as? String, "controller")
+            XCTAssertEqual(value["source"] as? String, source.rawValue)
+            XCTAssertEqual(value["observedAtNanoseconds"] as? UInt64, 123)
+            XCTAssertEqual(value["recoveryStartedAtNanoseconds"] as? UInt64, 100)
+            let nested = try XCTUnwrap(value["connection"] as? [String: Any])
+            XCTAssertEqual(nested["registryScope"] as? String, "other")
+            XCTAssertEqual(nested["candidateOrdinal"] as? UInt64, 1)
+            let nestedDisplay = try XCTUnwrap(value["display"] as? [String: Any])
+            XCTAssertEqual(nestedDisplay["flags"] as? UInt32, display.flags)
+            for identity in ["entryID", "displayID", "registryID", "UUID", String(UInt64(0xFEED00000042))] {
+                XCTAssertFalse(line.contains(identity))
+            }
+        }
+    }
+
+    func testFirstInvalidationKeepsItsSourceAndUnknownClockAcrossLaterCauses() throws {
+        for first in ConnectionInvalidationSource.allCases {
+            for times: (UInt64?, UInt64?) in [(200, 100), (nil, nil), (200, nil), (nil, 100)] {
+                var cause = FirstConnectionInvalidation()
+                XCTAssertTrue(cause.record(ConnectionInvalidation(source: first,
+                    observedAtNanoseconds: times.0, recoveryStartedAtNanoseconds: times.1)))
+                for later in ConnectionInvalidationSource.allCases {
+                    XCTAssertFalse(cause.record(ConnectionInvalidation(source: later, at: 50)))
+                }
+                let retained = try XCTUnwrap(cause.value)
+                XCTAssertEqual(retained.source, first)
+                XCTAssertEqual(retained.observedAtNanoseconds, times.0)
+                XCTAssertEqual(retained.recoveryStartedAtNanoseconds, times.1)
+                let value = try XCTUnwrap(JSONSerialization.jsonObject(
+                    with: Data(try connectionObservationMarker(retained).utf8)) as? [String: Any])
+                XCTAssertEqual(value["observedAtNanoseconds"] as? UInt64, times.0)
+                XCTAssertEqual(value["recoveryStartedAtNanoseconds"] as? UInt64, times.1)
+                XCTAssertNil(value["connection"])
+                XCTAssertNil(value["display"])
+            }
+        }
+    }
+
     func testInterestMarkerPreservesRawMessageAndUntrustedLocationClassification() throws {
         let marker = ConnectionObservation(role: .observer, observerStartedAtNanoseconds: 100, continuousNs: 124,
             event: .interest, candidateOrdinal: nil,
@@ -297,7 +354,8 @@ final class ConnectionObservationTests: XCTestCase {
         let drainReturned = DispatchSemaphore(value: 0)
         let revocationMarkerObserved = DispatchSemaphore(value: 0)
         let malformedMarkerObserved = DispatchSemaphore(value: 0)
-        let marker = observation()
+        let marker = ConnectionInvalidation(source: .ioNegative, observedAtNanoseconds: 123,
+            recoveryStartedAtNanoseconds: 100, connection: observation())
         defer {
             releaseCallback.signal()
             releaseOutput.signal()
@@ -312,9 +370,14 @@ final class ConnectionObservationTests: XCTestCase {
             }
             traceConnectionObservation(marker) { line in
                 let value = (try? JSONSerialization.jsonObject(with: Data(line.utf8))) as? [String: Any]
-                if value?["event"] as? String == ConnectionObservationEvent.terminated.rawValue,
-                   value?["disposition"] as? String == ConnectionObservationDisposition.revoked.rawValue,
-                   value?["invalidated"] as? Bool == true {
+                let connection = value?["connection"] as? [String: Any]
+                if value?["type"] as? String == "connection-invalidation",
+                   value?["source"] as? String == "io-negative",
+                   value?["observedAtNanoseconds"] as? UInt64 == 123,
+                   value?["recoveryStartedAtNanoseconds"] as? UInt64 == 100,
+                   connection?["event"] as? String == ConnectionObservationEvent.terminated.rawValue,
+                   connection?["disposition"] as? String == ConnectionObservationDisposition.revoked.rawValue,
+                   connection?["invalidated"] as? Bool == true {
                     revocationMarkerObserved.signal()
                 } else {
                     malformedMarkerObserved.signal()

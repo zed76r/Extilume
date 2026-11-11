@@ -24,6 +24,95 @@ final class LayoutRecordCloseoutTests: XCTestCase {
         InternalDisplayState(id: id, identityUUID: inner, isBuiltIn: true, isOnline: true, isActive: true, hardwareIdentity: hardware, reportedIdentityUUID: reported ?? inner)
     }
 
+    private var externalIdentity: ExternalDisplayIdentity {
+        .init(uuid: outer, registryPath: "IOService:/fixture", edidUUID: "fixture-edid", bootSession: bootID, registryEntryID: 84)
+    }
+
+    func testExternalCloseoutBacksUpAndClearsOnlyAfterIndependentVerification() throws {
+        try withExternalFixture { request, original, evidence in
+            let directory = URL(fileURLWithPath: request.records[0].directory)
+            var completionChecked = false
+            try run(request, now: {
+                if FileManager.default.fileExists(atPath: evidence.appendingPathComponent("complete.json").path) {
+                    XCTAssertFalse(FileManager.default.fileExists(atPath: directory.appendingPathComponent("recovery-record.json").path))
+                    completionChecked = true
+                }
+                return self.time
+            })
+            XCTAssertTrue(completionChecked)
+            XCTAssertNil(try RecoveryStore(directory: directory).load())
+            XCTAssertEqual(try Data(contentsOf: evidence.appendingPathComponent("daily-external-original.json")), original)
+            let restored = try JSONDecoder().decode(RecoveryRecord.self,
+                from: Data(contentsOf: evidence.appendingPathComponent("daily-external-restored.json")))
+            XCTAssertEqual(restored.phase, .restored)
+            XCTAssertTrue(restored.canClear)
+            XCTAssertEqual(restored.session, request.records[0].session)
+            XCTAssertNotEqual(restored.externalDisplay?.identity.bootSession, bootID)
+            XCTAssertThrowsError(try run(request))
+        }
+    }
+
+    func testExternalWitnessMustBindCurrentCAndRetainFullIdentity() throws {
+        for variant in 0..<7 {
+            try withExternalFixture { request, original, evidence in
+                var reads = 0
+                XCTAssertThrowsError(try run(request, externalState: { _, _, _ in
+                    reads += 1
+                    let expected = self.externalIdentity
+                    let identity = ExternalDisplayIdentity(uuid: variant == 1 ? UUID() : expected.uuid,
+                        registryPath: variant == 4 ? "other" : expected.registryPath,
+                        edidUUID: variant == 5 ? "other" : expected.edidUUID,
+                        bootSession: variant == 3 ? UUID() : expected.bootSession,
+                        registryEntryID: variant == 6 && reads > 1 ? 85 : expected.registryEntryID)
+                    return ExternalDisplayState(id: variant == 0 ? 3 : 2, identity: identity,
+                                                isOnline: true, isActive: variant != 2)
+                }))
+                XCTAssertEqual(try RecoveryStore(directory: URL(fileURLWithPath: request.records[0].directory)).loadWithOriginalBytes()?.bytes, original)
+                XCTAssertFalse(FileManager.default.fileExists(atPath: evidence.appendingPathComponent("complete.json").path))
+            }
+        }
+    }
+
+    func testExternalCloseoutCannotAdoptAnotherLayoutOrUseLegacyScope() throws {
+        for variant in 0..<3 {
+            try withExternalFixture(baselineMatches: variant != 2) { request, original, evidence in
+                var object = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(request)) as? [String: Any])
+                if variant == 0 { object["scope"] = "legacy-layout-record-closeout-v1" }
+                if variant == 1 { object["approved"] = false }
+                let rejected = try JSONDecoder().decode(LayoutCloseoutRequest.self, from: JSONSerialization.data(withJSONObject: object))
+                XCTAssertThrowsError(try run(rejected))
+                XCTAssertEqual(try RecoveryStore(directory: URL(fileURLWithPath: request.records[0].directory)).loadWithOriginalBytes()?.bytes, original)
+                if variant < 2 { XCTAssertTrue(try FileManager.default.contentsOfDirectory(atPath: evidence.path).isEmpty) }
+                XCTAssertFalse(FileManager.default.fileExists(atPath: evidence.appendingPathComponent("complete.json").path))
+            }
+        }
+    }
+
+    func testExternalClearRechecksEvidenceAndDoesNotClaimCompletionOnFailure() throws {
+        for afterClear in [false, true] {
+            try withExternalFixture { request, _, evidence in
+                let directory = URL(fileURLWithPath: request.records[0].directory)
+                XCTAssertThrowsError(try run(request, now: {
+                    if afterClear && !FileManager.default.fileExists(atPath: directory.appendingPathComponent("recovery-record.json").path) {
+                        return self.time + 31_000_000_000
+                    }
+                    return self.time
+                }, externalState: { _, _, _ in
+                    if !afterClear && FileManager.default.fileExists(atPath: evidence.appendingPathComponent("clear-requested.json").path) {
+                        throw Failure.injected
+                    }
+                    return ExternalDisplayState(id: 2, identity: self.externalIdentity, isOnline: true, isActive: true)
+                }))
+                XCTAssertFalse(FileManager.default.fileExists(atPath: evidence.appendingPathComponent("complete.json").path))
+                XCTAssertTrue(FileManager.default.fileExists(atPath: evidence.appendingPathComponent("stopped.json").path))
+                let saved = try RecoveryStore(directory: directory).load()
+                if afterClear { XCTAssertNil(saved) } else { XCTAssertEqual(saved?.phase, .restored) }
+                XCTAssertTrue(FileManager.default.fileExists(atPath: evidence.appendingPathComponent("daily-external-original.json").path))
+                XCTAssertTrue(FileManager.default.fileExists(atPath: evidence.appendingPathComponent("daily-external-restored.json").path))
+            }
+        }
+    }
+
     func testSuccessPreservesBothOriginalsAndCompletes() throws {
         try withFixture { request, originals, evidence in
             try run(request)
@@ -521,13 +610,42 @@ final class LayoutRecordCloseoutTests: XCTestCase {
                      residualProof: LayoutResidualCloseoutProof? = nil,
                      quiet: @escaping () throws -> Void = {},
                      snapshot: ((UInt64, () throws -> Void) throws -> Snapshot)? = nil,
-                     internalState: ((UUID, UInt32, InternalDisplayHardwareIdentity, UInt64, () throws -> Void) throws -> InternalDisplayState)? = nil) throws {
+                     internalState: ((UUID, UInt32, InternalDisplayHardwareIdentity, UInt64, () throws -> Void) throws -> InternalDisplayState)? = nil,
+                     externalState: ((UInt32, UInt64, () throws -> Void) throws -> ExternalDisplayState)? = nil) throws {
         let encoder = JSONEncoder()
         encoder.outputFormatting = .sortedKeys
         try performLayoutRecordCloseout(request: request, requestBytes: encoder.encode(request), executableSHA256: sha,
             residualProof: residualProof,
             now: now ?? { self.time }, boot: boot ?? { self.bootID }, quiet: quiet,
-            snapshot: snapshot ?? { _, _ in self.snapshot }, internalState: internalState ?? { _, _, _, _, _ in self.state() })
+            snapshot: snapshot ?? { _, _ in self.snapshot }, internalState: internalState ?? { _, _, _, _, _ in self.state() },
+            externalState: externalState ?? { _, _, _ in ExternalDisplayState(id: 2, identity: self.externalIdentity, isOnline: true, isActive: true) })
+    }
+
+    private func withExternalFixture(baselineMatches: Bool = true, _ body: (LayoutCloseoutRequest, Data, URL) throws -> Void) throws {
+        try withFixture { previous, _, evidence in
+            let directory = URL(fileURLWithPath: previous.records[0].directory)
+            let current = self.externalIdentity
+            let old = ExternalDisplayIdentity(uuid: current.uuid, registryPath: current.registryPath, edidUUID: current.edidUUID,
+                bootSession: UUID(uuidString: "10000000-0000-4000-8000-000000000004")!, registryEntryID: 7)
+            let target = try DisplayLayout(main: self.inner,
+                origins: [self.inner: .init(x: 0, y: 0), self.outer: .init(x: -100, y: 0)])
+            let internalOnly = try DisplayLayout(main: self.inner, origins: [self.inner: .init(x: 0, y: 0)])
+            let baseline = try baselineMatches ? self.snapshot.layout() : DisplayLayout(main: inner,
+                origins: [inner: .init(x: 0, y: 0), outer: .init(x: 100, y: 0)])
+            var record = try RecoveryRecord(baseline: baseline, target: target,
+                externalDisplay: .init(identity: old, numericIDHint: 99, baseline: true, applied: false))
+            try record.markApplying()
+            try record.confirmApplied(internalOnly, internalEnabled: true, externalEnabled: false)
+            let bytes = try JSONEncoder().encode(record)
+            try bytes.write(to: directory.appendingPathComponent("recovery-record.json"))
+            let prior = previous.records[0]
+            let entry = LayoutCloseoutEntry(role: "daily-external", directory: prior.directory, device: prior.device,
+                inode: prior.inode, originalSHA256: layoutCloseoutSHA256(bytes), session: record.session, generation: record.generation)
+            let request = LayoutCloseoutRequest(scope: "stale-external-record-closeout-v1", candidate: UUID(), approved: true,
+                adoptCurrentC: true, physicalObservationConfirmed: true, observedAtNanoseconds: time, probeSHA256: sha,
+                internalHardwareIdentity: hardware, expectedC: snapshot, records: [entry], evidenceDirectory: evidence.path)
+            try body(request, bytes, evidence)
+        }
     }
 
     private func assertOriginals(_ request: LayoutCloseoutRequest, _ originals: [Data]) throws {

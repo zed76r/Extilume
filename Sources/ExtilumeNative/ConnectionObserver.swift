@@ -46,7 +46,7 @@ final class ConnectionObserver: @unchecked Sendable {
     private let service: io_service_t
     private let targetEntryID: UInt64
     private let targetEDIDUUID: UUID
-    private let onInvalidation: @Sendable (String, UInt64?) -> Void
+    private let onInvalidation: @Sendable (ConnectionInvalidation) -> Void
     private let onReconfiguration: @Sendable () -> Void
     private let reportsEvents: Bool
     private let expectedDisabledInternal: UInt32?
@@ -79,7 +79,7 @@ final class ConnectionObserver: @unchecked Sendable {
          expectedInternalRegistryID: UInt64? = nil,
          diagnosticRole: InternalLifecycleRole = .observer,
          onReconfiguration: @escaping @Sendable () -> Void = {},
-         onInvalidation: @escaping @Sendable (String, UInt64?) -> Void = { _, _ in }) throws {
+         onInvalidation: @escaping @Sendable (ConnectionInvalidation) -> Void = { _ in }) throws {
         var ownsService = true
         defer { if ownsService { _ = IOObjectRelease(service) } }
 
@@ -101,7 +101,8 @@ final class ConnectionObserver: @unchecked Sendable {
         self.onInvalidation = onInvalidation
         self.onReconfiguration = onReconfiguration
         self.reconfiguration = InternalLinkReconfigurationGate { first in
-            onInvalidation("controlled-link-budget-expired", first)
+            onInvalidation(ConnectionInvalidation(source: .controlledLinkBudgetExpired,
+                observedAtNanoseconds: try? ContinuousClock.nanoseconds(), recoveryStartedAtNanoseconds: first))
         }
         ownsService = false
         queue.setSpecific(key: queueKey, value: true)
@@ -160,13 +161,17 @@ final class ConnectionObserver: @unchecked Sendable {
     func abortInternalReconfiguration() {
         let pending = reconfiguration.fail()
         if let pending {
-            onInvalidation("controlled-link-reconfiguration-failed", pending)
+            onInvalidation(ConnectionInvalidation(source: .controlledLinkReconfigurationFailed,
+                observedAtNanoseconds: try? ContinuousClock.nanoseconds(), recoveryStartedAtNanoseconds: pending))
             traceInternalLifecycle(.linkReconfigurationFailed, role: diagnosticRole, observedAt: pending)
         }
     }
 
-    private func signalInvalidation(_ reason: String, observedAt: UInt64?) {
-        onInvalidation(reason, reconfiguration.invalidate(observedAt: observedAt))
+    private func signalInvalidation(_ source: ConnectionInvalidationSource, observedAt: UInt64?,
+                                    connection: ConnectionObservation? = nil, display: ConnectionDisplayObservation? = nil) {
+        onInvalidation(ConnectionInvalidation(source: source, observedAtNanoseconds: observedAt,
+            recoveryStartedAtNanoseconds: reconfiguration.invalidate(observedAt: observedAt),
+            connection: connection, display: display))
     }
 
     func stopObserving() {
@@ -322,11 +327,14 @@ final class ConnectionObserver: @unchecked Sendable {
                     let location = property("Location", from: candidate) as? String
                     let wasInvalidated = candidates.invalidated
                     let accepted = candidates.matched(entryID: entryID, service: candidateClass, location: location)
+                    let matched = observation(.matched, entryID: entryID, observedAt: observedAt,
+                        location: ConnectionObservedLocation(location), initial: initial,
+                        disposition: !wasInvalidated && candidates.invalidated ? .revoked : (accepted ? .registered : .unchanged))
                     if !wasInvalidated && candidates.invalidated {
-                        signalInvalidation("io-role-conflict class=\(candidateClass.rawValue)", observedAt: observedAt)
+                        signalInvalidation(.ioRoleConflict, observedAt: observedAt, connection: matched)
                     }
                     if accepted, location == "External", [.prepared, .collecting, .verifying].contains(reconfiguration.phase) {
-                        signalInvalidation("io-candidate-changed", observedAt: observedAt)
+                        signalInvalidation(.ioCandidateChanged, observedAt: observedAt, connection: matched)
                     }
                     if accepted, candidateOrdinals[entryID] == nil {
                         candidateOrdinals[entryID] = UInt64(candidateOrdinals.count) + 1
@@ -374,11 +382,10 @@ final class ConnectionObserver: @unchecked Sendable {
     ) -> Bool {
         let registered = candidates.diagnosticCandidate(entryID: entryID)
         let candidateClass = candidates.invalidate(entryID: entryID, terminated: terminated)
-        let scope = connectionRegistryScope(entryID: entryID, target: targetEntryID, internalProof: expectedInternalRegistryID)
-        signalInvalidation("io-negative scope=\(scope.rawValue) class=\(candidateClass?.rawValue ?? "unclassified") event=\(event)", observedAt: observedAt)
-        // Formatting and output happen only after authorization has been revoked.
-        observe(eventKind, entryID: entryID, candidate: registered, observedAt: observedAt,
+        let observed = observation(eventKind, entryID: entryID, candidate: registered, observedAt: observedAt,
                 messageType: messageType, messageArgument: messageArgument, location: location, disposition: .revoked)
+        signalInvalidation(.ioNegative, observedAt: observedAt, connection: observed)
+        if let observed { traceConnectionObservation(observed) }
         guard let candidateClass else { return false }
         log("candidate \(event) class=\(candidateClass.rawValue) invalidated=true（仅安全条件失效，非已确认拔线）", observedAt: observedAt)
         return true
@@ -458,19 +465,21 @@ final class ConnectionObserver: @unchecked Sendable {
             flags: flags,
             expectedDisabledInternal: expectedDisabledInternal
         )
-        // 撤权不能等在可能阻塞的显示快照之后。
-        if let reason {
-            let scope = display == 0 ? "unknown" : (display == expectedDisabledInternal ? "expected-internal" : "other")
-            signalInvalidation("\(reason) scope=\(scope) flags=\(flags.rawValue)", observedAt: observedAt)
-        }
+        var observed: ConnectionDisplayObservation?
         if (reportsEvents || expectedDisabledInternal != nil), let observedAt {
-            traceConnectionObservation(ConnectionDisplayObservation(
+            observed = ConnectionDisplayObservation(
                 role: diagnosticRole, observerStartedAtNanoseconds: startedAt,
                 continuousNs: observedAt, flags: flags.rawValue,
                 scope: connectionDisplayScope(display: display, expectedDisabledInternal: expectedDisabledInternal),
                 invalidationReason: reason
-            ))
+            )
         }
+        // 撤权不能等在可能阻塞的显示快照或诊断输出之后。
+        if reason != nil {
+            signalInvalidation(flags.contains(.removeFlag) ? .cgRemove : .cgDisabled,
+                               observedAt: observedAt, display: observed)
+        }
+        if let observed { traceConnectionObservation(observed) }
         queue.async { [weak self] in
             guard let self, !self.resourcesReleased else { return }
             if reason != nil { _ = self.candidates.invalidate(entryID: 0, terminated: false) }
@@ -496,8 +505,20 @@ final class ConnectionObserver: @unchecked Sendable {
         location: ConnectionObservedLocation? = nil, initial: Bool? = nil,
         disposition: ConnectionObservationDisposition
     ) {
-        guard reportsEvents || expectedDisabledInternal != nil else { return }
-        guard let timestamp = observedAt ?? (try? ContinuousClock.nanoseconds()) else { return }
+        if let value = observation(event, entryID: entryID, candidate: candidate, observedAt: observedAt,
+            messageType: messageType, messageArgument: messageArgument, location: location,
+            initial: initial, disposition: disposition) { traceConnectionObservation(value) }
+    }
+
+    private func observation(
+        _ event: ConnectionObservationEvent, entryID: UInt64,
+        candidate: ConnectionCandidateDiagnostic? = nil, observedAt: UInt64?,
+        messageType: UInt32? = nil, messageArgument: ConnectionObservedArgument? = nil,
+        location: ConnectionObservedLocation? = nil, initial: Bool? = nil,
+        disposition: ConnectionObservationDisposition
+    ) -> ConnectionObservation? {
+        guard reportsEvents || expectedDisabledInternal != nil else { return nil }
+        guard let timestamp = observedAt ?? (try? ContinuousClock.nanoseconds()) else { return nil }
         let diagnosticCandidate = candidate ?? candidates.diagnosticCandidate(entryID: entryID)
         let messageClassification = connectionMessageClassification(
             event: event,
@@ -505,7 +526,7 @@ final class ConnectionObserver: @unchecked Sendable {
             messageType: messageType,
             messageArgument: messageArgument
         )
-        traceConnectionObservation(ConnectionObservation(
+        return ConnectionObservation(
             role: diagnosticRole, observerStartedAtNanoseconds: startedAt, continuousNs: timestamp,
             event: event, candidateOrdinal: candidateOrdinals[entryID],
             candidate: diagnosticCandidate,
@@ -513,7 +534,7 @@ final class ConnectionObserver: @unchecked Sendable {
             messageType: messageType, messageArgument: messageArgument,
             messageClassification: messageClassification, observedLocation: location, initial: initial,
             disposition: disposition, invalidated: candidates.invalidated
-        ))
+        )
     }
 
     private func releaseResourcesOnQueue() {
